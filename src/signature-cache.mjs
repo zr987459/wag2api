@@ -13,7 +13,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PERSIST_FILE = path.join(__dirname, '..', 'data', 'signatures.json');
+import { DATA_DIR } from './paths.mjs';
+const PERSIST_FILE = path.join(DATA_DIR, 'signatures.json');
 
 // Google 官方认证有效的合法思考签名兜底数据 (Base64)
 export const FALLBACK_THOUGHT_SIGNATURE =

@@ -36,10 +36,16 @@ import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session
 let lastClientHeaders = null;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import { DATA_DIR, IS_BINARY } from './paths.mjs';
+import crypto from 'crypto';
+import os from 'os';
+let EMBED = {};
+try { EMBED = (await import('./embedded.mjs')).default || {}; } catch (e) {}
+fs.mkdirSync(path.join(DATA_DIR, 'accounts'), { recursive: true });
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8790;
 
 // 状态持久化
-const persist = new Persist(path.join(__dirname, '..', 'data'));
+const persist = new Persist(DATA_DIR);
 await persist.restore();
 statsTracker.load();
 persist.startStatsSync(() => statsTracker.flush());
@@ -53,7 +59,7 @@ if (persist.enabled) {
 }
 
 // 账号池
-const accountPool = new AccountPool(path.join(__dirname, '..', 'data', 'accounts'));
+const accountPool = new AccountPool(path.join(DATA_DIR, 'accounts'));
 
 persist.snapshot();
 for (const m of ['addAccount', 'removeAccount', 'clearAccounts']) {
@@ -62,7 +68,7 @@ for (const m of ['addAccount', 'removeAccount', 'clearAccounts']) {
 }
 
 const oauthFlowManager = new OAuthFlowManager(accountPool);
-const access = new AccessControl(path.join(__dirname, '..', 'data', 'keys.json'));
+const access = new AccessControl(path.join(DATA_DIR, 'keys.json'));
 
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -116,8 +122,8 @@ const server = http.createServer(async (req, res) => {
 
   // 1. 控制台主页
   if (url.pathname === '/' || url.pathname === '/index.html') {
-    if (fs.existsSync(dashboardHtmlPath)) {
-      const html = fs.readFileSync(dashboardHtmlPath, 'utf-8');
+    if (EMBED.dashboard || fs.existsSync(dashboardHtmlPath)) {
+      const html = EMBED.dashboard || fs.readFileSync(dashboardHtmlPath, 'utf-8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(html);
       return;
@@ -126,8 +132,8 @@ const server = http.createServer(async (req, res) => {
 
   // 1.1 Token 专属提取页面 (/token, /get-token)
   if (url.pathname === '/token' || url.pathname === '/get-token' || url.pathname === '/token.html') {
-    if (fs.existsSync(tokenHtmlPath)) {
-      const html = fs.readFileSync(tokenHtmlPath, 'utf-8');
+    if (EMBED.token || fs.existsSync(tokenHtmlPath)) {
+      const html = EMBED.token || fs.readFileSync(tokenHtmlPath, 'utf-8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(html);
       return;
@@ -146,7 +152,7 @@ const server = http.createServer(async (req, res) => {
 
   // 1.6 健康检查
   if (url.pathname === '/health') {
-    sendJson(res, 200, { ok: true, app: 'ag-open-gateway', version: '1.2.1', auth: access.enabled });
+    sendJson(res, 200, { ok: true, app: 'ag-open-gateway', version: '1.3.0', auth: access.enabled });
     return;
   }
 
@@ -212,7 +218,7 @@ const server = http.createServer(async (req, res) => {
     const host = req.headers.host || '';
     const status = {
       app: 'ag-open-gateway',
-      version: '1.2.1',
+      version: '1.3.0',
       auth_enabled: access.enabled,
       port: PORT,
       auth_url: oauthFlowManager.getAuthUrl(host),
@@ -562,6 +568,18 @@ const server = http.createServer(async (req, res) => {
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 AG Open Gateway 运行在 http://0.0.0.0:${PORT}`);
+// 单文件版默认对外监听，首次运行若没有密钥就自动生成一个，避免裸奔
+if (IS_BINARY && !access.enabled && process.env.NO_AUTH !== '1') {
+  access.adminKey = 'sk-ag-' + crypto.randomBytes(18).toString('base64url');
+  access.save();
+}
+
+const HOST = process.env.HOST || '0.0.0.0';
+server.listen(PORT, HOST, () => {
+  const lan = Object.values(os.networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
+  console.log(`🚀 wag2api 已启动`);
+  console.log(`   本机:   http://127.0.0.1:${PORT}`);
+  if (HOST === '0.0.0.0') lan.forEach(ip => console.log(`   局域网: http://${ip}:${PORT}`));
+  console.log(`   数据:   ${DATA_DIR}`);
+  console.log(access.enabled ? `   密钥:   ${access.adminKey}` : '   密钥:   未设置（任何人都能访问，建议设置 ADMIN_KEY）');
 });

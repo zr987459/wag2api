@@ -28,6 +28,7 @@ html[data-theme=light] .card{box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 14px 
 html[data-theme=light] .state i{box-shadow:none}
 html[data-theme=light] .sw input:checked+i::after{background:#fff}
 html[data-theme=light] .scrim{background:rgba(15,20,27,.28)}
+
 body,.card,.dock,.sheet{transition:background-color .25s,border-color .25s,color .25s}
 *{box-sizing:border-box;margin:0;padding:0}
 html{-webkit-text-size-adjust:100%}
@@ -199,6 +200,38 @@ code{font-family:var(--mono);font-size:13px}
 #toast{position:fixed;left:50%;top:calc(18px + env(safe-area-inset-top));transform:translate(-50%,-20px);opacity:0;transition:.25s;z-index:80;
   background:var(--menu);border:1px solid var(--line-2);box-shadow:var(--shadow);backdrop-filter:blur(12px);padding:10px 18px;border-radius:99px;font-size:14px;pointer-events:none;max-width:90vw;text-align:center}
 #toast.show{opacity:1;transform:translate(-50%,0)}#toast.err{color:var(--bad)}
+
+/* ===== Desktop ===== */
+.desk-only{display:none!important}
+@media (min-width:960px){
+  body{padding:0 32px 40px}
+  .app{max-width:1320px}
+  .topbar{position:sticky;top:0;z-index:25;padding:18px 0;margin-bottom:6px;background:linear-gradient(var(--bg) 70%,transparent)}
+  .wordmark{font-size:24px}
+  .desk-only{display:inline-flex!important}
+  .dock{display:none}
+  .tb-actions{display:flex;align-items:center;gap:8px;margin-right:8px}
+  .tb-actions button{height:38px;padding:0 16px;border-radius:19px;font-size:14px;border:1px solid var(--line-2);background:var(--card);white-space:nowrap}
+  .tb-actions button:hover{border-color:var(--sub)}
+  .tb-actions .primary{background:var(--cy);color:var(--on-cy);border-color:var(--cy);font-weight:600}
+  .layout{display:grid;grid-template-columns:minmax(360px,420px) minmax(0,1fr);gap:22px;align-items:start}
+  .col-l{position:sticky;top:84px}
+  .col-r>.sec:first-child{margin-top:4px}
+  #acc-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:14px;align-items:start}
+  #acc-list .acc{margin:0}
+  #acc-list .empty{grid-column:1/-1}
+  #log-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));padding:0}
+  #log-list .log{border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+  #log-list .empty{grid-column:1/-1}
+  .card:hover{border-color:var(--line-2)}
+  .sheet{top:50%;bottom:auto;left:50%;right:auto;width:min(600px,calc(100vw - 64px));max-height:84vh;margin:0;border-radius:22px;border-bottom:1px solid var(--line-2);
+    transform:translate(-50%,-47%) scale(.98);opacity:0;transition:transform .2s,opacity .2s,visibility 0s .2s;box-shadow:var(--shadow);padding-bottom:0}
+  .sheet.open{transform:translate(-50%,-50%);opacity:1;transition:transform .2s,opacity .2s}
+  .grab{display:none}
+  .icon-btn:hover{background:var(--card)}
+}
+@media (min-width:1500px){ .layout{grid-template-columns:440px minmax(0,1fr)} }
+
 </style>
 <script>
 (function(){
@@ -212,8 +245,14 @@ code{font-family:var(--mono);font-size:13px}
 <div id="toast"></div>
 <div class="app">
   <header class="topbar">
-    <div class="wordmark">AG Open</div>
+    <div class="wordmark" id="wordmark">AG Open</div>
     <div style="display:flex;align-items:center;gap:2px">
+    <div class="tb-actions desk-only">
+      <button class="primary" onclick="openSheet('sh-add')">＋ 添加账号</button>
+      <button onclick="openSheet('sh-test')">测试</button>
+      <button onclick="openSheet('sh-conn')">客户端接入</button>
+      <button onclick="openSettingsSheet()">设置</button>
+    </div>
     <button class="icon-btn" id="theme-btn" aria-label="切换主题" onclick="toggleTheme()"></button>
     <div class="menu-wrap">
       <button class="icon-btn" aria-label="更多" onclick="toggleMenu()"><span class="dots"><i></i><i></i><i></i></span></button>
@@ -231,6 +270,8 @@ code{font-family:var(--mono);font-size:13px}
     </div>
   </header>
 
+  <div class="layout">
+  <div class="col-l">
   <section class="card hero">
     <div class="hero-top">
       <div class="state" id="srv-status"><i></i><span id="srv-status-text">连接中</span></div>
@@ -259,12 +300,16 @@ code{font-family:var(--mono);font-size:13px}
       </div></div>
   </div>
 
+  </div>
+  <div class="col-r">
   <div class="sec"><h2>账号</h2><div class="r"><span id="acc-count"></span><button class="link" id="btn-refresh" onclick="loadQuota(true)">刷新额度</button></div></div>
   <div id="acc-list"><div class="card empty">加载中</div></div>
   <div class="note" id="sync-time" style="text-align:center"></div>
 
   <div class="sec"><h2>最近请求</h2><div class="r"><button class="link" onclick="clearLogs()">清空</button></div></div>
   <div class="card" id="log-list"><div class="empty">还没有请求</div></div>
+  </div>
+  </div>
 </div>
 
 <nav class="dock">
@@ -398,6 +443,7 @@ const $ = id => document.getElementById(id);
 let ADMIN = '';
 try { ADMIN = localStorage.getItem('ag-admin') || ''; } catch (e) {}
 if (window.AGApp || /[?&]app=1/.test(location.search)) document.documentElement.classList.add('in-app');
+else { document.title = 'wag2api'; const wm = document.getElementById('wordmark'); if (wm) wm.textContent = 'wag2api'; }
 setTimeout(() => { try { gwFill(); } catch (e) {} }, 0);
 try { if (window.AGApp && AGApp.adminKey) { const k = AGApp.adminKey(); if (k) { ADMIN = k; localStorage.setItem('ag-admin', k); } } } catch (e) {}
 const _fetch = window.fetch.bind(window);
@@ -666,7 +712,7 @@ function fmtReset(o) {
 }
 function renderAccounts(accounts) {
   const c = $('acc-list');
-  if (!accounts.length) { c.innerHTML = '<div class="card empty">还没有账号，点下方「添加账号」</div>'; return; }
+  if (!accounts.length) { c.innerHTML = '<div class="card empty">还没有账号，点「添加账号」</div>'; return; }
   c.innerHTML = accounts.map(acc => {
     const email = acc.email || '';
     const on = email === activeEmail;

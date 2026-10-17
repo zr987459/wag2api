@@ -11,3 +11,4 @@ android/app/libnode/
 android/app/src/main/assets/gateway/
 android/.gradle/
 android/app/build/
+build/

@@ -1,9 +1,9 @@
-name: Build AG Open APK
+name: Build & Release
 
 on:
   push:
     branches: [ "main" ]
-    paths: [ "android/**", "src/**", "package.json", ".github/workflows/build-apk.yml" ]
+    paths: [ "android/**", "src/**", "scripts/**", "package.json", ".github/workflows/build-apk.yml" ]
   workflow_dispatch:
 
 permissions:
@@ -81,8 +81,49 @@ jobs:
           name: "wag2api v${{ steps.ver.outputs.vn }}"
           make_latest: true
           body: |
-            wag2api 手机版（AG Open）：在手机本地运行的 Antigravity → Anthropic API 网关。
-            下载下方 AGOpen.apk 安装，已安装的旧版可直接覆盖升级。
+            **手机独立版**：下载 `AGOpen.apk` 安装，网关直接在手机上运行，旧版可覆盖升级。
+
+            **Linux 版**：一键安装（systemd，开机自启）
+            ```
+            curl -fsSL https://raw.githubusercontent.com/zr987459/wag2api/main/scripts/install.sh | sudo bash
+            ```
+            或直接下载 `wag2api-linux-x64` / `wag2api-linux-arm64`，`chmod +x` 后运行，无需安装 Node。
           files: dist/AGOpen.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  linux:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Test
+        run: npm test
+      - name: Build single-file binaries
+        run: node scripts/build-linux.mjs x64 arm64
+      - name: Smoke test (x64)
+        run: |
+          HOME=$RUNNER_TEMP PORT=8799 ./dist/wag2api-linux-x64 & sleep 3
+          curl -fsS http://127.0.0.1:8799/health
+          curl -fsS http://127.0.0.1:8799/ | grep -q wag2api
+          kill %1
+      - name: Read version
+        id: ver
+        run: echo "vn=$(grep -oP 'versionName = "\K[^"]+' android/app/build.gradle.kts)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wag2api-linux
+          path: dist/wag2api-linux-*
+      - name: Attach to release
+        if: github.repository == 'zr987459/wag2api'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.vn }}
+          target_commitish: ${{ github.sha }}
+          name: "wag2api v${{ steps.ver.outputs.vn }}"
+          files: |
+            dist/wag2api-linux-x64
+            dist/wag2api-linux-arm64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

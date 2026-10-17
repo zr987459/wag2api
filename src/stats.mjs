@@ -379,4 +379,5 @@ export class StatsTracker {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-export const statsTracker = new StatsTracker(path.join(__dirname, '..', 'data'));
+import { DATA_DIR } from './paths.mjs';
+export const statsTracker = new StatsTracker(DATA_DIR);
