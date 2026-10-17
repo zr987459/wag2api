@@ -41,6 +41,13 @@ curl -fsSL https://raw.githubusercontent.com/zr987459/wag2api/main/scripts/insta
 
 装好后会显示控制台地址和自动生成的密钥，用浏览器打开即可。重复执行就是升级。
 
+脚本会自动选择版本：
+
+- 机器上已装 **Node.js ≥ 18**：安装轻量版，下载仅约 **60KB**
+- 没有 Node：下载 xz 压缩的单文件版，约 **30MB**（解压后约 90MB，内含运行环境）
+
+想强制用单文件版：`curl ... | sudo WAG2API_MODE=binary bash`
+
 - 修改端口 / 密钥：编辑 `/etc/wag2api.env`，然后 `sudo systemctl restart wag2api`
 - 查看日志：`journalctl -u wag2api -f`
 - 卸载：`curl -fsSL https://raw.githubusercontent.com/zr987459/wag2api/main/scripts/install.sh | sudo bash -s uninstall`
@@ -48,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/zr987459/wag2api/main/scripts/insta
 也可以不安装服务，直接运行：
 
 ```bash
-chmod +x wag2api-linux-x64
+xz -d wag2api-linux-x64.xz && chmod +x wag2api-linux-x64
 ./wag2api-linux-x64          # 数据保存在 ~/.wag2api，首次启动自动生成密钥
 ```
 

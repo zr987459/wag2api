@@ -152,7 +152,7 @@ const server = http.createServer(async (req, res) => {
 
   // 1.6 健康检查
   if (url.pathname === '/health') {
-    sendJson(res, 200, { ok: true, app: 'ag-open-gateway', version: '1.3.0', auth: access.enabled });
+    sendJson(res, 200, { ok: true, app: 'ag-open-gateway', version: '1.3.1', auth: access.enabled });
     return;
   }
 
@@ -218,7 +218,7 @@ const server = http.createServer(async (req, res) => {
     const host = req.headers.host || '';
     const status = {
       app: 'ag-open-gateway',
-      version: '1.3.0',
+      version: '1.3.1',
       auth_enabled: access.enabled,
       port: PORT,
       auth_url: oauthFlowManager.getAuthUrl(host),
@@ -569,7 +569,7 @@ server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 
 // 单文件版默认对外监听，首次运行若没有密钥就自动生成一个，避免裸奔
-if (IS_BINARY && !access.enabled && process.env.NO_AUTH !== '1') {
+if ((IS_BINARY || process.env.AUTO_KEY === '1') && !access.enabled && process.env.NO_AUTH !== '1') {
   access.adminKey = 'sk-ag-' + crypto.randomBytes(18).toString('base64url');
   access.save();
 }

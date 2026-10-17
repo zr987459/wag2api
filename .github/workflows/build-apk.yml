@@ -87,7 +87,9 @@ jobs:
             ```
             curl -fsSL https://raw.githubusercontent.com/zr987459/wag2api/main/scripts/install.sh | sudo bash
             ```
-            或直接下载 `wag2api-linux-x64` / `wag2api-linux-arm64`，`chmod +x` 后运行，无需安装 Node。
+            安装脚本会自动选择：已装 Node ≥ 18 用约 60KB 的轻量版，否则下载约 30MB 的压缩单文件版。
+
+            也可手动下载：`wag2api-linux-*.xz`（`xz -d` 解压后 `chmod +x` 运行，无需 Node），或 `wag2api-node.tar.gz`（`node src/server.mjs`）。
           files: dist/AGOpen.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -102,6 +104,11 @@ jobs:
         run: npm test
       - name: Build single-file binaries
         run: node scripts/build-linux.mjs x64 arm64
+      - name: Pack (xz + Node light package)
+        run: |
+          for a in x64 arm64; do xz -9e -T0 -k "dist/wag2api-linux-$a"; done
+          tar czf dist/wag2api-node.tar.gz src package.json LICENSE
+          ls -l dist
       - name: Smoke test (x64)
         run: |
           HOME=$RUNNER_TEMP PORT=8799 ./dist/wag2api-linux-x64 & sleep 3
@@ -125,5 +132,8 @@ jobs:
           files: |
             dist/wag2api-linux-x64
             dist/wag2api-linux-arm64
+            dist/wag2api-linux-x64.xz
+            dist/wag2api-linux-arm64.xz
+            dist/wag2api-node.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
