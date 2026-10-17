@@ -1,0 +1,88 @@
+name: Build AG Open APK
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: [ "android/**", "src/**", "package.json", ".github/workflows/build-apk.yml" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-open
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # 签名密码只存在仓库 Secrets 里。Fork 没有这个 Secret 时会用 debug 签名构建。
+      KS_PW: ${{ secrets.KS_PW }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Fetch Node.js runtime (nodejs-mobile)
+        run: |
+          curl -sL -o /tmp/nm.zip https://github.com/nodejs-mobile/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-android.zip
+          mkdir -p android/app/libnode
+          unzip -q /tmp/nm.zip -d android/app/libnode
+          rm -rf android/app/libnode/bin/armeabi-v7a android/app/libnode/bin/x86_64
+
+      - name: Bundle gateway source (plain, not obfuscated)
+        run: |
+          G=android/app/src/main/assets/gateway
+          mkdir -p $G
+          cp -r src $G/
+          cp package.json $G/
+
+      - name: Decrypt signing key
+        if: env.KS_PW != ''
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in android/keystore/release.p12.enc -out android/keystore/release.p12 -pass env:KS_PW
+
+      - name: Build APK (release, signed)
+        run: |
+          cd android
+          gradle assembleRelease --no-daemon --stacktrace
+          mkdir -p ../dist
+          cp app/build/outputs/apk/release/*.apk ../dist/AGOpen.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: AGOpen-APK
+          path: dist/AGOpen.apk
+
+      - name: Read version
+        id: ver
+        run: echo "vn=$(grep -oP 'versionName = "\K[^"]+' android/app/build.gradle.kts)" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        if: env.KS_PW != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.vn }}
+          target_commitish: ${{ github.sha }}
+          name: "wag2api v${{ steps.ver.outputs.vn }}"
+          make_latest: true
+          body: |
+            wag2api 手机版（AG Open）：在手机本地运行的 Antigravity → Anthropic API 网关。
+            下载下方 AGOpen.apk 安装，已安装的旧版可直接覆盖升级。
+          files: dist/AGOpen.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

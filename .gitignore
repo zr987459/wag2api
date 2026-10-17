@@ -1,0 +1,13 @@
+node_modules/
+data/
+*.log
+*.p12
+*.jks
+*.keystore
+!android/keystore/release.p12.enc
+.env
+dist/
+android/app/libnode/
+android/app/src/main/assets/gateway/
+android/.gradle/
+android/app/build/

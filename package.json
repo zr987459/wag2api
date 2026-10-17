@@ -1,0 +1,23 @@
+{
+  "name": "ag-open-gateway",
+  "version": "1.0.0",
+  "description": "Free and open-source local Anthropic-compatible gateway for Google Antigravity / Cloud Code",
+  "main": "src/server.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node tests/test-converter.mjs && node tests/test-usage.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "gemini",
+    "claude",
+    "antigravity",
+    "proxy",
+    "anthropic"
+  ],
+  "author": "zr987459",
+  "license": "MIT"
+}

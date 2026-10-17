@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#07090c">
+<title>AG Open</title>
+<style>
+:root{
+  --bg:#07090c;--card:#10151b;--card-2:#141b22;--line:#202832;--line-2:#2c3743;
+  --tx:#ecf2f6;--tx-2:#b9c6d2;--sub:#8496a8;
+  --cy:#00e5ff;--cy-d:#063a44;--ok:#3dff9a;--warn:#ffaa3c;--bad:#ff4d6a;
+  --mono:"JetBrains Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Inter","PingFang SC","HarmonyOS Sans SC","MiSans","Microsoft YaHei",sans-serif;
+  --r:20px;--on-cy:#07090c;--glass:rgba(14,18,24,.82);--sheet:rgba(16,21,27,.97);--menu:rgba(20,27,34,.96);
+  --ok-bg:#0d2a1d;--bad-bg:#2a0f16;--warn-bg:#2a1e0d;--shadow:0 18px 40px rgba(0,0,0,.5);
+  color-scheme:dark;
+}
+html[data-theme=light]{
+  --bg:#f4f6f9;--card:#ffffff;--card-2:#f7f9fb;--line:#e6eaef;--line-2:#d8dee6;
+  --tx:#0e141b;--tx-2:#3b4754;--sub:#6b7785;
+  --cy:#0aa5c2;--cy-d:#e2f6fa;--ok:#12a55c;--warn:#e08a00;--bad:#e5384f;--on-cy:#ffffff;
+  --glass:rgba(255,255,255,.78);--sheet:rgba(255,255,255,.97);--menu:rgba(255,255,255,.97);
+  --ok-bg:#e3f7ec;--bad-bg:#fde8eb;--warn-bg:#fff2dc;--shadow:0 18px 40px rgba(20,30,45,.14);
+  color-scheme:light;
+}
+html[data-theme=light] .card{box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 14px rgba(16,24,40,.05)}
+html[data-theme=light] .state i{box-shadow:none}
+html[data-theme=light] .sw input:checked+i::after{background:#fff}
+html[data-theme=light] .scrim{background:rgba(15,20,27,.28)}
+body,.card,.dock,.sheet{transition:background-color .25s,border-color .25s,color .25s}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  padding:max(14px,env(safe-area-inset-top)) 16px calc(104px + env(safe-area-inset-bottom));overflow-wrap:anywhere;word-break:break-word}
+a{color:inherit;text-decoration:none}button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+.app{max-width:560px;margin:0 auto}
+.num,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.app-only{display:none!important}.in-app .app-only{display:flex!important}.in-app .web-only{display:none!important}
+
+/* top */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:10px 4px 18px}
+.wordmark{font-size:26px;font-weight:600;letter-spacing:-.3px}
+.icon-btn{width:40px;height:40px;border-radius:50%;display:grid;place-items:center}
+.icon-btn:active{background:var(--card)}
+.icon-btn svg{width:22px;height:22px;stroke:var(--sub);fill:none;stroke-width:1.8;stroke-linecap:round}
+.dots{display:flex;gap:4px}.dots i{width:5px;height:5px;border-radius:50%;background:var(--sub)}
+.menu-wrap{position:relative}
+.dropdown{position:absolute;right:0;top:46px;min-width:190px;background:var(--menu);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border:1px solid var(--line-2);border-radius:16px;padding:6px;display:none;z-index:30;box-shadow:var(--shadow)}
+.dropdown.open{display:block}
+.dropdown button,.dropdown a{display:flex;width:100%;justify-content:space-between;align-items:center;padding:12px 14px;border-radius:10px;font-size:15px;text-align:left}
+.dropdown button:active,.dropdown a:active{background:var(--line)}
+.dropdown .k{color:var(--sub);font-size:12px}
+
+/* cards */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r)}
+.hero{padding:20px 20px 18px;margin-bottom:12px}
+.hero-top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.state{display:flex;align-items:center;gap:10px;font-size:17px;color:var(--ok);font-weight:500}
+.state i{width:13px;height:13px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}
+.state.warn{color:var(--warn)}.state.err{color:var(--bad)}
+.addr{font-family:var(--mono);font-size:30px;white-space:nowrap;overflow:hidden;line-height:1.2;margin:14px 0 12px;letter-spacing:-.5px}
+.hero-bot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.keyline{color:var(--sub);font-size:14px;display:flex;gap:8px;align-items:baseline;min-width:0}
+.keyline .mono{color:var(--tx-2)}
+.btn-ghost{border:1.5px solid var(--cy);color:var(--cy);border-radius:999px;padding:7px 16px;font-size:14px;white-space:nowrap}
+.btn-ghost:active{background:var(--cy-d)}
+
+/* switch */
+.sw{position:relative;display:inline-block;width:56px;height:32px;flex:none}
+.sw input{opacity:0;width:0;height:0;position:absolute}
+.sw i{position:absolute;inset:0;border-radius:999px;background:var(--line-2);transition:.2s}
+.sw i::after{content:"";position:absolute;width:26px;height:26px;left:3px;top:3px;border-radius:50%;background:var(--tx);transition:.2s}
+.sw input:checked+i{background:var(--ok)}
+.sw input:checked+i::after{transform:translateX(24px);background:var(--bg)}
+
+/* stats */
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.stat{padding:14px 16px;min-width:0;overflow:hidden}
+.stat.wide{grid-column:1/-1}
+.stat .lbl{font-size:13px;color:var(--sub)}
+.stat{display:flex;flex-direction:column}.stat .bd{margin-top:auto}
+.stat .big{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:26px;line-height:1.25;margin:4px 0 8px;white-space:nowrap}
+.bd{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr));gap:4px 14px;border-top:1px solid var(--line);padding-top:8px}
+.bd div{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:0 8px;font-size:13px;min-width:0}
+.bd span{color:var(--sub);white-space:nowrap}
+.bd b{font-family:var(--mono);font-weight:500;font-variant-numeric:tabular-nums;color:var(--tx);margin-left:auto;text-align:right;max-width:100%;overflow-wrap:anywhere}
+
+/* section */
+.sec{display:flex;align-items:center;justify-content:space-between;margin:22px 4px 12px}
+.sec h2{font-size:19px;font-weight:600}
+.sec .r{color:var(--sub);font-size:14px;display:flex;gap:14px;align-items:center}
+.link{color:var(--cy);font-size:14px}
+
+/* accounts */
+.acc{padding:16px 18px 14px;margin-bottom:12px}
+.acc.on{border:1.5px solid var(--cy)}
+.acc-h{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:12px}
+.acc-mail{font-size:17px;line-height:1.35;min-width:0}
+.pill{flex:none;font-size:13px;padding:4px 14px;border-radius:999px;background:var(--line);color:var(--sub)}
+.acc.on .pill{background:var(--cy-d);color:var(--cy)}
+.q{display:grid;grid-template-columns:auto minmax(40px,1fr) auto;align-items:center;gap:10px;padding:4px 0}
+.q .n{font-size:13px;color:var(--sub);white-space:nowrap;min-width:5.6em}
+.q .p{font-family:var(--mono);font-size:13px;text-align:right;min-width:3.4em;font-variant-numeric:tabular-nums}
+.q .rs{grid-column:2/-1;font-size:12px;color:var(--sub);margin-top:-4px}
+.bar{height:8px;border-radius:99px;background:var(--line);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:99px;background:var(--cy);width:0;transition:width .5s}
+.bar.warn i{background:var(--warn)}.bar.bad i{background:var(--bad)}
+.acc-f{display:flex;justify-content:flex-end;gap:6px;margin-top:8px;border-top:1px solid var(--line);padding-top:8px}
+.btn-t{padding:6px 12px;border-radius:10px;font-size:14px;color:var(--tx-2)}
+.btn-t:active{background:var(--line)}.btn-t.danger{color:var(--bad)}
+.empty{padding:26px;text-align:center;color:var(--sub)}
+
+/* logs */
+.log{padding:12px 16px;border-bottom:1px solid var(--line)}
+.log:last-child{border-bottom:0}
+.log-h{display:flex;justify-content:space-between;gap:10px}
+.log-m{font-family:var(--mono);font-size:14px}
+.log-s{font-size:12px;color:var(--sub)}
+.ok-t{color:var(--ok);font-family:var(--mono)}.bad-t{color:var(--bad);font-family:var(--mono)}
+.tk{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;font-size:12px;color:var(--sub)}
+.tk b{color:var(--tx-2);font-family:var(--mono);font-weight:500}
+.hit-hi{color:var(--ok)!important}.hit-mid{color:var(--warn)!important}
+
+/* dock */
+.dock{position:fixed;left:16px;right:16px;bottom:calc(14px + env(safe-area-inset-bottom));max-width:528px;margin:0 auto;z-index:20;
+  display:flex;align-items:center;gap:6px;padding:8px;border-radius:30px;background:var(--glass);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid var(--line-2)}
+.dock .primary{flex:1.6;height:48px;border-radius:24px;background:var(--cy);color:var(--on-cy);font-size:16px;font-weight:600}
+.dock .sec-b{flex:1;height:48px;border-radius:24px;font-size:16px;white-space:nowrap;min-width:0}
+.dock .primary{white-space:nowrap;min-width:0;padding:0 10px}
+.dock button:active{opacity:.75}
+
+/* generic buttons/inputs */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:42px;padding:0 16px;border-radius:12px;border:1px solid var(--line-2);font-size:14px;white-space:nowrap}
+.btn:active{background:var(--line)}
+.btn-solid{background:var(--cy);color:var(--on-cy);border-color:var(--cy);font-weight:600}
+.btn-text{border:0;height:auto;padding:6px 10px;color:var(--cy)}
+.btn-text.danger{color:var(--bad)}
+.btn.busy{opacity:.6}
+.input{flex:1;min-width:0;height:44px;border-radius:12px;border:1px solid var(--line-2);background:var(--bg);color:var(--tx);padding:0 14px;font-family:var(--mono);font-size:14px;outline:none}
+.input:focus{border-color:var(--cy)}
+.line{display:flex;gap:8px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.note{color:var(--sub);font-size:13px;margin:10px 0}
+.msg{display:none;margin-top:10px;font-size:13px;padding:10px 12px;border-radius:10px}
+.msg.show{display:block}.msg.info{background:var(--line);color:var(--tx-2)}.msg.ok{background:var(--ok-bg);color:var(--ok)}.msg.err{background:var(--bad-bg);color:var(--bad)}
+.tag{font-size:12px;padding:3px 10px;border-radius:99px;background:var(--line);color:var(--sub)}
+.tag.ok{background:var(--ok-bg);color:var(--ok)}.tag.bad{background:var(--bad-bg);color:var(--bad)}.tag.warn{background:var(--warn-bg);color:var(--warn)}
+
+/* sheets */
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;pointer-events:none;transition:.2s;z-index:40}
+.scrim.open{opacity:1;pointer-events:auto}
+.sheet{position:fixed;left:0;right:0;bottom:0;max-width:600px;margin:0 auto;max-height:88vh;display:flex;flex-direction:column;z-index:50;
+  background:var(--sheet);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--line-2);border-bottom:0;border-radius:26px 26px 0 0;
+  transform:translateY(105%);visibility:hidden;transition:transform .28s cubic-bezier(.2,.8,.2,1),visibility 0s .28s;padding-bottom:env(safe-area-inset-bottom)}
+.sheet.open{transform:none;visibility:visible;transition:transform .28s cubic-bezier(.2,.8,.2,1)}
+.grab{width:40px;height:5px;border-radius:9px;background:var(--line-2);margin:10px auto 2px}
+.sheet-head{display:flex;justify-content:space-between;align-items:center;padding:8px 18px 10px}
+.sheet-title{font-size:18px;font-weight:600}
+.sheet-body{overflow:auto;padding:4px 18px 22px}
+.subnav{display:flex;gap:6px;padding:0 18px 10px;overflow-x:auto}
+.subnav button{padding:8px 14px;border-radius:99px;font-size:14px;color:var(--sub);background:var(--line);white-space:nowrap}
+.subnav button.on{background:var(--cy-d);color:var(--cy)}
+.sub{display:none}.sub.on{display:block}
+.steps{padding-left:20px;color:var(--tx-2);font-size:14px}.steps li{margin:4px 0}
+code{font-family:var(--mono);font-size:13px}
+.snippet{border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.snippet-head{display:flex;justify-content:space-between;align-items:center;padding:6px 8px 6px 14px;background:var(--card-2);font-size:13px;color:var(--sub)}
+.snippet pre{padding:12px 14px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all;color:var(--tx-2)}
+.kv{border:1px solid var(--line);border-radius:14px}
+.kv-row{display:flex;align-items:center;gap:10px;padding:10px 8px 10px 14px;border-bottom:1px solid var(--line)}
+.kv-row:last-child{border-bottom:0}
+.kv-row .label{color:var(--sub);font-size:13px;min-width:4.8em;flex:none}
+.kv-val{flex:1;min-width:0;font-family:var(--mono);font-size:13px;word-break:break-all}
+.label{color:var(--sub);font-size:13px}
+.gw-rule{font-size:13px;color:var(--tx-2);background:var(--card-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;line-height:1.6}
+.gw-card{flex-direction:column;gap:14px}
+.gw-top{display:flex;justify-content:space-between;align-items:center}
+.gw-title{font-weight:600}
+.gw-sw{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.gw-sw .t{display:flex;flex-direction:column}.gw-sw small{color:var(--sub);font-size:12px}
+.gw-field{display:flex;flex-direction:column;gap:6px}
+.gw-val{display:flex;gap:8px;align-items:center}
+.gw-val code{flex:1;min-width:0;word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.models{display:flex;flex-wrap:wrap;gap:8px}
+.model{font-family:var(--mono);font-size:13px;padding:8px 12px;border-radius:10px;background:var(--line);cursor:pointer}
+.model small{color:var(--sub);margin-left:6px}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{color:var(--sub);font-weight:400;text-align:left;padding:6px 6px;border-bottom:1px solid var(--line)}
+.tbl td{padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl .r{text-align:right}.muted{color:var(--sub)}
+.preview{color:var(--tx-2)}
+.empty-row td{text-align:center;color:var(--sub);padding:20px}
+.gate{position:fixed;inset:0;display:none;place-items:center;background:var(--bg);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);z-index:60;padding:24px}
+.gate.open{display:grid}
+.gate-box{width:100%;max-width:380px;background:var(--card);border:1px solid var(--line-2);border-radius:22px;padding:22px}
+.gate-box h2{font-size:20px}.gate-box p{color:var(--sub);margin:4px 0 14px}
+#toast{position:fixed;left:50%;top:calc(18px + env(safe-area-inset-top));transform:translate(-50%,-20px);opacity:0;transition:.25s;z-index:80;
+  background:var(--menu);border:1px solid var(--line-2);box-shadow:var(--shadow);backdrop-filter:blur(12px);padding:10px 18px;border-radius:99px;font-size:14px;pointer-events:none;max-width:90vw;text-align:center}
+#toast.show{opacity:1;transform:translate(-50%,0)}#toast.err{color:var(--bad)}
+</style>
+<script>
+(function(){
+  var m='';try{m=(window.AGApp&&AGApp.theme&&AGApp.theme())||localStorage.getItem('ag-theme')||''}catch(e){}
+  var light=m?m==='light':!(window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-theme',light?'light':'dark');
+})();
+</script>
+</head>
+<body>
+<div id="toast"></div>
+<div class="app">
+  <header class="topbar">
+    <div class="wordmark">AG Open</div>
+    <div style="display:flex;align-items:center;gap:2px">
+    <button class="icon-btn" id="theme-btn" aria-label="切换主题" onclick="toggleTheme()"></button>
+    <div class="menu-wrap">
+      <button class="icon-btn" aria-label="更多" onclick="toggleMenu()"><span class="dots"><i></i><i></i><i></i></span></button>
+      <div class="dropdown" id="menu">
+        <button onclick="menuGo(()=>loadQuota(true))">刷新额度 <span class="k">↻</span></button>
+        <button onclick="menuGo(()=>openSheet('sh-conn'))">客户端接入</button>
+        <button onclick="menuGo(()=>{openSheet('sh-conn');openSub('conn','conn-models')})">模型列表</button>
+        <a href="/token" target="_blank" rel="noopener" onclick="toggleMenu(false)">Token 助手 <span class="k">↗</span></a>
+        <button onclick="menuGo(clearLogs)">清空日志与统计</button>
+        <button class="app-only" onclick="menuGo(()=>window.AGApp && AGApp.checkUpdate && AGApp.checkUpdate())">检查更新</button>
+        <button onclick="menuGo(()=>setThemeMode(''))">主题跟随系统</button>
+        <button class="web-only" onclick="menuGo(logout)">退出登录</button>
+      </div>
+    </div>
+    </div>
+  </header>
+
+  <section class="card hero">
+    <div class="hero-top">
+      <div class="state" id="srv-status"><i></i><span id="srv-status-text">连接中</span></div>
+      <label class="sw app-only"><input type="checkbox" id="sw-gw-main" onchange="gwToggle(this.checked)"><i></i></label>
+    </div>
+    <div class="addr" id="hero-addr">—</div>
+    <div class="hero-bot">
+      <div class="keyline"><span>密钥</span><span class="mono" id="hero-key">—</span></div>
+      <button class="btn-ghost" onclick="copyConn()">复制接入</button>
+    </div>
+  </section>
+
+  <div class="stats">
+    <div class="card stat"><div class="lbl">请求总数</div><div class="big" id="st-req">—</div>
+      <div class="bd"><div><span>成功</span><b id="st-req-ok">—</b></div><div><span>失败</span><b id="st-req-err">—</b></div><div><span>平均延迟</span><b id="st-lat">—</b></div><div><span>平均首字</span><b id="st-ttft">—</b></div></div></div>
+    <div class="card stat"><div class="lbl">缓存命中率</div><div class="big" id="st-cache">—</div>
+      <div class="bd"><div><span>近 24h</span><b id="st-cache-24h">—</b></div><div><span>命中 Tokens</span><b id="st-cache-tok">—</b></div><div><span>提示 Tokens</span><b id="st-prompt-tok">—</b></div></div></div>
+    <div class="card stat wide"><div class="lbl">Tokens 合计</div><div class="big" id="st-tok">—</div>
+      <div class="bd">
+        <div><span>输入</span><b id="st-tok-in">—</b></div>
+        <div><span>缓存读取</span><b id="st-tok-cache">—</b></div>
+        <div><span>输出</span><b id="st-tok-out">—</b></div>
+        <div><span>其中思考</span><b id="st-tok-think">—</b></div>
+        <div><span>近 24h 请求</span><b id="st-24h-req">—</b></div>
+        <div><span>近 24h Tokens</span><b id="st-24h-tok">—</b></div>
+      </div></div>
+  </div>
+
+  <div class="sec"><h2>账号</h2><div class="r"><span id="acc-count"></span><button class="link" id="btn-refresh" onclick="loadQuota(true)">刷新额度</button></div></div>
+  <div id="acc-list"><div class="card empty">加载中</div></div>
+  <div class="note" id="sync-time" style="text-align:center"></div>
+
+  <div class="sec"><h2>最近请求</h2><div class="r"><button class="link" onclick="clearLogs()">清空</button></div></div>
+  <div class="card" id="log-list"><div class="empty">还没有请求</div></div>
+</div>
+
+<nav class="dock">
+  <button class="primary" onclick="openSheet('sh-add')">＋ 添加账号</button>
+  <button class="sec-b" onclick="openSheet('sh-test')">测试</button>
+  <button class="sec-b" onclick="openSettingsSheet()">设置</button>
+</nav>
+<div class="scrim" id="scrim" onclick="closeSheet()"></div>
+
+<div class="gate" id="gate">
+  <div class="gate-box">
+    <h2>登录</h2>
+    <p>输入管理密钥。</p>
+    <div class="line">
+      <input class="input" type="password" id="ipt-admin" placeholder="管理密钥" autocomplete="current-password">
+      <button class="btn btn-signal" onclick="doLogin()">进入</button>
+    </div>
+    <div class="msg" id="msg-gate"></div>
+  </div>
+</div>
+
+<!-- Sheet: add account -->
+<div class="sheet" id="sh-add">
+  <div class="grab"></div>
+  <div class="sheet-head"><span class="sheet-title">添加账号</span><button class="btn btn-text" onclick="closeSheet()">关闭</button></div>
+  <nav class="subnav" data-group="acc">
+    <button class="on" data-sub="acc-token-sub">粘贴 Token</button>
+    <button data-sub="acc-oauth-sub">浏览器授权</button>
+  </nav>
+  <div class="sheet-body">
+    <div class="sub on" id="acc-token-sub">
+      <p class="note" style="margin-top:0">已有 Refresh Token 直接粘贴。没有的话用「浏览器授权」获取。</p>
+      <div class="line">
+        <input class="input" type="text" id="ipt-token" placeholder="1//04..." autocomplete="off" spellcheck="false">
+        <button class="btn btn-solid" id="btn-submit-token" onclick="submitToken()">添加</button>
+      </div>
+      <div class="msg" id="msg-token"></div>
+    </div>
+    <div class="sub" id="acc-oauth-sub">
+      <ol class="steps" style="margin-bottom:14px">
+        <li><span>点「打开授权」，用 Google 账号登录</span></li>
+        <li><span>页面显示 <b>无法访问此网站</b> 是正常的，别关</span></li>
+        <li><span>复制地址栏<b>完整网址</b>（含 <code>code=</code>）</span></li>
+        <li><span>粘贴到下面，点「换票」</span></li>
+      </ol>
+      <div class="actions" style="margin-bottom:12px">
+        <a class="btn btn-solid" id="btn-oauth-link" href="#" target="_blank" rel="noopener">打开授权</a>
+        <button class="btn" onclick="copyAuthUrl()">复制链接</button>
+      </div>
+      <div class="line">
+        <input class="input" type="text" id="ipt-code" placeholder="http://localhost:51121/oauth-callback?code=..." autocomplete="off" spellcheck="false">
+        <button class="btn btn-solid" id="btn-submit-code" onclick="submitAuthCode()">换票</button>
+      </div>
+      <div class="msg" id="msg-oauth"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Sheet: test -->
+<div class="sheet" id="sh-test">
+  <div class="grab"></div>
+  <div class="sheet-head"><span class="sheet-title">连通性测试</span>
+    <div class="actions"><button class="btn btn-solid" id="btn-run-tests" onclick="runModelTest()">运行</button><button class="btn btn-text" onclick="closeSheet()">关闭</button></div>
+  </div>
+  <div class="sheet-body">
+    <table class="tbl test">
+      <thead><tr><th>模型</th><th class="r">延迟</th><th class="r">状态</th><th>返回</th></tr></thead>
+      <tbody id="test-body"><tr class="empty-row"><td colspan="4">点「运行」测试各模型</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Sheet: connect -->
+<div class="sheet" id="sh-gw">
+  <div class="grab"></div>
+  <div class="sheet-head"><span class="sheet-title">网关配置</span><button class="btn btn-text" onclick="closeSheet()">关闭</button></div>
+  <div class="sheet-body">
+    <div class="gw-card app-only" id="gw-card">
+      <div class="gw-top"><span class="gw-title">本机网关</span><span class="tag na" id="gw-state">—</span></div>
+      <label class="gw-sw"><span class="t">网关运行<small>关掉后外部客户端连不上</small></span><span class="sw"><input type="checkbox" id="sw-gw" onchange="gwToggle(this.checked)"><i></i></span></label>
+      <label class="gw-sw"><span class="t">悬浮球<small>桌面显示 AG 小球，点一下回到 App</small></span><span class="sw"><input type="checkbox" id="sw-bubble" onchange="bubbleToggle(this.checked)"><i></i></span></label>
+      <div class="gw-field"><span class="label">地址 Base URL</span>
+        <div class="gw-val"><code id="gw-url">—</code><button class="btn" onclick="copyText('gw-url')">复制</button></div></div>
+      <div class="gw-field"><span class="label">端口</span>
+        <div class="gw-val"><input class="input" id="gw-port" type="number" inputmode="numeric" min="1024" max="65535" style="flex:1;min-width:0"><button class="btn" onclick="gwSetPort()">修改</button></div></div>
+      <div class="gw-field"><span class="label">API Key</span>
+        <div class="gw-val"><code id="gw-key">—</code><button class="btn" onclick="copyText('gw-key')">复制</button></div>
+        <button class="btn" style="align-self:flex-start" onclick="gwRegen()">重新生成 Key</button></div>
+      <div class="gw-rule">协议选 <b>Anthropic (Messages)</b><br>Gemini 只走 Anthropic 协议，端点 <b>/v1/messages</b>。选 Chat Completions 会直接报错</div>
+    </div>
+  </div>
+</div>
+<div class="sheet" id="sh-conn">
+  <div class="grab"></div>
+  <div class="sheet-head"><span class="sheet-title">客户端接入</span><button class="btn btn-text" onclick="closeSheet()">关闭</button></div>
+  <nav class="subnav" data-group="conn">
+    <button class="on" data-sub="conn-claude">Claude Code</button>
+    <button data-sub="conn-cursor">通用客户端</button>
+    <button data-sub="conn-curl">cURL</button>
+    <button data-sub="conn-models">模型</button>
+  </nav>
+  <div class="sheet-body">
+    <div class="kv" style="margin-bottom:14px">
+      <div class="kv-row"><span class="label">Base URL</span><span class="kv-val" id="cfg-url">—</span><button class="btn btn-text" onclick="copyText('cfg-url')">复制</button></div>
+      <div class="kv-row app-only"><span class="label">API Key</span><span class="kv-val" id="cfg-key">—</span><button class="btn btn-text" onclick="copyText('cfg-key')">复制</button></div>
+    </div>
+    <div class="gw-rule" style="margin-bottom:14px">协议选 <b>Anthropic (Messages)</b><br>Gemini 只走 Anthropic 协议，端点 <b>/v1/messages</b>。选 Chat Completions 会直接报错</div>
+    <div class="sub on" id="conn-claude">
+      <div class="snippet"><div class="snippet-head"><span class="label">Terminal</span><button class="btn btn-text" onclick="copyText('cfg-claude-cmd')">复制</button></div><pre id="cfg-claude-cmd">—</pre></div>
+    </div>
+    <div class="sub" id="conn-cursor">
+      <p class="note" style="margin-top:0">支持自定义 Anthropic 接口的客户端都按这三项填写：</p>
+      <div class="snippet"><div class="snippet-head"><span class="label">Config</span><button class="btn btn-text" onclick="copyText('cfg-cursor')">复制</button></div><pre id="cfg-cursor">—</pre></div>
+    </div>
+    <div class="sub" id="conn-curl">
+      <div class="snippet"><div class="snippet-head"><span class="label">cURL</span><button class="btn btn-text" onclick="copyText('cfg-curl')">复制</button></div><pre id="cfg-curl">—</pre></div>
+    </div>
+    <div class="sub" id="conn-models">
+      <p class="note" style="margin-top:0">点击模型名复制</p>
+      <div class="models" id="model-chips">
+        <span class="model" data-copy="gemini-3.8-flash-high">gemini-3.8-flash-high</span>
+        <span class="model" data-copy="claude-sonnet-4-6">claude-sonnet-4-6</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+
+const $ = id => document.getElementById(id);
+let ADMIN = '';
+try { ADMIN = localStorage.getItem('ag-admin') || ''; } catch (e) {}
+if (window.AGApp || /[?&]app=1/.test(location.search)) document.documentElement.classList.add('in-app');
+setTimeout(() => { try { gwFill(); } catch (e) {} }, 0);
+try { if (window.AGApp && AGApp.adminKey) { const k = AGApp.adminKey(); if (k) { ADMIN = k; localStorage.setItem('ag-admin', k); } } } catch (e) {}
+const _fetch = window.fetch.bind(window);
+window.fetch = async (u, o = {}) => {
+  const headers = Object.assign({}, o.headers || {});
+  if (ADMIN) headers['x-admin-key'] = ADMIN;
+  const r = await _fetch(u, Object.assign({}, o, { headers }));
+  if (r.status === 401 && String(u).startsWith('/api/')) {
+    const c = r.clone(); try { const j = await c.json(); if (j.need_admin || j.error) showGate(); } catch (e) {}
+  }
+  return r;
+};
+function showGate(msg) {
+  try { if (window.AGApp && AGApp.adminKey) { const k = AGApp.adminKey(); if (k && k !== ADMIN) { ADMIN = k; localStorage.setItem('ag-admin', k); location.reload(); return; } } } catch (e) {} $('gate').classList.add('open'); if (msg) { const m = $('msg-gate'); m.className = 'msg show err'; m.textContent = msg; } setTimeout(() => $('ipt-admin').focus(), 50); }
+async function doLogin() {
+  const v = $('ipt-admin').value.trim(); if (!v) return;
+  const r = await _fetch('/api/status', { headers: { 'x-admin-key': v } });
+  if (r.ok) {
+    ADMIN = v;
+    try { localStorage.setItem('ag-admin', v); } catch (e) {}
+    $('gate').classList.remove('open'); $('ipt-admin').value = '';
+    await loadStatus(); loadQuota();
+    return;
+  }
+  showGate('密钥不对');
+}
+function logout() {
+  ADMIN = '';
+  try { localStorage.removeItem('ag-admin'); } catch (e) {}
+  showGate();
+}
+function fillSnippets(host, key) {
+  $('cfg-url').textContent = host;
+  $('cfg-claude-cmd').textContent = `export ANTHROPIC_BASE_URL="${host}"\nexport ANTHROPIC_API_KEY="${key}"\nclaude`;
+  $('cfg-cursor').textContent = `Base URL: ${host}\nAPI Key:  ${key}\nModel:    claude-sonnet-4-6`;
+  $('cfg-curl').textContent = `curl ${host}/v1/messages \\\n  -H "x-api-key: ${key}" \\\n  -H "anthropic-version: 2023-06-01" \\\n  -H "content-type: application/json" \\\n  -d '{"model":"claude-sonnet-4-6","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'`;
+}
+let allAccounts = [];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtNum = n => {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  n = Number(n);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'K';
+  return n.toLocaleString();
+};
+// 精确数值：千分位分组，不缩写
+const fmtInt = n => (n === null || n === undefined || isNaN(n)) ? '—' : Math.round(Number(n)).toLocaleString('en-US');
+const fmtPct = r => (r === null || r === undefined || isNaN(r)) ? '—' : (r * 100).toFixed(1) + '%';
+const hitRate = (input, cached) => { const d = (input || 0) + (cached || 0); return d > 0 ? (cached || 0) / d : null; };
+const hitCls = r => r === null || r === undefined ? '' : r >= 0.5 ? 'hit-hi' : r >= 0.1 ? 'hit-mid' : '';
+const fmtSec = ms => (ms === null || ms === undefined || isNaN(ms) || ms <= 0) ? '—' : (ms / 1000).toFixed(2) + 's';
+const fmtTime = l => {
+  if (!l.timestamp) return esc(l.time || '');
+  const d = new Date(l.timestamp), now = new Date(), p = v => String(v).padStart(2, '0');
+  const t = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return d.toDateString() === now.toDateString() ? t : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${t}`;
+};
+// 大数字自动缩小字号，保证完整显示
+function fitNums() {
+  document.querySelectorAll('.stat .big, .addr').forEach(el => {
+    el.style.fontSize = '';
+    let size = parseFloat(getComputedStyle(el).fontSize);
+    while (el.scrollWidth > el.clientWidth + 1 && size > 12) { size -= 1; el.style.fontSize = size + 'px'; }
+  });
+}
+try { new ResizeObserver(() => { clearTimeout(window._fitT); window._fitT = setTimeout(fitNums, 60); }).observe(document.documentElement); } catch (e) {}
+window.addEventListener('resize', () => { clearTimeout(window._fitT); window._fitT = setTimeout(fitNums, 120); });
+function renderStats(s) {
+  const inT = s.input_tokens || 0, caT = s.cached_tokens || 0, outT = s.output_tokens || 0;
+  $('st-req').textContent = fmtInt(s.total_requests);
+  $('st-req-ok').textContent = fmtInt(s.success_requests ?? s.total_requests);
+  $('st-req-err').textContent = fmtInt(s.error_requests ?? 0);
+  $('st-lat').textContent = fmtSec(s.avg_latency_ms);
+  $('st-ttft').textContent = fmtSec(s.avg_ttft_ms);
+  $('st-cache-tok').textContent = fmtInt(caT);
+  $('st-prompt-tok').textContent = fmtInt(inT + caT);
+  $('st-tok').textContent = fmtInt(inT + caT + outT);
+  $('st-tok-in').textContent = fmtInt(inT);
+  $('st-tok-cache').textContent = fmtInt(caT);
+  $('st-tok-out').textContent = fmtInt(outT);
+  $('st-tok-think').textContent = fmtInt(s.thoughts_tokens || 0);
+  $('st-cache').textContent = fmtPct(s.cache_hit_rate !== undefined ? s.cache_hit_rate : hitRate(inT, caT));
+  const d = s.last_24h || {};
+  $('st-cache-24h').textContent = fmtPct(d.cache_hit_rate !== undefined ? d.cache_hit_rate : hitRate(d.input, d.cached));
+  $('st-24h-req').textContent = fmtInt(d.requests ?? 0);
+  $('st-24h-tok').textContent = fmtInt(d.tokens ?? 0);
+  requestAnimationFrame(fitNums);
+}
+
+let toastTimer;
+function showToast(msg, isErr = false) {
+  const t = $('toast'); t.textContent = msg; t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = '', 2200);
+}
+async function copyVal(str) {
+  try { await navigator.clipboard.writeText(str); }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = str; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (_) {} ta.remove();
+  }
+  showToast('已复制');
+}
+function copyText(id) { copyVal($(id).textContent); }
+function setBusy(btn, busy, label) {
+  if (!btn) return;
+  if (busy) { btn.dataset.label = btn.innerHTML; btn.disabled = true; btn.classList.add('busy'); btn.innerHTML = label || btn.innerHTML; }
+  else { btn.disabled = false; btn.classList.remove('busy'); if (btn.dataset.label) btn.innerHTML = btn.dataset.label; }
+}
+function setServer(state, text) {
+  const map = { ok: '运行中', warn: '待添加账号', err: '已停止' };
+  $('srv-status').className = 'state ' + (state === 'ok' ? '' : state);
+  $('srv-status-text').textContent = text || map[state] || state;
+  GW_UP = state !== 'err';
+  ['sw-gw', 'sw-gw-main'].forEach(id => { const sw = $(id); if (sw) sw.checked = GW_UP; });
+  const t = $('gw-state'); if (t) { t.textContent = GW_UP ? '运行中' : '已停止'; t.className = 'tag ' + (GW_UP ? 'ok' : 'na'); }
+}
+function curKey() { return (window.AGApp && AGApp.adminKey && AGApp.adminKey()) || ADMIN || ''; }
+const maskKey = k => !k ? '未设置' : k.length <= 10 ? k : k.slice(0, 6) + '****' + k.slice(-4);
+function gwFill() {
+  const k = curKey();
+  if ($('hero-addr')) { $('hero-addr').textContent = window.location.host; requestAnimationFrame(fitNums); }
+  if ($('hero-key')) $('hero-key').textContent = maskKey(k);
+  if (!$('gw-url')) return;
+  $('gw-url').textContent = window.location.origin;
+  $('gw-key').textContent = k || '—';
+  if ($('cfg-key')) $('cfg-key').textContent = k || '—';
+  const sb = $('sw-bubble'); if (sb && window.AGApp && AGApp.isBubble) sb.checked = AGApp.isBubble();
+  const pi = $('gw-port'); if (pi && window.AGApp && AGApp.port && document.activeElement !== pi) pi.value = AGApp.port();
+}
+function copyConn() {
+  const k = curKey();
+  copyVal(`Base URL: ${location.origin}\nAPI Key: ${k || '（未设置）'}\n协议: Anthropic Messages (/v1/messages)`);
+}
+function openSettingsSheet() { openSheet(window.AGApp ? 'sh-gw' : 'sh-conn'); }
+let GW_UP = false;
+function gwToggle(on) {
+  if (!window.AGApp) { showToast('请在 App 里操作', true); return; }
+  if (on) { AGApp.startGateway(); }
+  else if (AGApp.stopGateway) { AGApp.stopGateway(); setServer('err'); }
+}
+function gwSetPort() {
+  const p = parseInt($('gw-port').value, 10);
+  if (!(p >= 1024 && p <= 65535)) return showToast('端口要在 1024 到 65535 之间', true);
+  if (window.AGApp && AGApp.port && p === AGApp.port()) return showToast('端口没变');
+  if (window.AGApp && AGApp.setPort && AGApp.setPort(p)) showToast('正在用新端口重启…');
+}
+function gwRegen() {
+  if (!confirm('重新生成后旧 Key 立刻失效，客户端要换成新 Key。继续？')) return;
+  if (window.AGApp && AGApp.regenKey) { try { localStorage.removeItem('ag-admin'); } catch (e) {} AGApp.regenKey(); }
+}
+function bubbleToggle(on) { if (window.AGApp && AGApp.setBubble) AGApp.setBubble(on, GW_UP); }
+async function loadLogs() {
+  const tb = $('log-list'); if (!tb) return;
+  try {
+    const r = await fetch('/api/logs'); if (!r.ok) return;
+    const logs = (await r.json()).slice(0, 30);
+    tb.innerHTML = logs.length ? logs.map(l => {
+      const ok = l.status >= 200 && l.status < 300;
+      const t = l.tokens || {}; const i = t.input || 0, c = t.cached || 0, o = t.output || 0, th = t.thoughts || 0;
+      const tot = t.total ?? (i + c + o);
+      const hr = l.cache_hit_rate !== undefined ? l.cache_hit_rate : hitRate(i, c);
+      return `<div class="log"><div class="log-h"><span class="log-m">${esc(l.model || '—')}</span><span class="${ok ? 'ok-t' : 'bad-t'}">${esc(l.status)}</span></div>
+        <div class="log-s">${fmtTime(l)} · ${esc(l.email || '')} · ${fmtSec(l.latency_ms)}${l.ttft_ms ? ' · 首字 ' + fmtSec(l.ttft_ms) : ''}</div>
+        ${l.error ? `<div class="log-s" style="color:var(--bad)">${esc(String(l.error))}</div>` : ''}
+        <div class="tk"><span>合计 <b>${fmtInt(tot)}</b></span><span>输入 <b>${fmtInt(i)}</b></span><span>缓存 <b>${fmtInt(c)}</b></span><span>输出 <b>${fmtInt(o)}</b></span>${th ? `<span>思考 <b>${fmtInt(th)}</b></span>` : ''}<span>命中 <b class="${hitCls(hr)}">${fmtPct(hr)}</b></span></div></div>`;
+    }).join('') : '<div class="empty">还没有请求</div>';
+  } catch (e) {}
+}
+async function clearLogs() {
+  if (!confirm('确定彻底清空历史日志并将统计用量归零吗？')) return;
+  try {
+    await fetch('/api/logs/clear?all=1', { method: 'POST', headers: { 'x-admin-key': ADMIN || '' } });
+    loadLogs();
+    loadStats();
+    loadStatus();
+  } catch (e) {}
+}
+
+let cachedAuthUrl = '';
+let activeEmail = '';
+
+const SUN = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></svg>';
+const MOON = '<svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>';
+function themeMode() { try { return (window.AGApp && AGApp.theme && AGApp.theme()) || localStorage.getItem('ag-theme') || ''; } catch (e) { return ''; } }
+function sysLight() { return !(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches); }
+function applyTheme() {
+  const m = themeMode(); const light = m ? m === 'light' : sysLight();
+  document.documentElement.setAttribute('data-theme', light ? 'light' : 'dark');
+  const mc = document.querySelector('meta[name=theme-color]'); if (mc) mc.content = light ? '#f4f6f9' : '#07090c';
+  const b = $('theme-btn'); if (b) b.innerHTML = light ? MOON : SUN;
+  return light;
+}
+function setThemeMode(m) {
+  try { m ? localStorage.setItem('ag-theme', m) : localStorage.removeItem('ag-theme'); } catch (e) {}
+  const light = (function () { document.documentElement.removeAttribute('data-theme'); return m ? m === 'light' : sysLight(); })();
+  try { if (window.AGApp && AGApp.setTheme) AGApp.setTheme(m, light); } catch (e) {}
+  applyTheme();
+  if (!m) showToast('主题已跟随系统');
+}
+function toggleTheme() { setThemeMode(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light'); }
+if (window.matchMedia) matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!themeMode()) { applyTheme(); try { AGApp.setTheme('', sysLight()); } catch (e) {} } });
+let FAILS = 0, RETRY_T;
+async function loadStatus() {
+  try {
+    const res = await fetch('/api/status?_t=' + Date.now());
+    if (res.status === 401) { setServer('warn', '需要登录'); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const host = window.location.origin;
+    gwFill();
+    fillSnippets(host, ADMIN || '你的密钥');
+    cachedAuthUrl = data.auth_url || '';
+    $('btn-oauth-link').href = cachedAuthUrl || '#';
+    const accounts = data.accounts || [];
+    activeEmail = data.active_account?.email || '';
+        const s = data.stats || {};
+    renderStats(s);
+        $('acc-count').textContent = accounts.length ? accounts.length + ' 个' : '';
+    if (accounts.length === 0) setServer('warn'); else setServer('ok');
+    FAILS = 0;
+    allAccounts = accounts;
+    renderAccounts(accounts);
+    loadLogs();
+  } catch (e) {
+    FAILS++;
+    if (FAILS >= 3) setServer('err', '无法连接');
+    else { const t = $('srv-status-text'); if (t && FAILS === 2) t.textContent = '重新连接中…'; }
+    clearTimeout(RETRY_T); RETRY_T = setTimeout(loadStatus, 2000);
+  }
+}
+
+async function loadModels() {
+  try {
+    const d = await (await fetch('/api/models')).json();
+    const list = d.data || d.models || [];
+    if (!list.length) return;
+    $('model-chips').innerHTML = list.map(m => {
+      const note = (m.name || '').match(/\((.*)\)/);
+      return `<span class="model" data-copy="${esc(m.id)}">${esc(m.id)}${note ? `<small>${esc(note[1])}</small>` : ''}</span>`;
+    }).join('');
+  } catch (e) {}
+}
+
+document.addEventListener('click', e => {
+  const m = e.target.closest('.model[data-copy]');
+  if (m) copyVal(m.dataset.copy);
+  const act = e.target.closest('[data-act]');
+  if (act) {
+    if (act.dataset.act === 'switch') switchAccount(act.dataset.email, act);
+    if (act.dataset.act === 'remove') removeAccount(act.dataset.email, act);
+  }
+});
+
+const QUOTA = {};
+const QROWS = [['gemini_5h', 'Gemini 5H'], ['gemini_7d', 'Gemini 7D'], ['claude_5h', 'Claude 5H'], ['claude_7d', 'Claude 7D']];
+function fmtReset(o) {
+  if (!o) return '';
+  let s = o.reset_text || '';
+  if (o.reset_time) {
+    const t = new Date(o.reset_time);
+    if (!isNaN(t)) s += (s ? ' · ' : '') + t.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+  return s ? '重置 ' + s : '';
+}
+function renderAccounts(accounts) {
+  const c = $('acc-list');
+  if (!accounts.length) { c.innerHTML = '<div class="card empty">还没有账号，点下方「添加账号」</div>'; return; }
+  c.innerHTML = accounts.map(acc => {
+    const email = acc.email || '';
+    const on = email === activeEmail;
+    const q = QUOTA[email];
+    let rows;
+    if (!q) rows = '<div class="note" style="margin:0">额度读取中…</div>';
+    else if (!q.ok) rows = `<div class="note" style="margin:0;color:var(--warn)">${esc(q.error || q.message || '额度读取失败')}</div>`;
+    else rows = QROWS.map(([k, name]) => {
+      const o = q[k];
+      const p = (o && o.percentage !== null && o.percentage !== undefined) ? Math.max(0, Math.min(100, Number(o.percentage))) : null;
+      const lv = p === null ? '' : p >= 30 ? '' : p > 0 ? 'warn' : 'bad';
+      const rs = fmtReset(o);
+      return `<div class="q"><span class="n">${name}</span><div class="bar ${lv}"><i style="width:${p ?? 0}%"></i></div><span class="p">${p === null ? '—' : (Math.round(p * 10) / 10) + '%'}</span>${rs ? `<span class="rs">${esc(rs)}</span>` : ''}</div>`;
+    }).join('');
+    return `<div class="card acc${on ? ' on' : ''}">
+      <div class="acc-h"><div class="acc-mail">${esc(email)}</div><span class="pill">${on ? '主控' : '备用'}</span></div>
+      ${rows}
+      <div class="acc-f">${on ? '' : `<button class="btn-t" data-act="switch" data-email="${esc(email)}">设为主控</button>`}<button class="btn-t danger" data-act="remove" data-email="${esc(email)}">移除</button></div>
+    </div>`;
+  }).join('');
+}
+
+async function loadQuota(manual = false) {
+  const btn = $('btn-refresh');
+  setBusy(btn, true, '同步中');
+  try {
+    await Promise.all(allAccounts.map(async a => {
+      try { QUOTA[a.email] = await (await fetch('/api/gemini/quota?email=' + encodeURIComponent(a.email) + '&_t=' + Date.now())).json(); }
+      catch (e) { QUOTA[a.email] = { ok: false, error: '网络异常' }; }
+    }));
+    renderAccounts(allAccounts);
+    $('sync-time').textContent = allAccounts.length ? '额度同步于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) : '';
+    if (manual) showToast('额度已更新');
+  } catch (e) { if (manual) showToast('额度获取失败', true); }
+  finally { setBusy(btn, false); }
+}
+
+async function runModelTest() {
+  const btn = $('btn-run-tests');
+  setBusy(btn, true, '测试中');
+  const tb = $('test-body');
+  tb.innerHTML = '<tr class="empty-row"><td colspan="4">正在请求上游…</td></tr>';
+  try {
+    const data = await (await fetch('/api/gemini/test', { method: 'POST' })).json();
+    if (data.models && data.models.length) {
+      tb.innerHTML = data.models.map(m => `<tr>
+        <td class="mono">${esc(m.name)}</td>
+        <td class="mono r muted">${esc(m.latency_ms)}ms</td>
+        <td class="r"><span class="tag ${m.ok ? 'ok' : 'bad'}">${m.ok ? 'OK' : 'FAIL'}</span></td>
+        <td class="preview-cell"><span class="preview">${esc(m.preview || m.message || '')}</span></td>
+      </tr>`).join('');
+      const ok = data.models.filter(m => m.ok).length;
+      showToast(`${ok}/${data.models.length} 正常`, ok < data.models.length);
+    } else {
+      tb.innerHTML = `<tr class="empty-row"><td colspan="4" style="color:var(--bad)">${esc(data.message || '测试失败')}</td></tr>`;
+    }
+  } catch (e) {
+    tb.innerHTML = '<tr class="empty-row"><td colspan="4" style="color:var(--bad)">网络异常</td></tr>';
+  } finally { setBusy(btn, false); }
+}
+
+function openSheet(id) {
+  document.querySelectorAll('.sheet').forEach(s => s.classList.toggle('open', s.id === id));
+  $('scrim').classList.add('open');
+}
+function closeSheet() {
+  document.querySelectorAll('.sheet').forEach(s => s.classList.remove('open'));
+  $('scrim').classList.remove('open');
+}
+function toggleMenu(force) {
+  const m = $('menu'); m.classList.toggle('open', typeof force === 'boolean' ? force : !m.classList.contains('open'));
+}
+function menuGo(fn) { toggleMenu(false); fn(); }
+document.addEventListener('click', e => { if (!e.target.closest('.menu-wrap')) toggleMenu(false); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSheet(); toggleMenu(false); } });
+function openSub(group, id) {
+  const nav = document.querySelector(`.subnav[data-group="${group}"]`);
+  nav.querySelectorAll('button').forEach(b => {
+    const on = b.dataset.sub === id; b.classList.toggle('on', on);
+    $(b.dataset.sub).classList.toggle('on', on);
+  });
+}
+document.querySelectorAll('.subnav').forEach(n => n.addEventListener('click', e => {
+  const b = e.target.closest('button[data-sub]'); if (b) openSub(n.dataset.group, b.dataset.sub);
+}));
+function copyAuthUrl() { cachedAuthUrl ? copyVal(cachedAuthUrl) : showToast('授权链接未加载', true); }
+function setMsg(el, type, text) {
+  if (!type) { el.className = 'msg'; el.textContent = ''; return; }
+  el.className = 'msg show ' + type; el.textContent = text;
+}
+
+async function addAccount({ url, body, btn, input, msg, infoText, okText, failText }) {
+  const v = input.value.trim();
+  if (!v) return showToast('请先粘贴内容', true);
+  setBusy(btn, true, '…');
+  setMsg(msg, 'info', infoText);
+  try {
+    const d = await (await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body(v)) })).json();
+    if (d.ok) {
+      setMsg(msg, 'ok', '✓ ' + (d.message || okText)); showToast(okText); input.value = '';
+      await loadStatus(); loadQuota();
+      setTimeout(() => { setMsg(msg); closeSheet(); if (d.email) setTimeout(() => showToast('账号已添加，可以直接用'), 250); }, 900);
+    } else { setMsg(msg, 'err', '✕ ' + (d.error || failText)); showToast(d.error || failText, true); }
+  } catch (e) { setMsg(msg, 'err', '✕ 网络异常：' + e.message); showToast('网络异常', true); }
+  finally { setBusy(btn, false); }
+}
+function submitToken() {
+  return addAccount({ url: '/api/accounts/add-token', body: v => ({ refresh_token: v }), btn: $('btn-submit-token'), input: $('ipt-token'), msg: $('msg-token'),
+    infoText: '正在向 Google 校验 Token…', okText: '账号已添加', failText: 'Token 校验失败' });
+}
+function submitAuthCode() {
+  return addAccount({ url: '/api/oauth/exchange', body: v => ({ code_or_url: v }), btn: $('btn-submit-code'), input: $('ipt-code'), msg: $('msg-oauth'),
+    infoText: '正在交换 Refresh Token…', okText: '授权成功', failText: '换票失败，确认网址含 code=' });
+}
+async function switchAccount(email, btn) {
+  setBusy(btn, true);
+  try {
+    await fetch('/api/accounts/switch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+    showToast('已切换 ' + email); await loadStatus(); loadQuota();
+  } catch (e) { showToast('切换失败', true); setBusy(btn, false); }
+}
+async function removeAccount(email, btn) {
+  if (!confirm('移除账号 ' + email + '？')) return;
+  setBusy(btn, true);
+  try {
+    await fetch('/api/accounts/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+    showToast('已移除'); await loadStatus(); loadQuota();
+  } catch (e) { showToast('移除失败', true); setBusy(btn, false); }
+}
+$('ipt-token').addEventListener('keydown', e => { if (e.key === 'Enter') submitToken(); });
+$('ipt-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitAuthCode(); });
+
+applyTheme();
+(async () => {
+  if (!ADMIN) { try { const h = await (await _fetch('/health')).json(); if (h.auth) showGate(); } catch (e) {} }
+  await loadStatus(); loadQuota(); loadModels();
+  setInterval(loadStatus, 30000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadStatus(); });
+})();
+</script>
+</body>
+</html>
