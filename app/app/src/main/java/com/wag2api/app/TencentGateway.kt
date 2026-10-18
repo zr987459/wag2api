@@ -103,6 +103,17 @@ object TencentGateway {
     @Synchronized
     fun getReasoning(key: String): String? = reasoningCache[key]
 
+    /** 按 tool_call_id 后缀查找思考内容（不依赖当前账号，兼容多账号轮换） */
+    @Synchronized
+    fun getReasoningByToolId(toolCallId: String): String? {
+        if (toolCallId.isEmpty()) return null
+        val suffix = ":$toolCallId"
+        for ((k, v) in reasoningCache) {
+            if (k.endsWith(suffix)) return v
+        }
+        return null
+    }
+
     const val UPSTREAM_GLOBAL = "https://www.workbuddy.ai"
     const val UPSTREAM_CN = "https://copilot.tencent.com"
     const val CLIENT_UA = "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
@@ -434,7 +445,7 @@ object TencentGateway {
                             val id = calls.getJSONObject(k).optString("id")
                             if (id.isNotEmpty()) {
                                 // 按 $uid:$tool_call_id 精准匹配，避免跨账号串味
-                                val cached = getReasoning("$uid:$id")
+                                val cached = getReasoningByToolId(id)
                                 if (!cached.isNullOrEmpty()) {
                                     m.put("reasoning_content", cached)
                                     break

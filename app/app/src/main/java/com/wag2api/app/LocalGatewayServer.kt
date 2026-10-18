@@ -168,7 +168,7 @@ class LocalGatewayServer(
                             j.toString()
                         } catch (e: Exception) { body }
                     } else body
-                    dispatchWorkBuddy(output, path, query, wbBody, headers)
+                    dispatchWorkBuddy(output, method, path, query, wbBody, headers)
                     output.flush()
                     client.close()
                     return
@@ -182,6 +182,7 @@ class LocalGatewayServer(
     /** 原 WB 路由表，保持不动 */
     private fun dispatchWorkBuddy(
         output: OutputStream,
+        method: String,
         path: String,
         query: String,
         body: String,
