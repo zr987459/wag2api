@@ -27,16 +27,7 @@ jobs:
         working-directory: .
         run: npm test
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: 宿主路由单测
-        working-directory: app
-        run: |
-          chmod +x gradlew
-          ./gradlew :app:testFullDebugUnitTest --no-daemon
+      # 宿主 Kotlin 编译检查放在 apk job 里做（那里已有 NDK 与 libnode）
 
   # ─────────────────────────────────────────────
   # 2. APK：full + lite 一次出两个包
