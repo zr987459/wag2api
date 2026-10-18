@@ -6,22 +6,32 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
- * Token 保活：定期检查 + 401 时即时刷新。
+ * Token 保活：定期续期 + 401 时即时刷新。
  *
- * 腾讯的 accessToken 有有效期，过期后上游直接 401。
- * 这里做两件事：
- *  1. 后台定时（默认 30 分钟）尝试刷新一次，提前续期
- *  2. 请求遇到 401 时立刻刷新，成功则原样重试
+ * 刷新协议（与官方 CLI / CLIProxyAPI 的 codebuddy 实现一致）：
+ *   POST {base}/v2/plugin/auth/token/refresh   body = {}
+ *   Authorization: Bearer <旧 accessToken>
+ *   X-Refresh-Token: <refreshToken>
+ *   X-Auth-Refresh-Source: plugin
+ *   X-User-Id / X-Domain
+ *   → { code: 0, data: { accessToken, refreshToken, expiresIn, refreshExpiresIn, domain } }
+ *
+ * 注意：/v2/plugin/auth/token 是登录轮询端点（GET ?state=），不是刷新端点。
  */
 object TokenKeeper {
 
     private const val TAG = "TokenKeeper"
 
-    /** 提前刷新的间隔：30 分钟 */
+    /** 定时续期间隔：30 分钟 */
     private const val REFRESH_INTERVAL_MS = 30 * 60 * 1000L
+
+    /** 同一账号两次刷新的最小间隔（定时任务会跳过刚被 401 路径刷过的账号） */
+    private const val MIN_REFRESH_GAP_MS = 5 * 60 * 1000L
 
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
@@ -30,20 +40,25 @@ object TokenKeeper {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    @Volatile private var lastRefreshAt = 0L
-    @Volatile private var running = false
+    /** uid -> 锁对象：同一账号的刷新串行化（refreshToken 可能是一次性的，并发刷新会互相作废） */
+    private val locks = ConcurrentHashMap<String, Any>()
+    /** uid -> 上次刷新成功时间 */
+    private val lastOkAt = ConcurrentHashMap<String, Long>()
 
-    /** 启动后台保活线程 */
+    @Volatile private var worker: Thread? = null
+
+    /** 启动后台保活线程（幂等） */
+    @Synchronized
     fun start() {
-        if (running) return
-        running = true
-        Thread({
-            while (running) {
+        if (worker?.isAlive == true) return
+        worker = Thread({
+            var lastRunAt = 0L
+            while (!Thread.currentThread().isInterrupted) {
                 try {
                     Thread.sleep(60_000)          // 每分钟检查一次是否到点
-                    if (System.currentTimeMillis() - lastRefreshAt >= REFRESH_INTERVAL_MS) {
+                    if (System.currentTimeMillis() - lastRunAt >= REFRESH_INTERVAL_MS) {
                         refreshAll()
-                        lastRefreshAt = System.currentTimeMillis()
+                        lastRunAt = System.currentTimeMillis()
                     }
                 } catch (e: InterruptedException) {
                     break
@@ -51,22 +66,27 @@ object TokenKeeper {
                     Log.w(TAG, "保活循环异常: ${e.message}")
                 }
             }
-        }, "token-keeper").start()
+        }, "token-keeper").apply { isDaemon = true; start() }
     }
 
-    fun stop() { running = false }
+    @Synchronized
+    fun stop() {
+        worker?.interrupt()
+        worker = null
+    }
 
-    /** 遍历所有有 refreshToken 的账号，尝试续期 */
+    /** 遍历所有有 refreshToken 的账号续期；最近 5 分钟内刷过的跳过 */
     fun refreshAll() {
         val accounts = AccountVault.getAccounts()
+        val now = System.currentTimeMillis()
         for (i in 0 until accounts.length()) {
             val a = accounts.optJSONObject(i) ?: continue
             if (a.optBoolean("disabled", false)) continue
             val uid = a.optString("uid")
-            val refresh = a.optString("refreshToken")
-            if (uid.isEmpty() || refresh.isEmpty()) continue
+            if (uid.isEmpty() || a.optString("refreshToken").isEmpty()) continue
+            if (now - (lastOkAt[uid] ?: 0L) < MIN_REFRESH_GAP_MS) continue
             try {
-                refreshIfPossible(uid, force = true)
+                refreshIfPossible(uid)
             } catch (e: Exception) {
                 Log.w(TAG, "刷新 $uid 失败: ${e.message}")
             }
@@ -75,55 +95,75 @@ object TokenKeeper {
 
     /**
      * 刷新指定账号的 accessToken。
-     * @return true 表示刷新成功
+     *
+     * @param staleAccessToken 调用方手上那个已经 401 的 token。拿到锁后若发现库里的 token
+     *        已经不是它（别的请求刚刷新过），直接返回 true，不重复打上游。
+     * @return true 表示库里现在有一个比 staleAccessToken 更新的 token
      */
-    fun refreshIfPossible(uid: String, force: Boolean = false): Boolean {
+    fun refreshIfPossible(uid: String, staleAccessToken: String? = null): Boolean {
+        val lock = locks.getOrPut(uid) { Any() }
+        synchronized(lock) {
+            val acc = findAccount(uid) ?: return false
+            val current = acc.optString("accessToken")
+            if (staleAccessToken != null && current.isNotEmpty() && current != staleAccessToken) return true
+
+            val refresh = acc.optString("refreshToken")
+            if (refresh.isEmpty()) return false
+            return doRefresh(uid, acc, current, refresh)
+        }
+    }
+
+    private fun findAccount(uid: String): JSONObject? {
         val accounts = AccountVault.getAccounts()
-        var target: JSONObject? = null
         for (i in 0 until accounts.length()) {
             val a = accounts.optJSONObject(i) ?: continue
-            if (a.optString("uid") == uid) { target = a; break }
+            if (a.optString("uid") == uid) return a
         }
-        val acc = target ?: return false
+        return null
+    }
 
-        val refresh = acc.optString("refreshToken")
-        if (refresh.isEmpty()) return false
-
+    private fun doRefresh(uid: String, acc: JSONObject, accessToken: String, refresh: String): Boolean {
         val realm = acc.optString("realm", "global")
         val base = if (realm == "cn") TencentGateway.UPSTREAM_CN else TencentGateway.UPSTREAM_GLOBAL
-
-        // 腾讯 OAuth 刷新端点
-        val bodyJson = JSONObject().apply {
-            put("grant_type", "refresh_token")
-            put("refresh_token", refresh)
+        val domain = acc.optString("domain").ifEmpty {
+            if (realm == "cn") "www.codebuddy.cn" else "www.workbuddy.ai"
         }
 
-        return try {
-            val req = Request.Builder()
-                .url("$base/v2/plugin/auth/token")
-                .header("Content-Type", "application/json")
-                .header("User-Agent", TencentGateway.CLIENT_UA)
-                .header("Origin", base)
-                .header("Referer", "$base/")
-                .post(bodyJson.toString().toRequestBody(jsonMedia))
-                .build()
+        val req = Request.Builder()
+            .url("$base/v2/plugin/auth/token/refresh")
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Content-Type", "application/json")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("User-Agent", TencentGateway.CLIENT_UA)
+            .header("Authorization", "Bearer $accessToken")
+            .header("X-Refresh-Token", refresh)
+            .header("X-Auth-Refresh-Source", "plugin")
+            .header("X-User-Id", uid)
+            .header("X-Domain", domain)
+            .header("X-Request-ID", UUID.randomUUID().toString().replace("-", ""))
+            .post("{}".toRequestBody(jsonMedia))
+            .build()
 
+        return try {
             client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "刷新 $uid 返回 ${resp.code}")
+                    // 401/403 = refreshToken 本身失效，只能重新登录；不要无限重试
+                    Log.w(TAG, "刷新 $uid 返回 HTTP ${resp.code}: ${text.take(200)}")
                     return false
                 }
-                val text = resp.body?.string() ?: return false
                 val o = try { JSONObject(text) } catch (e: Exception) { return false }
-                // 兼容多种返回结构
+                if (o.has("code") && o.optInt("code", -1) != 0) {
+                    Log.w(TAG, "刷新 $uid 业务失败 code=${o.optInt("code")} msg=${o.optString("msg")}")
+                    return false
+                }
                 val data = o.optJSONObject("data") ?: o
-                val newAccess = data.optString("accessToken")
-                    .ifEmpty { data.optString("access_token") }
-                val newRefresh = data.optString("refreshToken")
-                    .ifEmpty { data.optString("refresh_token") }
-
+                val newAccess = data.optString("accessToken").ifEmpty { data.optString("access_token") }
+                val newRefresh = data.optString("refreshToken").ifEmpty { data.optString("refresh_token") }
                 if (newAccess.isEmpty()) return false
+
                 AccountVault.updateTokens(uid, newAccess, newRefresh.ifEmpty { null })
+                lastOkAt[uid] = System.currentTimeMillis()
                 Log.i(TAG, "账号 $uid token 已续期")
                 true
             }

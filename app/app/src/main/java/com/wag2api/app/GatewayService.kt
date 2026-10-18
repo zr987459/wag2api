@@ -169,7 +169,8 @@ class GatewayService : Service() {
 
     private fun updateNotification() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
+        val p = server?.actualPort?.takeIf { it > 0 } ?: getPort(this)
+        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :$p"
         nm.notify(NOTIF_ID, buildNotification(text))
     }
 

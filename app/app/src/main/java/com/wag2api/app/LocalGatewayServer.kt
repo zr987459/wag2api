@@ -21,12 +21,29 @@ class LocalGatewayServer(
     private var serverSocket: ServerSocket? = null
     @Volatile private var isRunning = false
 
+    /** 实际监听的端口；-1 = 尚未绑定 / 绑定失败 */
+    @Volatile var actualPort: Int = -1
+        private set
+    @Volatile var bindError: String? = null
+        private set
+
     fun start() {
         if (isRunning) return
         isRunning = true
         thread(name = "LocalGatewayServer") {
             try {
-                serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
+                val loopback = InetAddress.getByName("127.0.0.1")
+                serverSocket = try {
+                    ServerSocket(port, 50, loopback)
+                } catch (e: java.net.BindException) {
+                    // 自定义端口被占用：回退默认端口，而不是让服务「看起来在跑」实际什么都没监听
+                    bindError = "端口 $port 被占用: ${e.message}"
+                    android.util.Log.e("LocalGatewayServer", bindError ?: "")
+                    if (port == GatewayService.DEFAULT_PORT) throw e
+                    ServerSocket(GatewayService.DEFAULT_PORT, 50, loopback)
+                }
+                actualPort = serverSocket?.localPort ?: -1
+                GatewayService.refreshNotification()
                 while (isRunning) {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true // 减少小包网络延迟
@@ -336,6 +353,8 @@ class LocalGatewayServer(
                     val res = JSONObject().apply {
                         put("ok", ok)
                         put("port", GatewayService.getPort(context))
+                        put("actual_port", actualPort)
+                        put("restart_required", ok && GatewayService.getPort(context) != actualPort)
                         if (ok) put("msg", "端口已保存，重启网关后生效")
                         else put("msg", "端口需在 1024~65535 之间")
                     }
@@ -344,6 +363,9 @@ class LocalGatewayServer(
                     val json = JSONObject().apply {
                         put("ok", true)
                         put("port", GatewayService.getPort(context))
+                        put("actual_port", actualPort)
+                        put("restart_required", GatewayService.getPort(context) != actualPort)
+                        bindError?.let { put("bind_error", it) }
                         put("default_port", GatewayService.DEFAULT_PORT)
                     }
                     sendJsonResponse(output, 200, json.toString())
@@ -583,14 +605,19 @@ class LocalGatewayServer(
                     TencentGateway.streamChat(oaiReq, convId) { line ->
                         val trimmed = line.trim()
                         if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
-                            try {
-                                val chunk = JSONObject(trimmed.substring(6))
+                            val chunk = try { JSONObject(trimmed.substring(6)) } catch (e: Exception) { null }
+                            if (chunk != null) {
                                 val u = chunk.optJSONObject("usage")
                                 if (u != null) {
                                     streamTokens = u.optInt("total_tokens", streamTokens)
                                 }
-                                translator.onChunk(chunk)
-                            } catch (ignored: Exception) {}
+                                try {
+                                    translator.onChunk(chunk)
+                                } catch (e: IOException) {
+                                    // 客户端断开：告诉网关停止读上游（旧实现吞掉异常，断开后仍把整段流读完）
+                                    return@streamChat false
+                                } catch (ignored: Exception) {}
+                            }
                         }
                         true
                     }

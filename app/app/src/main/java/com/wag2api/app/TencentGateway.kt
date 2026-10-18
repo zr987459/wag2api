@@ -30,6 +30,10 @@ object TencentGateway {
     private const val RETRY_BACKOFF_MS = 1200L
     /** 全部繁忙时的额外退避轮数 */
     private const val FINAL_BACKOFF_ROUNDS = 2
+    /** 单个请求最多发起的上游 HTTP 次数（含端点回退 / 换号 / 退避） */
+    private const val MAX_HTTP_CALLS = 10
+    /** 首字之前的重试总预算；超出直接把最后一个错误返回给客户端 */
+    private const val RETRY_BUDGET_MS = 20_000L
 
     /** 由 GatewayService 在启动时注入，供账号调度器读取偏好 */
     @Volatile private var appCtx: android.content.Context? = null
@@ -459,209 +463,233 @@ object TencentGateway {
 
         val endpoints = listOf("$base/v2/chat/completions", "$base/console/chat/completions")
         val cId = convId ?: UUID.randomUUID().toString().replace("-", "")
+        val bodyStr = upstreamPayload.toString()
 
+        val state = StreamState()
         var lastErr: Exception? = null
-        val triedUids = LinkedHashSet<String>()
-        // 一旦已经向客户端吐过字，就不能再重试，否则会出现重复输出
-        var emittedAny = false
+        var httpCalls = 0
+        val deadline = System.currentTimeMillis() + RETRY_BUDGET_MS
+        if (!AccountScheduler.hasUsableAccount(realm)) {
+            throw IllegalStateException("未登录账号，请先在面板添加账号")
+        }
 
-        // 最多轮换 3 个账号；每个账号内部再按端点回退
-        for (attempt in 1..MAX_ACCOUNT_ATTEMPTS) {
-            val acc = AccountScheduler.pick(ctx, realm, triedUids)
-                ?: AccountVault.getActiveAccount(realm)
-                ?: throw IllegalStateException("未登录账号，请先在面板添加账号")
+        // 第 0 轮只用非冷却账号；之后每轮先退避，再允许挑「冷却最快结束」的账号。
+        // 迭代实现，硬上限 = 轮数 × 账号数 × 端点数，且受 MAX_HTTP_CALLS / RETRY_BUDGET_MS 双重约束。
+        roundLoop@ for (round in 0..FINAL_BACKOFF_ROUNDS) {
+            if (round > 0) {
+                val wait = RETRY_BACKOFF_MS * round
+                if (System.currentTimeMillis() + wait > deadline) break@roundLoop
+                Log.i(TAG, "全部账号繁忙，退避 ${wait}ms 后第 $round 轮重试")
+                Thread.sleep(wait)
+            }
 
-            val uid = acc.optString("uid", "user_default")
-            triedUids.add(uid)
+            val tried = HashSet<String>()
+            var onlyRateLimited = true
 
-            val machineId = sha256Prefix("wb2a:machine:$uid")
-            val sessionId = sha256Prefix("wb2a:session:$uid")
-
-            var rateLimited = false
-
-            for ((i, url) in endpoints.withIndex()) {
-                val isLast = i == endpoints.lastIndex
-                val reqBuilder = Request.Builder()
-                    .url(url)
-                    .header("Authorization", "Bearer ${acc.optString("accessToken")}")
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json, text/event-stream")
-                    .header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
-                    .header("X-Requested-With", "XMLHttpRequest")
-                    .header("X-CodeBuddy-Request", "1")
-                    .header("User-Agent", CLIENT_UA)
-                    .header("Origin", base)
-                    .header("Referer", "$base/")
-                    .header("X-User-Id", uid)
-                    .header("X-Product", "WorkBuddy")
-                    .header("X-Agent-Purpose", "conversation")
-                    .header("X-IDE-Name", "WorkBuddy")
-                    .header("X-IDE-Type", "WorkBuddy")
-                    .header("X-IDE-Version", "5.5.4")
-                    .header("X-Machine-ID", machineId)
-                    .header("X-Session-ID", sessionId)
-                    .header("X-Conversation-ID", cId)
-                    .header("X-Conversation-Request-ID", UUID.randomUUID().toString().replace("-", ""))
-                    .header("X-Conversation-Message-ID", UUID.randomUUID().toString().replace("-", ""))
-                    .header("X-Root-Request-ID", UUID.randomUUID().toString().replace("-", ""))
-                    .header("X-Trace-ID", UUID.randomUUID().toString().replace("-", ""))
-
-                if (realm == "global") {
-                    reqBuilder.header("X-No-Enterprise-Id", "1")
-                    reqBuilder.header("X-Domain", "www.workbuddy.ai")
-                } else {
-                    reqBuilder.header("X-No-Enterprise-Id", "1")
-                    reqBuilder.header("X-No-Department-Info", "1")
-                }
-
-                val req = reqBuilder.post(upstreamPayload.toString().toRequestBody(jsonMedia)).build()
-
+            accountLoop@ for (n in 1..MAX_ACCOUNT_ATTEMPTS) {
+                val acc = AccountScheduler.acquire(ctx, realm, tried, allowCooling = round > 0) ?: break@accountLoop
+                val uid = acc.optString("uid", "user_default")
+                tried.add(uid)
+                val machineId = sha256Prefix("wb2a:machine:$uid")
+                val sessionId = sha256Prefix("wb2a:session:$uid")
+                var token = acc.optString("accessToken")
+                var refreshed = false
+                var ok = false
                 try {
-                    okHttpClient.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) {
-                            val body = resp.body?.string().orEmpty()
-                            val errCode = upstreamCode(body)
-                            val snippet = if (isWafBlocked(resp.code, body)) {
-                                "Tencent Cloud WAF blocked request (pattern in prompt)"
-                            } else {
-                                body.take(300)
+                    var i = 0
+                    while (i < endpoints.size) {
+                        if (httpCalls >= MAX_HTTP_CALLS || System.currentTimeMillis() > deadline) break@roundLoop
+                        httpCalls++
+                        val r = attemptOnce(endpoints[i], token, uid, realm, base, cId, bodyStr,
+                            machineId, sessionId, state, onLine)
+                        when (r) {
+                            is Outcome.Done -> {
+                                ok = true
+                                return
                             }
-                            val err = UpstreamException(resp.code, errCode, url, snippet)
-                            Log.w(TAG, err.message ?: "")
-
-                            // 429 / 14003：限流，打冷却 + 换账号
-                            if (isRateLimited(resp.code, errCode, body)) {
-                                rateLimited = true
+                            is Outcome.RateLimited -> {
+                                // 限流跟账号走，不跟端点走：直接换账号，不再浪费一次 /console
+                                lastErr = r.err
                                 AccountScheduler.markCooling(uid)
-                                lastErr = err
-                                return@use
+                                continue@accountLoop
                             }
-
-                            // token 失效：先尝试刷新，再换账号
-                            if (isAuthExpired(resp.code, body)) {
-                                TokenKeeper.refreshIfPossible(uid)
-                                lastErr = err
-                                return@use
-                            }
-
-                            if (!isLast && shouldTryNext(resp.code, errCode, body)) {
-                                lastErr = err
-                                return@use
-                            }
-                            throw err
-                        }
-
-                        val source = resp.body?.source()
-                            ?: throw IOException("empty upstream body @ $url")
-                        var first = true
-                        val reasoningBuf = java.lang.StringBuilder()
-                        val toolIds = java.util.ArrayList<String>()
-
-                        while (!source.exhausted()) {
-                            val line = source.readUtf8Line() ?: break
-                            if (line.isEmpty()) continue
-                            if (first) {
-                                first = false
-                                val code = upstreamCode(line)
-                                if (code != null && code != 0) {
-                                    val err = UpstreamException(resp.code, code, url, line.take(500))
-                                    // 首帧就是限流错误：还没吐字，安全重试
-                                    if (isRateLimited(resp.code, code, line)) {
-                                        rateLimited = true
-                                        AccountScheduler.markCooling(uid)
-                                        lastErr = err
-                                        return@use
-                                    }
-                                    if (!isLast && shouldTryNext(resp.code, code, line)) {
-                                        lastErr = err
-                                        return@use
-                                    }
-                                    throw err
-                                }
-                            }
-
-                            try {
-                                if (line.startsWith("data: ")) {
-                                    val s = line.substring(6).trim()
-                                    if (s.startsWith("{") && s != "[DONE]") {
-                                        val delta = JSONObject(s).optJSONArray("choices")
-                                            ?.optJSONObject(0)?.optJSONObject("delta")
-                                        val r = delta?.optString("reasoning_content")
-                                        if (!r.isNullOrEmpty()) reasoningBuf.append(r)
-                                        val tc = delta?.optJSONArray("tool_calls")
-                                        if (tc != null) {
-                                            for (idx in 0 until tc.length()) {
-                                                val tid = tc.getJSONObject(idx).optString("id")
-                                                if (tid.isNotEmpty()) toolIds.add(tid)
-                                            }
-                                        }
+                            is Outcome.AuthExpired -> {
+                                lastErr = r.err
+                                onlyRateLimited = false
+                                if (!refreshed) {
+                                    refreshed = true
+                                    if (TokenKeeper.refreshIfPossible(uid, token)) {
+                                        token = currentToken(uid) ?: token
+                                        continue        // 同一端点、同一账号、新 token 再试一次
                                     }
                                 }
-                            } catch (ignored: Exception) {}
-
-                            emittedAny = true
-                            val keepGoing = onLine("$line\n\n")
-                            if (!keepGoing) break
-                        }
-
-                        if (reasoningBuf.isNotEmpty()) {
-                            val fullR = reasoningBuf.toString()
-                            for (tid in toolIds) {
-                                recordReasoning("$uid:$tid", fullR)
+                                continue@accountLoop
+                            }
+                            is Outcome.NextEndpoint -> {
+                                lastErr = r.err
+                                onlyRateLimited = false
+                                i++
                             }
                         }
-
-                        AccountScheduler.touch(uid)
-                        return
                     }
-                } catch (e: UpstreamException) {
-                    // 限流已在上面处理；其余错误若还有端点可退，继续
-                    if (!isLast && !rateLimited) {
-                        lastErr = e
-                        continue
-                    }
-                    if (rateLimited) continue
-                    throw e
-                } catch (e: IOException) {
-                    Log.w(TAG, "network error @ $url: ${e.message}")
-                    lastErr = e
-                    if (isLast) continue
+                } finally {
+                    AccountScheduler.release(uid, ok)
                 }
             }
 
-            // 已经吐字给客户端了，无论成败都不能再重试（否则重复输出）
-            if (emittedAny) {
-                lastErr?.let { throw it }
-                return
-            }
-
-            // 这个账号的所有端点都试完了
-            if (!rateLimited && lastErr == null) break
-            if (attempt < MAX_ACCOUNT_ATTEMPTS) {
-                // 全是限流的话，短暂退避再换账号（腾讯限流是瞬时的）
-                if (rateLimited) Thread.sleep(RETRY_BACKOFF_MS)
-            }
+            // 非限流类失败（5xx / 网络 / token 失效）不做全局退避，直接把最后的错误抛给客户端
+            if (!onlyRateLimited) break@roundLoop
         }
 
-        // 已经吐字了就不再退避重试，直接结束
-        if (emittedAny) return
+        throw lastErr ?: IOException("upstream retry budget exhausted")
+    }
 
-        // 所有账号都被限流：最后再做一轮退避重试
-        for (round in 1..FINAL_BACKOFF_ROUNDS) {
-            val acc = AccountScheduler.pick(ctx, realm, emptySet())
-                ?: AccountVault.getActiveAccount(realm)
-                ?: break
-            Log.i(TAG, "全部账号繁忙，退避第 $round 轮重试")
-            Thread.sleep(RETRY_BACKOFF_MS * round)
-            try {
-                AccountScheduler.clearAllCooldowns()
-                streamChat(payload, convId, onLine)
-                return
-            } catch (e: Exception) {
-                lastErr = e
-            }
+    private class StreamState { var emittedAny = false }
+
+    private sealed class Outcome {
+        object Done : Outcome()
+        class RateLimited(val err: Exception) : Outcome()
+        class AuthExpired(val err: Exception) : Outcome()
+        class NextEndpoint(val err: Exception) : Outcome()
+    }
+
+    private fun currentToken(uid: String): String? {
+        val all = AccountVault.getAccounts()
+        for (i in 0 until all.length()) {
+            val a = all.optJSONObject(i) ?: continue
+            if (a.optString("uid") == uid) return a.optString("accessToken").ifEmpty { null }
         }
+        return null
+    }
 
-        lastErr?.let { throw it }
+    /**
+     * 对单个端点发一次请求。
+     *  - 首字之前的可重试错误 → 返回 Outcome，由调用方决定换端点 / 换账号 / 刷新 token
+     *  - 不可重试错误 → 抛出
+     *  - **一旦 onLine 被调用过（emittedAny=true），任何异常都直接抛出，绝不重试**
+     */
+    private fun attemptOnce(
+        url: String,
+        token: String,
+        uid: String,
+        realm: String,
+        base: String,
+        cId: String,
+        bodyStr: String,
+        machineId: String,
+        sessionId: String,
+        state: StreamState,
+        onLine: (String) -> Boolean
+    ): Outcome {
+        val reqBuilder = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $token")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("X-CodeBuddy-Request", "1")
+            .header("User-Agent", CLIENT_UA)
+            .header("Origin", base)
+            .header("Referer", "$base/")
+            .header("X-User-Id", uid)
+            .header("X-Product", "WorkBuddy")
+            .header("X-Agent-Purpose", "conversation")
+            .header("X-IDE-Name", "WorkBuddy")
+            .header("X-IDE-Type", "WorkBuddy")
+            .header("X-IDE-Version", "5.5.4")
+            .header("X-Machine-ID", machineId)
+            .header("X-Session-ID", sessionId)
+            .header("X-Conversation-ID", cId)
+            .header("X-Conversation-Request-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-Conversation-Message-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-Root-Request-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-Trace-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-No-Enterprise-Id", "1")
+        if (realm == "global") {
+            reqBuilder.header("X-Domain", "www.workbuddy.ai")
+        } else {
+            reqBuilder.header("X-No-Department-Info", "1")
+        }
+        val req = reqBuilder.post(bodyStr.toRequestBody(jsonMedia)).build()
+
+        try {
+            okHttpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    val errCode = upstreamCode(body)
+                    val snippet = if (isWafBlocked(resp.code, body)) {
+                        "Tencent Cloud WAF blocked request (pattern in prompt)"
+                    } else body.take(300)
+                    val err = UpstreamException(resp.code, errCode, url, snippet)
+                    Log.w(TAG, err.message ?: "")
+                    return when {
+                        isRateLimited(resp.code, errCode, body) -> Outcome.RateLimited(err)
+                        isAuthExpired(resp.code, body) -> Outcome.AuthExpired(err)
+                        shouldTryNext(resp.code, errCode, body) -> Outcome.NextEndpoint(err)
+                        else -> throw err
+                    }
+                }
+
+                val source = resp.body?.source() ?: return Outcome.NextEndpoint(IOException("empty upstream body @ $url"))
+                var first = true
+                val reasoningBuf = StringBuilder()
+                val toolIds = ArrayList<String>()
+
+                while (true) {
+                    val line = source.readUtf8Line() ?: break
+                    if (line.isEmpty()) continue
+                    if (first) {
+                        first = false
+                        val code = upstreamCode(line)
+                        if (code != null && code != 0) {
+                            val err = UpstreamException(resp.code, code, url, line.take(500))
+                            // 首帧就是错误：还没吐字，安全重试
+                            return when {
+                                isRateLimited(resp.code, code, line) -> Outcome.RateLimited(err)
+                                shouldTryNext(resp.code, code, line) -> Outcome.NextEndpoint(err)
+                                else -> throw err
+                            }
+                        }
+                    }
+
+                    try {
+                        if (line.startsWith("data: ")) {
+                            val s = line.substring(6).trim()
+                            if (s.startsWith("{")) {
+                                val delta = JSONObject(s).optJSONArray("choices")
+                                    ?.optJSONObject(0)?.optJSONObject("delta")
+                                val r = delta?.optString("reasoning_content")
+                                if (!r.isNullOrEmpty()) reasoningBuf.append(r)
+                                val tc = delta?.optJSONArray("tool_calls")
+                                if (tc != null) {
+                                    for (idx in 0 until tc.length()) {
+                                        val tid = tc.optJSONObject(idx)?.optString("id").orEmpty()
+                                        if (tid.isNotEmpty()) toolIds.add(tid)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (ignored: Exception) {}
+
+                    // 先置位再回调：哪怕 onLine 写到一半抛异常，也视为「已吐字」
+                    state.emittedAny = true
+                    if (!onLine("$line\n\n")) break     // 客户端已断开，正常结束
+                }
+
+                if (reasoningBuf.isNotEmpty()) {
+                    val fullR = reasoningBuf.toString()
+                    for (tid in toolIds) recordReasoning("$uid:$tid", fullR)
+                }
+                return Outcome.Done
+            }
+        } catch (e: UpstreamException) {
+            throw e
+        } catch (e: IOException) {
+            // 已吐字：流中断只能如实报错，重试会导致客户端收到重复内容
+            if (state.emittedAny) throw e
+            Log.w(TAG, "network error @ $url: ${e.message}")
+            return Outcome.NextEndpoint(e)
+        }
     }
 }
