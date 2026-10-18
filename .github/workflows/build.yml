@@ -70,49 +70,58 @@ jobs:
       # keystore：有 Secret 就用正式签名，没有就退回 debug
       - name: 解密 keystore
         env:
-          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+          KS_PW: ${{ secrets.KS_PW }}
         run: |
-          if [ -z "$KS_B64" ]; then
-            echo "::notice::未配置 KEYSTORE_B64，将使用 debug 签名构建"
-            exit 0
+          if [ -z "$KS_PW" ]; then
+            echo "::error::缺少 KS_PW，无法解密固定签名密钥，会导致每次签名不同、无法覆盖安装"
+            exit 1
           fi
           mkdir -p app/keystore
-          echo "$KS_B64" | base64 -d > app/keystore/release.p12
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in android/keystore/release.p12.enc \
+            -out app/keystore/release.p12 -pass env:KS_PW
+          echo "密钥已解密"
 
       - name: 构建 full + lite
         working-directory: app
         env:
-          KS_PW: ${{ secrets.KEYSTORE_PASSWORD }}
-          KS_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+          KS_PW: ${{ secrets.KS_PW }}
+          KS_ALIAS: ag
         run: |
           set -e
           chmod +x gradlew
-          if [ -n "$KS_PW" ] && [ -z "$KS_ALIAS" ]; then
-            echo "::error::配置了 KEYSTORE_PASSWORD 但缺少 KEYSTORE_ALIAS"
+          if [ ! -f keystore/release.p12 ]; then
+            echo "::error::未找到解密的密钥库，无法保证固定签名"
             exit 1
           fi
           ./gradlew assembleFullRelease assembleLiteRelease --no-daemon --stacktrace
 
       # 签名硬校验：证书指纹必须与仓库变量一致，否则失败
-      - name: 校验签名指纹
-        env:
-          EXPECTED: ${{ vars.RELEASE_CERT_SHA256 }}
-          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+      - name: 校验签名（full 与 lite 必须同签名）
         run: |
           set -e
-          if [ -z "$KS_B64" ]; then echo "debug 签名构建，跳过指纹校验"; exit 0; fi
-          if [ -z "$EXPECTED" ]; then echo "::notice::未配置 RELEASE_CERT_SHA256，跳过"; exit 0; fi
           BT=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
-          for f in app/app/build/outputs/apk/full/release/*.apk \
-                   app/app/build/outputs/apk/lite/release/*.apk; do
-            [ -f "$f" ] || continue
-            SHA=$("$BT" verify --print-certs "$f" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
-            echo "$f => $SHA"
-            if [ "$SHA" != "$EXPECTED" ]; then
-              echo "::error::签名指纹不匹配：$f"
+          FULL=$(ls app/app/build/outputs/apk/full/release/*.apk | head -1)
+          LITE=$(ls app/app/build/outputs/apk/lite/release/*.apk | head -1)
+          SHA_FULL=$("$BT" verify --print-certs "$FULL" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
+          SHA_LITE=$("$BT" verify --print-certs "$LITE" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
+          echo "full: $SHA_FULL"
+          echo "lite: $SHA_LITE"
+          if [ "$SHA_FULL" != "$SHA_LITE" ]; then
+            echo "::error::full 与 lite 签名不一致，无法互相覆盖安装"
+            exit 1
+          fi
+          if [ -n "$EXPECTED" ]; then
+            if [ "$SHA_FULL" != "$EXPECTED" ]; then
+              echo "::error::签名指纹与 RELEASE_CERT_SHA256 不一致，会导致无法覆盖安装"
               exit 1
             fi
-          done
+            echo "签名指纹校验通过"
+          else
+            echo "::notice::未配置 RELEASE_CERT_SHA256，已跳过指纹比对"
+          fi
+        env:
+          EXPECTED: ${{ vars.RELEASE_CERT_SHA256 }}
 
       - name: 检查产物结构
         run: |

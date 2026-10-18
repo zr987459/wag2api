@@ -44,13 +44,14 @@ android {
 
     signingConfigs {
         create("release") {
-            // CI 解密后放到 app/keystore/release.p12；本地没有则回退 debug 签名
+            // CI 从 android/keystore/release.p12.enc 解密到此路径。
+            // 必须固定同一个密钥库，否则每次构建签名不同，手机无法覆盖安装。
             val ks = rootProject.file("keystore/release.p12")
             if (ks.exists()) {
                 storeFile = ks
                 storeType = "pkcs12"
                 storePassword = System.getenv("KS_PW") ?: ""
-                keyAlias = System.getenv("KS_ALIAS") ?: "wag2api"
+                keyAlias = System.getenv("KS_ALIAS") ?: "ag"
                 keyPassword = System.getenv("KS_PW") ?: ""
             }
             enableV1Signing = true
@@ -63,6 +64,14 @@ android {
             isMinifyEnabled = false
             val hasKs = rootProject.file("keystore/release.p12").exists() &&
                     !System.getenv("KS_PW").isNullOrEmpty()
+            // CI 环境（GITHUB_ACTIONS）必须用正式签名，否则每次签名不同会导致无法覆盖安装
+            val inCi = !System.getenv("GITHUB_ACTIONS").isNullOrEmpty()
+            if (inCi && !hasKs) {
+                throw GradleException(
+                    "CI 环境缺少固定签名密钥库（keystore/release.p12 或 KS_PW），" +
+                    "继续构建会导致签名不一致、手机无法覆盖安装。已中止。"
+                )
+            }
             signingConfig = if (hasKs) signingConfigs.getByName("release")
                             else signingConfigs.getByName("debug")
             proguardFiles(
