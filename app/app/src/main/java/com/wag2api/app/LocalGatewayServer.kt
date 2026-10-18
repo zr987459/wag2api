@@ -283,6 +283,72 @@ class LocalGatewayServer(
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).put("engine", e).toString())
             }
 
+            // 1.10 API: 账号池状态（含冷却、最近使用、请求数）
+            path == "/panel/api/pool" || path == "/m/api/pool" -> {
+                val json = JSONObject().apply {
+                    put("ok", true)
+                    put("accounts", AccountScheduler.poolStatus())
+                    put("selected_uid", AccountScheduler.getSelectedUid(context))
+                }
+                sendJsonResponse(output, 200, json.toString())
+            }
+
+            // 1.11 API: 切换当前账号
+            path == "/panel/api/pool/select" || path == "/m/api/pool/select" -> {
+                val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
+                if (uid.isEmpty()) {
+                    sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "uid 不能为空").toString())
+                } else {
+                    AccountScheduler.setSelectedUid(context, uid)
+                    sendJsonResponse(output, 200, JSONObject().put("ok", true).put("uid", uid).toString())
+                }
+            }
+
+            // 1.12 API: 清除所有账号冷却
+            path == "/panel/api/pool/clear-cooldown" || path == "/m/api/pool/clear-cooldown" -> {
+                AccountScheduler.clearAllCooldowns()
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
+            }
+
+            // 1.13 API: 启用 / 禁用账号
+            path == "/panel/api/pool/toggle" || path == "/m/api/pool/toggle" -> {
+                val j = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
+                val uid = j.optString("uid")
+                val disabled = j.optBoolean("disabled", false)
+                if (uid.isNotEmpty()) AccountVault.setDisabled(uid, disabled)
+                sendJsonResponse(output, 200, JSONObject().put("ok", uid.isNotEmpty()).toString())
+            }
+
+            // 1.14 API: 手动触发 token 保活刷新
+            path == "/panel/api/tokens/refresh" || path == "/m/api/tokens/refresh" -> {
+                Thread {
+                    try { TokenKeeper.refreshAll() } catch (ignored: Exception) {}
+                }.start()
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("msg", "已在后台刷新").toString())
+            }
+
+            // 1.15 API: 读取 / 修改监听端口
+            path == "/panel/api/settings/port" || path == "/m/api/settings/port" -> {
+                if (method == "POST") {
+                    val np = try { JSONObject(body).optInt("port", 0) } catch (e: Exception) { 0 }
+                    val ok = GatewayService.setPort(context, np)
+                    val res = JSONObject().apply {
+                        put("ok", ok)
+                        put("port", GatewayService.getPort(context))
+                        if (ok) put("msg", "端口已保存，重启网关后生效")
+                        else put("msg", "端口需在 1024~65535 之间")
+                    }
+                    sendJsonResponse(output, 200, res.toString())
+                } else {
+                    val json = JSONObject().apply {
+                        put("ok", true)
+                        put("port", GatewayService.getPort(context))
+                        put("default_port", GatewayService.DEFAULT_PORT)
+                    }
+                    sendJsonResponse(output, 200, json.toString())
+                }
+            }
+
             // 2. API: 发起授权
             path == "/panel/api/login/start" || path == "/m/api/auth/start" -> {
                 val realm = try { JSONObject(body).optString("realm", "global") } catch (e: Exception) { "global" }

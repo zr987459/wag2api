@@ -245,4 +245,60 @@ object AccountVault {
         if (list.length() > 0) return list.getJSONObject(0)
         return null
     }
+
+    /** 就地修改某个账号的字段（不动 token），用于记 last_used / 冷却等 */
+    @Synchronized
+    fun updateAccount(uid: String, block: (JSONObject) -> Unit) {
+        val list = getAccounts()
+        val next = JSONArray()
+        for (i in 0 until list.length()) {
+            val a = list.getJSONObject(i)
+            if (a.optString("uid") == uid) block(a)
+            next.put(a)
+        }
+        prefs.edit().putString(KEY_ACCOUNTS, next.toString()).apply()
+    }
+
+    /** 更新账号的 accessToken / refreshToken（token 保活成功后调用） */
+    @Synchronized
+    fun updateTokens(uid: String, accessToken: String, refreshToken: String? = null) {
+        val list = getAccounts()
+        var nickname = ""
+        var realm = "global"
+        val next = JSONArray()
+        for (i in 0 until list.length()) {
+            val a = list.getJSONObject(i)
+            if (a.optString("uid") == uid) {
+                a.put("accessToken", accessToken)
+                if (!refreshToken.isNullOrEmpty()) a.put("refreshToken", refreshToken)
+                nickname = a.optString("nickname")
+                realm = a.optString("realm", "global")
+            }
+            next.put(a)
+        }
+        prefs.edit().putString(KEY_ACCOUNTS, next.toString()).apply()
+
+        // 同步落盘到 auths/
+        try {
+            val authsDir = File(appContext.filesDir, "auths").apply { mkdirs() }
+            val file = File(authsDir, "workbuddy-$uid.json")
+            val fullObj = JSONObject().apply {
+                put("account", JSONObject().apply {
+                    put("uid", uid)
+                    put("nickname", nickname)
+                })
+                put("auth", JSONObject().apply {
+                    put("accessToken", accessToken)
+                    if (!refreshToken.isNullOrEmpty()) put("refreshToken", refreshToken)
+                    put("realm", realm)
+                })
+            }
+            file.writeText(fullObj.toString(2))
+        } catch (ignored: Exception) {}
+    }
+
+    @Synchronized
+    fun setDisabled(uid: String, disabled: Boolean) {
+        updateAccount(uid) { it.put("disabled", disabled) }
+    }
 }

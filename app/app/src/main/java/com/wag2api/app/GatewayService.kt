@@ -27,7 +27,25 @@ class GatewayService : Service() {
     companion object {
         const val CHANNEL_ID = "wag2api_gateway_channel"
         const val NOTIF_ID = 8800
-        const val PORT = 8800
+        /** 默认端口，可在设置里改 */
+        const val DEFAULT_PORT = 8800
+
+        private const val PREF = "wag2api_settings"
+        private const val KEY_PORT = "listen_port"
+
+        /** 读取用户自定义端口，非法值回退默认 */
+        fun getPort(ctx: Context): Int {
+            val p = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .getInt(KEY_PORT, DEFAULT_PORT)
+            return if (p in 1024..65535) p else DEFAULT_PORT
+        }
+
+        fun setPort(ctx: Context, port: Int): Boolean {
+            if (port !in 1024..65535) return false
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .edit().putInt(KEY_PORT, port).apply()
+            return true
+        }
 
         @Volatile var isRunning = false
         @Volatile private var instance: GatewayService? = null
@@ -76,6 +94,9 @@ class GatewayService : Service() {
 
         AccountVault.init(applicationContext)
         GatewayMetrics.init(applicationContext)
+        AccountScheduler.init(applicationContext)
+        TencentGateway.attach(applicationContext)
+        TokenKeeper.start()          // token 后台保活
         createNotificationChannel()
         startForegroundServiceNotification()   // 必须在 startForegroundService 后 5 秒内调用
 
@@ -83,8 +104,9 @@ class GatewayService : Service() {
         EngineFactory.injectToken(applicationContext)
 
         // 前门先起来，WB 毫秒级就绪
+        val listenPort = getPort(applicationContext)
         server = LocalGatewayServer(
-            applicationContext, PORT, engine,
+            applicationContext, listenPort, engine,
             onBusy = ::onRequestStart,
             onIdle = ::onRequestEnd
         )
@@ -147,7 +169,7 @@ class GatewayService : Service() {
 
     private fun updateNotification() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :$PORT"
+        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
         nm.notify(NOTIF_ID, buildNotification(text))
     }
 
@@ -169,7 +191,7 @@ class GatewayService : Service() {
     }
 
     private fun startForegroundServiceNotification() {
-        val notification = buildNotification("WB ✓ · AG 启动中 · 本地端口 :$PORT")
+        val notification = buildNotification("WB ✓ · AG 启动中 · 本地端口 :${getPort(this)}")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // Android 14+ 要求显式声明 specialUse，否则后台启动会被拒
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -182,6 +204,7 @@ class GatewayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        TokenKeeper.stop()
         try { engine.stop() } catch (ignored: Exception) {}
         server?.stop()
         isRunning = false

@@ -76,9 +76,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun waitForServerAndLoad() {
         Thread {
+            val port = GatewayService.getPort(applicationContext)
             for (i in 1..40) {
                 try {
-                    Socket("127.0.0.1", GatewayService.PORT).close()
+                    Socket("127.0.0.1", port).close()
                     break
                 } catch (e: Exception) {
                     Thread.sleep(150)
@@ -86,7 +87,7 @@ class MainActivity : AppCompatActivity() {
             }
             handler.post {
                 // 直接访问本地前门，100% 同源，零跨域阻断
-                webView.loadUrl("http://127.0.0.1:${GatewayService.PORT}/")
+                webView.loadUrl("http://127.0.0.1:$port/")
             }
         }.start()
     }

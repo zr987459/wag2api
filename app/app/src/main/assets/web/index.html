@@ -86,6 +86,19 @@
     </div>
 
     <div class="card">
+      <div class="section-title">服务设置</div>
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+        <span style="font-size: 13px; white-space: nowrap;">监听端口</span>
+        <input type="number" id="portInput" class="input-field" style="margin-bottom: 0; flex: 1;"
+               min="1024" max="65535" placeholder="8800" />
+        <button class="btn btn-primary btn-sm" onclick="savePort()">保存</button>
+      </div>
+      <p style="font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.6;">
+        修改后需重启网关（或重开 App）生效。范围 1024~65535。
+      </p>
+    </div>
+
+    <div class="card">
       <div class="section-title">快捷操作</div>
       <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
         移动端已全面精简国内碎包积分噪点，专注于纯净的账号纳管与大模型 API 转发。
@@ -108,6 +121,27 @@
         <button class="btn btn-primary btn-sm" onclick="openAuthModal()">+ 授权</button>
       </div>
     </div>
+
+    <div class="card" style="margin-bottom: 14px;">
+      <div class="section-title" style="margin-bottom: 10px;">
+        <span>账号调度</span>
+        <button class="btn btn-outline btn-sm" onclick="clearCooldowns()">清除冷却</button>
+      </div>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.6;">
+        遇到「模型繁忙」会自动换账号重试。冷却中的账号会暂时跳过。
+      </p>
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
+        <span style="font-size: 13px;">当前使用</span>
+        <select id="activeAccountSelect" class="input-field" style="margin-bottom: 0; flex: 1; max-width: 60%;" onchange="selectAccount(this.value)">
+          <option value="">自动轮询</option>
+        </select>
+      </div>
+      <div style="display: flex; gap: 8px; margin-top: 10px;">
+        <button class="btn btn-outline" style="flex: 1;" onclick="refreshTokens()">🔄 Token 保活</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="loadPool()">刷新状态</button>
+      </div>
+    </div>
+
     <div id="accountList">
       <div style="text-align: center; padding: 40px; color: var(--text-dim);">加载账号中...</div>
     </div>

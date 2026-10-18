@@ -95,6 +95,8 @@ async function loadOverview() {
     const infoCore = document.getElementById('infoCoreUrl');
     if (infoCore) infoCore.textContent = window.location.origin;
     await refreshEngineState();
+    await loadPool();
+    await loadPort();
   } catch (e) {
     statusText.textContent = '连接中断';
     statusPill.style.color = 'var(--danger)';
@@ -120,14 +122,28 @@ async function loadAccounts() {
       return;
     }
 
+    const pool = await loadPool();
+    const poolMap = {};
+    (pool && pool.accounts ? pool.accounts : []).forEach(x => { poolMap[x.uid] = x; });
+    const selectedUid = (pool && pool.selected_uid) || '';
+
     container.innerHTML = accounts.map(a => {
       const initial = (a.nickname || 'U').charAt(0).toUpperCase();
-      const isOnline = !a.disabled && !a.cooling;
+      const p = poolMap[a.uid] || {};
+      const cooling = !!p.cooling;
+      const disabled = !!p.disabled || !!a.disabled;
+      const isActive = selectedUid && selectedUid === a.uid;
+
+      const isOnline = !disabled && !cooling;
       const statusClass = isOnline ? 'tag-online' : 'tag-offline';
-      const statusText = isOnline ? '● 在线' : (a.disabled ? '● 已停用' : '● 冷却中');
+      let statusText = '● 在线';
+      if (disabled) statusText = '● 已禁用';
+      else if (cooling) statusText = `● 冷却 ${p.cooldown_sec || 0}s`;
+
       const realmText = a.realm === 'global' ? '国际版' : '国内版';
       const tokensUsed = (a.token_usage && a.token_usage.total_tokens) ? a.token_usage.total_tokens.toLocaleString() : '0';
       const creditsDisplay = a.credits >= 0 ? `· 积分 ${a.credits}` : '';
+      const activeTag = isActive ? '<span class="tag tag-online">当前</span>' : '';
 
       return `
         <div class="item-card">
@@ -138,12 +154,14 @@ async function loadAccounts() {
                 <span>${escapeHtml(a.nickname)}</span>
                 <span class="tag tag-global">${realmText}</span>
                 <span class="tag ${statusClass}">${statusText}</span>
+                ${activeTag}
               </div>
               <div class="item-sub">UID: ${escapeHtml(a.uid)} ${creditsDisplay} · 消耗: ${tokensUsed} tokens</div>
             </div>
           </div>
-          <div style="display: flex; gap: 6px;">
-            <button class="btn btn-outline btn-sm" onclick="copyText('${escapeHtml(a.uid)}')">复制UID</button>
+          <div style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
+            <button class="btn btn-outline btn-sm" onclick="selectAccount('${escapeHtml(a.uid)}').then(()=>{loadAccounts();loadPool();})">使用</button>
+            <button class="btn btn-outline btn-sm" onclick="toggleAccount('${escapeHtml(a.uid)}', ${!disabled})">${disabled ? '启用' : '禁用'}</button>
             <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.4);" onclick="deleteAccount('${escapeHtml(a.uid)}')">删除</button>
           </div>
         </div>`;
@@ -650,4 +668,98 @@ async function restartAgEngine() {
 
 function openAgConsole() {
   window.location.href = '/ag/';
+}
+
+// ── 账号池调度 ────────────────────────────────────────────
+
+async function loadPool() {
+  try {
+    const res = await fetch('/panel/api/pool', { cache: 'no-store' });
+    if (!res.ok) return;
+    const d = await res.json();
+    const sel = document.getElementById('activeAccountSelect');
+    if (sel) {
+      const cur = d.selected_uid || '';
+      sel.innerHTML = '<option value="">自动轮询</option>';
+      (d.accounts || []).forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a.uid;
+        let label = a.nickname || a.uid.slice(0, 10);
+        if (a.cooling) label += `（冷却 ${a.cooldown_sec}s）`;
+        if (a.disabled) label += '（已禁用）';
+        opt.textContent = label;
+        sel.appendChild(opt);
+      });
+      sel.value = cur;
+    }
+    return d;
+  } catch (e) { return null; }
+}
+
+async function selectAccount(uid) {
+  try {
+    await fetch('/panel/api/pool/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid })
+    });
+  } catch (e) { alert('切换失败：' + e.message); }
+}
+
+async function clearCooldowns() {
+  try {
+    await fetch('/panel/api/pool/clear-cooldown', { method: 'POST' });
+    loadPool();
+    alert('已清除所有账号冷却');
+  } catch (e) { alert('操作失败：' + e.message); }
+}
+
+async function refreshTokens() {
+  try {
+    const r = await fetch('/panel/api/tokens/refresh', { method: 'POST' });
+    const d = await r.json();
+    alert(d.msg || '已在后台刷新 Token');
+  } catch (e) { alert('刷新失败：' + e.message); }
+}
+
+async function toggleAccount(uid, disabled) {
+  try {
+    await fetch('/panel/api/pool/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid, disabled })
+    });
+    loadAccounts();
+    loadPool();
+  } catch (e) { alert('操作失败：' + e.message); }
+}
+
+// ── 端口设置 ──────────────────────────────────────────────
+
+async function loadPort() {
+  try {
+    const res = await fetch('/panel/api/settings/port', { cache: 'no-store' });
+    if (!res.ok) return;
+    const d = await res.json();
+    const el = document.getElementById('portInput');
+    if (el) el.value = d.port || 8800;
+  } catch (e) {}
+}
+
+async function savePort() {
+  const el = document.getElementById('portInput');
+  const port = parseInt(el.value, 10);
+  if (!port || port < 1024 || port > 65535) {
+    alert('端口需在 1024~65535 之间');
+    return;
+  }
+  try {
+    const r = await fetch('/panel/api/settings/port', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port })
+    });
+    const d = await r.json();
+    alert(d.msg || (d.ok ? '已保存' : '保存失败'));
+  } catch (e) { alert('保存失败：' + e.message); }
 }
