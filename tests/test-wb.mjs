@@ -476,6 +476,105 @@ test('server.mjs 安卓模式（ENGINE_TOKEN）：不加载 WB，行为不变', 
   } finally { child.kill(); }
 });
 
+test('server.mjs：HOST=0.0.0.0 且没有 ADMIN_KEY 时打印安全警告', async () => {
+  const { child, log } = await startServer({ HOST: '0.0.0.0' });
+  try {
+    await new Promise(r => setTimeout(r, 200));
+    assert.match(log(), /安全警告/);
+    assert.match(log(), /tokens\/export/);
+  } finally { child.kill(); }
+  const s2 = await startServer({ HOST: '0.0.0.0', ADMIN_KEY: 'k' });
+  try { await new Promise(r => setTimeout(r, 200)); assert.doesNotMatch(s2.log(), /安全警告/); } finally { s2.child.kill(); }
+});
+
+// ── persist：WB 数据同步到 GitHub state 分支（本地假 GitHub API）────────
+function fakeGitHub() {
+  const files = new Map(); // path -> {content(base64), sha}
+  let n = 0, puts = 0;
+  const srv = http.createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const chunks = []; for await (const c of req) chunks.push(c);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null;
+    const send = (st, o) => { res.writeHead(st, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+    if (/\/branches\//.test(u.pathname)) return send(200, { name: 'state' });
+    const m = u.pathname.match(/^\/repos\/[^/]+\/[^/]+\/contents\/(.+)$/);
+    if (!m) return send(404, {});
+    const p = decodeURIComponent(m[1]);
+    if (req.method === 'GET') {
+      if (files.has(p)) return send(200, { type: 'file', path: p, sha: files.get(p).sha, content: files.get(p).content });
+      const kids = [...files.keys()].filter(k => k.startsWith(p + '/') && !k.slice(p.length + 1).includes('/'));
+      return kids.length ? send(200, kids.map(k => ({ type: 'file', path: k, name: k.split('/').pop(), sha: files.get(k).sha }))) : send(404, {});
+    }
+    if (req.method === 'PUT') { puts++; const sha = 's' + (++n); files.set(p, { content: body.content, sha }); return send(200, { content: { sha } }); }
+    if (req.method === 'DELETE') { files.delete(p); return send(200, {}); }
+    send(404, {});
+  });
+  return { srv, files, puts: () => puts, read: p => files.has(p) ? Buffer.from(files.get(p).content, 'base64').toString() : null };
+}
+
+test('persist：WB 账号 / 设置 / 统计同步到云端，重新部署后恢复；最近使用不触发提交', async () => {
+  const gh = fakeGitHub();
+  await new Promise(r => gh.srv.listen(0, '127.0.0.1', r));
+  process.env.GH_API = `http://127.0.0.1:${gh.srv.address().port}`;
+  process.env.GH_TOKEN = 't'; process.env.GH_REPO = 'o/r';
+  try {
+    const { Persist, stripVolatile, mergeVolatile } = await import('../src/persist.mjs?wb=' + Date.now());
+    assert.deepEqual(JSON.parse(stripVolatile(JSON.stringify([{ uid: 'a', accessToken: 't', last_used: 5, token_usage: { request_count: 3 } }]))), [{ uid: 'a', accessToken: 't' }]);
+    assert.equal(JSON.parse(mergeVolatile(JSON.stringify([{ uid: 'a', accessToken: 'new' }]), JSON.stringify([{ uid: 'a', accessToken: 'old', last_used: 9 }])))[0].last_used, 9);
+
+    // 第一台机器：加账号、改设置、记一笔统计
+    const d1 = tmp();
+    const p1 = new Persist(d1);
+    await p1.restore();
+    let changes = 0;
+    const wb1 = createWbEngine({ dataDir: d1, log: quiet, onChange: () => { changes++; p1.schedule(); } });
+    wb1.vault.saveAccount('u1', 'N1', 'global', 'AT1', 'RT1');
+    wb1.settings.set('default_engine', 'ag');
+    wb1.metrics.record('POST', '/v1/messages', 'm', 'stream', 200, { input: 1, cached: 0, output: 2, thoughts: 0 }, 10);
+    wb1.flush();
+    clearTimeout(p1.timer);
+    await p1.sync();
+    await p1.syncStats();
+    assert.equal(JSON.parse(gh.read('gateway-state/wb/accounts.json'))[0].accessToken, 'AT1');
+    assert.equal(JSON.parse(gh.read('gateway-state/wb/settings.json')).default_engine, 'ag');
+    assert.ok(gh.read('gateway-state/wb/metrics.json'));
+
+    // 每次请求都会 touch（最近使用 / 计数）：推送内容不变，不产生提交
+    const before = gh.puts(), changesBefore = changes;
+    wb1.scheduler.touch('u1');
+    assert.equal(changes, changesBefore);
+    await p1.sync();
+    assert.equal(gh.puts(), before);
+    // Token 刷新属于实质变化，要同步
+    wb1.vault.updateTokens('u1', 'AT2');
+    clearTimeout(p1.timer);
+    await p1.sync();
+    assert.equal(JSON.parse(gh.read('gateway-state/wb/accounts.json'))[0].accessToken, 'AT2');
+
+    // 第二台（重新部署、空磁盘）：恢复后 WB 引擎直接可用
+    const d2 = tmp();
+    const p2 = new Persist(d2);
+    await p2.restore();
+    const wb2 = createWbEngine({ dataDir: d2, log: quiet });
+    assert.equal(wb2.vault.find('u1').accessToken, 'AT2');
+    assert.equal(wb2.defaultEngine(), 'ag');
+    assert.equal(wb2.metrics.statsJson().total_requests, 1);
+    assert.ok(fs.existsSync(path.join(d2, 'wb', 'auths', 'workbuddy-u1.json')));
+
+    // 删除账号同步上去，再部署也不会回来
+    wb2.vault.deleteAccount('u1');
+    await p2.sync();
+    clearTimeout(p2.timer);
+    const d3 = tmp();
+    await new Persist(d3).restore();
+    assert.equal(createWbEngine({ dataDir: d3, log: quiet }).vault.getAccounts().length, 0);
+    wb1.flush(); wb2.flush();
+  } finally {
+    gh.srv.close();
+    delete process.env.GH_API; delete process.env.GH_TOKEN; delete process.env.GH_REPO;
+  }
+});
+
 for (const [name, fn] of tests) {
   try { await fn(); passed++; console.log('  ✓', name); } catch (e) { console.error('  ✗', name); console.error(e); process.exitCode = 1; }
 }

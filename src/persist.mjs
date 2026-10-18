@@ -1,5 +1,5 @@
 /**
- * 永久保存：可选：把运行时新增的账号和用量统计同步到 GitHub 仓库的 state 分支。
+ * 永久保存：可选：把运行时新增的账号（AG 与 WB）、WB 设置和用量统计同步到 GitHub 仓库的 state 分支。
  * Render 免费版重启/重新部署会清空磁盘，启动时从 state 分支恢复。
  * state 分支不会触发 Render 部署（Render 只部署 main）。
  *
@@ -14,6 +14,36 @@ import crypto from 'crypto';
 
 const API = (process.env.GH_API || 'https://api.github.com').replace(/\/$/, '');
 const DIR = 'gateway-state';
+
+// WB 引擎（Linux / 源码版）的数据：DATA_DIR/wb/ → gateway-state/wb/
+//   accounts.json  账号与 Token（唯一事实来源；auths/ 只是它的镜像，启动后会自动重建）
+//   settings.json  默认引擎、选中账号、网关总开关
+//   metrics.json   统计（跟 user_stats.json 一样只在本地没有时恢复，随统计定时备份）
+// last_used / 请求计数每次请求都会变，推送前去掉，避免每个请求都产生一次提交；恢复时保留本地的这些字段。
+export const WB_VOLATILE = ['last_used', 'token_usage', 'cooling'];
+export function stripVolatile(text) {
+  const list = JSON.parse(text);
+  if (!Array.isArray(list)) return text;
+  return JSON.stringify(list.map(a => {
+    const o = { ...a };
+    for (const k of WB_VOLATILE) delete o[k];
+    return o;
+  }), null, 2);
+}
+export function mergeVolatile(remoteText, localText) {
+  const remote = JSON.parse(remoteText);
+  if (!Array.isArray(remote)) return remoteText;
+  let local = [];
+  try { local = localText ? JSON.parse(localText) : []; } catch (e) { local = []; }
+  const byUid = new Map((Array.isArray(local) ? local : []).map(a => [a && a.uid, a]));
+  return JSON.stringify(remote.map(a => {
+    const l = byUid.get(a && a.uid);
+    if (!l) return a;
+    const o = { ...a };
+    for (const k of WB_VOLATILE) if (l[k] !== undefined) o[k] = l[k];
+    return o;
+  }), null, 2);
+}
 
 export class Persist {
   constructor(dataDir) {
@@ -91,9 +121,28 @@ export class Persist {
       const statsText = await this.getFile(`${DIR}/user_stats.json`);
       const statsFile = path.join(this.dataDir, 'user_stats.json');
       if (statsText && !fs.existsSync(statsFile)) { JSON.parse(statsText); fs.writeFileSync(statsFile, statsText, 'utf-8'); }
+      // WB 引擎：云端为准（账号增删、Token 刷新都会同步上去），本地的使用计数保留
+      const wbDir = path.join(this.dataDir, 'wb');
+      let wbN = 0;
+      const wbAcc = await this.getFile(`${DIR}/wb/accounts.json`);
+      if (wbAcc) {
+        fs.mkdirSync(wbDir, { recursive: true });
+        const localFile = path.join(wbDir, 'accounts.json');
+        const merged = mergeVolatile(wbAcc, fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf-8') : '');
+        fs.writeFileSync(localFile, merged, 'utf-8');
+        wbN = JSON.parse(merged).length;
+        // auths/ 是 accounts.json 的镜像：清掉旧文件，免得已在别处删除的账号被重新并入
+        const authsDir = path.join(wbDir, 'auths');
+        if (fs.existsSync(authsDir)) for (const f of fs.readdirSync(authsDir)) if (f.endsWith('.json')) { try { fs.unlinkSync(path.join(authsDir, f)); } catch (e) {} }
+      }
+      const wbSet = await this.getFile(`${DIR}/wb/settings.json`);
+      if (wbSet) { JSON.parse(wbSet); fs.mkdirSync(wbDir, { recursive: true }); fs.writeFileSync(path.join(wbDir, 'settings.json'), wbSet, 'utf-8'); }
+      const wbMetrics = await this.getFile(`${DIR}/wb/metrics.json`);
+      const wbMetricsFile = path.join(wbDir, 'metrics.json');
+      if (wbMetrics && !fs.existsSync(wbMetricsFile)) { JSON.parse(wbMetrics); fs.mkdirSync(wbDir, { recursive: true }); fs.writeFileSync(wbMetricsFile, wbMetrics, 'utf-8'); }
       this.removed = new Set(removed);
       this.lastSync = Date.now();
-      console.log(`[Persist] 已从 ${this.branch} 分支恢复 ${n} 个账号`);
+      console.log(`[Persist] 已从 ${this.branch} 分支恢复 ${n} 个 AG 账号${wbAcc ? `、${wbN} 个 WB 账号` : ''}`);
     } catch (e) {
       this.lastError = '恢复失败，已暂停同步以免覆盖云端数据：' + e.message;
       this.restoreFailed = true;
@@ -141,6 +190,7 @@ export class Persist {
       this.removed = removed;
       this.knownFiles = local;
       await this.put(`${DIR}/removed.json`, JSON.stringify(Array.from(removed), null, 2), 'state: removed accounts');
+      await this.syncWb();
       this.lastSync = Date.now(); this.lastError = '';
     } catch (e) {
       this.lastError = e.message;
@@ -151,13 +201,23 @@ export class Persist {
     }
   }
 
+  /** WB 账号与设置（内容没变就跳过；accounts.json 去掉易变字段后再比较） */
+  async syncWb() {
+    const wbDir = path.join(this.dataDir, 'wb');
+    const acc = path.join(wbDir, 'accounts.json');
+    if (fs.existsSync(acc)) await this.put(`${DIR}/wb/accounts.json`, stripVolatile(fs.readFileSync(acc, 'utf-8')), 'state: wb accounts');
+    const set = path.join(wbDir, 'settings.json');
+    if (fs.existsSync(set)) await this.put(`${DIR}/wb/settings.json`, fs.readFileSync(set, 'utf-8'), 'state: wb settings');
+  }
+
   /** 推送用量统计（内容没变就跳过） */
   async syncStats() {
     if (!this.enabled || this.restoreFailed) return;
     try {
       const file = path.join(this.dataDir, 'user_stats.json');
-      if (!fs.existsSync(file)) return;
-      await this.put(`${DIR}/user_stats.json`, fs.readFileSync(file, 'utf-8'), 'state: usage stats');
+      if (fs.existsSync(file)) await this.put(`${DIR}/user_stats.json`, fs.readFileSync(file, 'utf-8'), 'state: usage stats');
+      const wbMetrics = path.join(this.dataDir, 'wb', 'metrics.json');
+      if (fs.existsSync(wbMetrics)) await this.put(`${DIR}/wb/metrics.json`, fs.readFileSync(wbMetrics, 'utf-8'), 'state: wb stats');
     } catch (e) {
       console.error('[Persist] 统计同步失败:', e.message);
     }

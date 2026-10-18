@@ -654,7 +654,16 @@ class LocalGatewayServer(
                 // 1. 非流式响应
                 try {
                     val oaiResp = TencentGateway.chatSync(oaiReq, convId)
-                    val anthropicResp = AnthropicToOpenAI.convertResponse(oaiResp, modelRaw)
+                    // chatSync 返回扁平结构（content / tool_calls / prompt_tokens），先补成 OpenAI 响应再转换
+                    val anthropicResp = AnthropicToOpenAI.convertResponse(toOpenAiResponse(oaiResp), modelRaw)
+                    val reasoning = oaiResp.optString("reasoning_content", "")
+                    if (reasoning.isNotEmpty()) {
+                        val old = anthropicResp.getJSONArray("content")
+                        val withThinking = JSONArray().put(JSONObject()
+                            .put("type", "thinking").put("thinking", reasoning).put("signature", ""))
+                        for (k in 0 until old.length()) withThinking.put(old.get(k))
+                        anthropicResp.put("content", withThinking)
+                    }
                     GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", 200, syncUsage(oaiResp), System.currentTimeMillis() - startTime)
                     sendJsonResponse(output, 200, anthropicResp.toString())
                 } catch (e: Exception) {
@@ -711,6 +720,21 @@ class LocalGatewayServer(
             GatewayMetrics.record("POST", "/v1/messages", modelRaw, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
             sendJsonResponse(output, st, body.toString())
         }
+    }
+
+    /** chatSync 的扁平结果 → OpenAI chat.completion 形状（convertResponse 需要 choices / usage） */
+    private fun toOpenAiResponse(res: JSONObject): JSONObject {
+        val toolCalls = res.optJSONArray("tool_calls")
+        val message = JSONObject().put("role", "assistant").put("content", res.optString("content"))
+        if (toolCalls != null) message.put("tool_calls", toolCalls)
+        return JSONObject()
+            .put("choices", JSONArray().put(JSONObject()
+                .put("index", 0)
+                .put("message", message)
+                .put("finish_reason", if (toolCalls != null) "tool_calls" else "stop")))
+            .put("usage", JSONObject()
+                .put("prompt_tokens", res.optInt("prompt_tokens", 0))
+                .put("completion_tokens", res.optInt("completion_tokens", 0)))
     }
 
     /** chatSync 结果里的用量：优先上游原始 usage，否则用扁平的 prompt/completion */

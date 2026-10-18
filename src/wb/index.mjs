@@ -75,10 +75,11 @@ export function createWbEngine({
   log = console,
   authEnabled = () => false,
   backoffMs,
+  onChange = () => {},
 } = {}) {
   const dir = path.join(dataDir, 'wb');
-  const settings = new Settings(dir, { default_engine: defaultEngine === 'ag' ? 'ag' : 'wb' });
-  const vault = new AccountVault(dir);
+  const settings = new Settings(dir, { default_engine: defaultEngine === 'ag' ? 'ag' : 'wb' }, onChange);
+  const vault = new AccountVault(dir, onChange);
   const scheduler = new AccountScheduler(vault, settings);
   const tokenKeeper = new TokenKeeper(vault, { fetchImpl, log });
   const metrics = new GatewayMetrics(dir);

@@ -24,16 +24,20 @@ export function jwtPayload(token) {
 }
 
 export class AccountVault {
-  constructor(dir) {
+  constructor(dir, onChange = () => {}) {
     this.dir = dir;
+    this.onChange = onChange;
     this.file = path.join(dir, 'accounts.json');
     this.authsDir = path.join(dir, 'auths');
     fs.mkdirSync(this.authsDir, { recursive: true });
     this.list = Array.isArray(readJson(this.file, [])) ? readJson(this.file, []) : [];
     this.syncAuthsDir();
+    // auths/ 是镜像：缺的补上（例如从云端恢复后）
+    for (const a of this.list) if (a.uid && a.accessToken && !fs.existsSync(path.join(this.authsDir, `workbuddy-${a.uid}.json`))) this.writeAuthFile(a);
   }
 
-  save() { atomicWrite(this.file, JSON.stringify(this.list, null, 2)); }
+  /** @param quiet 只改了易变字段（最近使用、计数），不触发云端同步 */
+  save(quiet = false) { atomicWrite(this.file, JSON.stringify(this.list, null, 2)); if (!quiet) this.onChange(); }
 
   /** 把 auths/ 里尚未入库的官方凭证并入（与安卓扫描 filesDir/auths 等价） */
   syncAuthsDir() {
@@ -96,11 +100,11 @@ export class AccountVault {
     return { uid: a.uid, nickname: a.nickname, realm: a.realm || 'global', accessToken: a.accessToken, refreshToken: a.refreshToken || '' };
   }
 
-  updateAccount(uid, fn) {
+  updateAccount(uid, fn, { quiet = false } = {}) {
     const a = this.find(uid);
     if (!a) return;
     fn(a);
-    this.save();
+    this.save(quiet);
   }
 
   updateTokens(uid, accessToken, refreshToken) {

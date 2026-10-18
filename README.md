@@ -75,6 +75,13 @@ Linux / 源码版（`node src/server.mjs`）同样是 **WB + AG 双引擎**，�
 
 WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/wb/auths/`，启动时自动并入。
 
+> ⚠️ **安全**：默认监听 `0.0.0.0`。如果没设 `ADMIN_KEY`，同一网络 / 公网上的任何人都能调用
+> `/panel/api/tokens/export`、`/api/accounts/export` **导出你全部 WB / AG Token**，并用你的额度调用 `/v1/*`。
+> 启动日志会醒目警告。对外部署务必设置 `ADMIN_KEY`（足够长的随机串），或只在本机监听 `HOST=127.0.0.1`。
+> 单文件版首次运行会自动生成密钥（`NO_AUTH=1` 可关闭，不建议）。
+
+配置了 `GH_TOKEN` + `GH_REPO`（见 `src/persist.mjs`）时，AG 账号、WB 账号与设置、两边统计都会同步到仓库的 `state` 分支，重新部署后自动恢复。
+
 ## 模型分流规则
 
 前门按三层顺序判断，**绝不靠模型名前缀猜**（两边都有 `claude-` 和 `gemini-` 家族，猜一定错）：

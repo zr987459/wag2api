@@ -27,10 +27,11 @@ export function readJson(file, fallback) {
 }
 
 export class Settings {
-  constructor(dir, defaults = {}) {
+  constructor(dir, defaults = {}, onChange = () => {}) {
+    this.onChange = onChange;
     this.file = path.join(dir, 'settings.json');
     this.data = { default_engine: 'wb', selected_uid: '', gateway_enabled: true, ...defaults, ...readJson(this.file, {}) };
   }
   get(k) { return this.data[k]; }
-  set(k, v) { this.data[k] = v; atomicWrite(this.file, JSON.stringify(this.data, null, 2)); }
+  set(k, v) { this.data[k] = v; atomicWrite(this.file, JSON.stringify(this.data, null, 2)); this.onChange(); }
 }

@@ -52,7 +52,7 @@ export class AccountScheduler {
       a.last_used = Date.now();
       a.token_usage = a.token_usage || { request_count: 0, total_tokens: 0 };
       a.token_usage.request_count = (a.token_usage.request_count || 0) + 1;
-    });
+    }, { quiet: true });
   }
 
   poolStatus() {

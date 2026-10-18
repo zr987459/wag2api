@@ -73,6 +73,7 @@ const wb = DUAL ? createWbEngine({
   port: PORT,
   defaultEngine: process.env.DEFAULT_ENGINE,
   authEnabled: () => access.enabled,
+  onChange: () => persist.schedule(), // 账号 / 设置变化 → 同步到 GitHub state 分支（未配置时空操作）
 }) : null;
 if (wb) wb.start();
 const agModelList = () => (getModelsResponse().data || []);
@@ -704,6 +705,7 @@ if ((IS_BINARY || process.env.AUTO_KEY === '1') && !access.enabled && process.en
 }
 
 const HOST = process.env.HOST || '0.0.0.0';
+const PUBLIC_BIND = ['0.0.0.0', '::', ''].includes(HOST.trim());
 
 // 统一的优雅退出：宿主关闭引擎时先 drain 再 SIGTERM，Linux systemd 同样受益。
 // 必须在 server.close() 前 flush 统计，且不能有其它监听器提前 process.exit。
@@ -738,4 +740,16 @@ server.listen(PORT, HOST, () => {
   console.log(`   数据:   ${DATA_DIR}`);
   console.log(wb ? `   引擎:   WB + AG（默认 ${wb.defaultEngine().toUpperCase()}，模型名加 wb: / ag: 可强制指定）` : '   引擎:   仅 AG');
   console.log(access.enabled ? `   密钥:   ${access.adminKey}` : '   密钥:   未设置（任何人都能访问，建议设置 ADMIN_KEY）');
+  if (PUBLIC_BIND && !access.enabled) {
+    const bar = '!'.repeat(64);
+    console.warn([
+      '', bar,
+      '!!  安全警告：正在监听所有网卡（HOST=' + (HOST || '0.0.0.0') + '），且没有设置 ADMIN_KEY',
+      '!!  同一网络 / 公网上的任何人都能：',
+      '!!    · 调用 /panel/api/tokens/export、/api/accounts/export 导出全部 WB / AG Token',
+      '!!    · 用你的账号额度调用 /v1/*',
+      '!!  修复：设置 ADMIN_KEY=<足够长的随机串>，或只在本机监听 HOST=127.0.0.1',
+      bar, '',
+    ].join('\n'));
+  }
 });
