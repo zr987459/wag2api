@@ -130,6 +130,43 @@ class LocalGatewayServer(
             val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
             val body = readRequestBody(input, contentLength)
 
+            // ── 数据面与控制面安全隔离 ──────────────────────
+            // 控制面白名单：面板网页、静态资源、管理 API、健康检查
+            val isControlPlane = path == "/" ||
+                    path == "/index.html" ||
+                    path == "/health" ||
+                    path.startsWith("/panel/") ||
+                    path.startsWith("/m/") ||
+                    path.endsWith(".css") ||
+                    path.endsWith(".js") ||
+                    path.endsWith(".json") ||
+                    path.endsWith(".png") ||
+                    path.endsWith(".svg") ||
+                    path.endsWith(".ico")
+
+            // 网关总开关关闭时：仅放行控制面，数据面外部推理 API (v1/* 等) 安全拦截返回 503
+            if (!GatewayService.isGatewayEnabled(context) && !isControlPlane) {
+                val errJson = JSONObject().apply {
+                    put("error", JSONObject().apply {
+                        put("message", "WorkBuddy 网关已关闭，请在管理面板开启")
+                        put("type", "gateway_disabled")
+                        put("code", "gateway_disabled")
+                    })
+                }.toString()
+                val bytes = errJson.toByteArray(Charsets.UTF_8)
+                val respHead = "HTTP/1.1 503 Service Unavailable\r\n" +
+                        "Content-Type: application/json; charset=utf-8\r\n" +
+                        "Content-Length: ${bytes.size}\r\n" +
+                        "Retry-After: 30\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Connection: close\r\n\r\n"
+                output.write(respHead.toByteArray(Charsets.US_ASCII))
+                output.write(bytes)
+                output.flush()
+                client.close()
+                return
+            }
+
             // ── 前门分流：先问 EngineRouter 这条请求归谁 ──────────────
             val decision = EngineRouter.decide(context, engine, path, body)
             when (val d = decision) {

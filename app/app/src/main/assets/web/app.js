@@ -147,25 +147,28 @@ async function loadAccounts() {
       const activeTag = isActive ? '<span class="tag tag-online">当前</span>' : '';
 
       return `
-        <div class="item-card">
-          <div class="item-main">
+        <div class="account-card" id="acc-card-${escapeHtml(a.uid)}">
+          <div class="account-card-header">
             <div class="item-avatar">${initial}</div>
-            <div class="item-info">
-              <div class="item-title">
-                <span>${escapeHtml(a.nickname)}</span>
+            <div class="account-card-info">
+              <div class="account-title-row">
+                <span class="account-name">${escapeHtml(a.nickname)}</span>
                 <span class="tag tag-global">${realmText}</span>
                 <span class="tag ${statusClass}">${statusText}</span>
                 ${activeTag}
               </div>
-              <div class="item-sub">UID: ${escapeHtml(a.uid)} ${creditsDisplay} · 消耗: ${tokensUsed} tokens</div>
+              <div class="account-meta">UID: ${escapeHtml(a.uid)} ${creditsDisplay} · 消耗: ${tokensUsed} tokens</div>
             </div>
           </div>
-          <div style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
-            <button class="btn btn-outline btn-sm" onclick="testAccount('${escapeHtml(a.uid)}', this)">测试</button>
-            <button class="btn btn-outline btn-sm" onclick="exportOne('${escapeHtml(a.uid)}')">导出</button>
-            <button class="btn btn-outline btn-sm" onclick="selectAccount('${escapeHtml(a.uid)}').then(()=>{loadAccounts();loadPool();})">使用</button>
-            <button class="btn btn-outline btn-sm" onclick="toggleAccount('${escapeHtml(a.uid)}', ${!disabled})">${disabled ? '启用' : '禁用'}</button>
-            <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.4);" onclick="deleteAccount('${escapeHtml(a.uid)}')">删除</button>
+
+          <div class="account-test-banner" id="test-banner-${escapeHtml(a.uid)}"></div>
+
+          <div class="account-actions-grid">
+            <button class="btn btn-outline btn-sm" onclick="testAccount('${escapeHtml(a.uid)}', this)">⚡ 测试</button>
+            <button class="btn btn-outline btn-sm" onclick="exportOne('${escapeHtml(a.uid)}')">📤 导出</button>
+            <button class="btn btn-outline btn-sm" onclick="selectAccount('${escapeHtml(a.uid)}').then(()=>{loadAccounts();loadPool();showToast('已切换至该账号','success');})">🌟 使用</button>
+            <button class="btn btn-outline btn-sm" onclick="toggleAccount('${escapeHtml(a.uid)}', ${!disabled})">${disabled ? '▶ 启用' : '⏸ 禁用'}</button>
+            <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.4);" onclick="deleteAccount('${escapeHtml(a.uid)}')">🗑 删除</button>
           </div>
         </div>`;
     }).join('');
@@ -576,20 +579,20 @@ async function loadLogs() {
       const model = escapeHtml(l.model || '');
       const latency = l.latency_ms ? `${l.latency_ms}ms` : '';
       const tokensStr = l.tokens > 0 ? `${l.tokens.toLocaleString()} tok` : '';
-      const noteStr = l.note ? `<div style="font-size: 11px; color: var(--danger); margin-top: 4px; font-family: var(--font-mono); word-break: break-all;">⚠️ ${escapeHtml(l.note)}</div>` : '';
+      const noteStr = l.note ? `<div class="log-note-box">⚠️ ${escapeHtml(l.note)}</div>` : '';
 
       return `
-        <div class="item-card" style="padding: 10px 14px; margin-bottom: 8px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <div style="display: flex; align-items: center; gap: 6px;">
+        <div class="log-card">
+          <div class="log-header-row">
+            <div class="log-path-wrap">
               ${statusTag}
-              <span style="font-family: var(--font-mono); font-weight: 600; font-size: 13px; color: var(--text-main);">${method} ${path}</span>
+              <span class="log-path-text">${method} ${path}</span>
             </div>
             <span style="font-size: 11px; color: var(--text-dim); font-family: var(--font-mono);">${timeStr}</span>
           </div>
-          <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-muted);">
-            <span style="font-family: var(--font-mono); color: var(--accent);">${model}</span>
-            <span style="font-family: var(--font-mono); font-size: 11px;">${[latency, tokensStr].filter(Boolean).join(' · ')}</span>
+          <div class="log-detail-row">
+            <span class="log-model-text">${model}</span>
+            <span class="log-metrics-text">${[latency, tokensStr].filter(Boolean).join(' · ')}</span>
           </div>
           ${noteStr}
         </div>`;
@@ -786,7 +789,7 @@ async function loadGatewayState() {
 }
 
 async function toggleGateway(on) {
-  if (!on && !confirm('关闭网关后，所有客户端将无法访问，确定吗？')) {
+  if (!on && !confirm('关闭网关后，外部客户端 API 请求将被拒绝（503），控制台保持运行。确定关闭吗？')) {
     document.getElementById('gatewayToggle').checked = true;
     return;
   }
@@ -797,12 +800,10 @@ async function toggleGateway(on) {
       body: JSON.stringify({ enabled: on })
     });
     const d = await r.json();
-    if (!on) {
-      alert('网关已关闭。如需重新打开，请回到本页面开启开关。');
-    }
-    setTimeout(loadGatewayState, 500);
+    showToast(on ? '网关已恢复 · 客户端可访问' : '网关已暂停 · 外部 API 已停止', on ? 'success' : 'warn');
+    setTimeout(loadGatewayState, 300);
   } catch (e) {
-    alert('操作失败：' + e.message);
+    showToast('操作失败：' + e.message, 'error');
   }
 }
 
@@ -856,11 +857,36 @@ function showTextDialog(title, text) {
   document.body.appendChild(wrap);
 }
 
+// ── 全局轻量 Toast 浮层 ───────────────────────────
+function showToast(msg, type = 'info') {
+  let box = document.getElementById('toastContainer');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toastContainer';
+    box.className = 'toast-container';
+    document.body.appendChild(box);
+  }
+  const item = document.createElement('div');
+  item.className = `toast-msg ${type}`;
+  item.textContent = msg;
+  box.appendChild(item);
+  setTimeout(() => {
+    item.remove();
+  }, 2300);
+}
+
 // ── 连通性测试 ────────────────────────────────────────────
 
 async function testAccount(uid, btn) {
   const orig = btn ? btn.textContent : '';
   if (btn) { btn.textContent = '测试中…'; btn.disabled = true; }
+  const banner = document.getElementById(`test-banner-${uid}`);
+  if (banner) {
+    banner.style.display = 'block';
+    banner.className = 'account-test-banner';
+    banner.textContent = '正在向上游验证账号可用性...';
+  }
+
   try {
     const r = await fetch('/panel/api/accounts/test', {
       method: 'POST',
@@ -868,17 +894,34 @@ async function testAccount(uid, btn) {
       body: JSON.stringify({ uid })
     });
     const d = await r.json();
-    let msg;
     if (d.ok) {
-      msg = `✅ 连通正常\n耗时 ${d.elapsed_ms}ms\n端点 ${d.endpoint || '-'}`;
+      const info = `✅ 连通正常 · 耗时 ${d.elapsed_ms}ms · 端点 ${d.endpoint ? d.endpoint.split('/').slice(-2).join('/') : '-'}`;
+      if (banner) {
+        banner.className = 'account-test-banner success';
+        banner.textContent = info;
+      }
+      showToast(`连通正常 (${d.elapsed_ms}ms)`, 'success');
     } else if (d.partial) {
-      msg = `⚠️ 账号可用，但上游繁忙\n${d.msg}\n耗时 ${d.elapsed_ms}ms`;
+      const info = `⚠️ 账号有效，上游繁忙 · ${d.msg} (${d.elapsed_ms}ms)`;
+      if (banner) {
+        banner.className = 'account-test-banner warning';
+        banner.textContent = info;
+      }
+      showToast('账号有效，上游繁忙', 'warn');
     } else {
-      msg = `❌ 测试失败\n${d.msg}\n耗时 ${d.elapsed_ms}ms`;
+      const info = `❌ 测试未通过 · ${d.msg || '未知错误'}`;
+      if (banner) {
+        banner.className = 'account-test-banner error';
+        banner.textContent = info;
+      }
+      showToast('测试未通过: ' + (d.msg || '失败'), 'error');
     }
-    alert(msg);
   } catch (e) {
-    alert('测试失败：' + e.message);
+    if (banner) {
+      banner.className = 'account-test-banner error';
+      banner.textContent = `❌ 测试请求异常: ${e.message}`;
+    }
+    showToast('测试异常: ' + e.message, 'error');
   } finally {
     if (btn) { btn.textContent = orig; btn.disabled = false; }
   }
@@ -887,8 +930,9 @@ async function testAccount(uid, btn) {
 async function testAllAccounts() {
   const pool = await loadPool();
   const list = (pool && pool.accounts ? pool.accounts : []).filter(a => !a.disabled);
-  if (list.length === 0) { alert('没有可测试的账号'); return; }
+  if (list.length === 0) { showToast('没有可测试的账号', 'warn'); return; }
 
+  showToast(`正在批量测试 ${list.length} 个账号...`, 'info');
   const lines = [];
   for (const a of list) {
     try {
@@ -900,11 +944,11 @@ async function testAllAccounts() {
       const d = await r.json();
       const mark = d.ok ? '✅' : (d.partial ? '⚠️' : '❌');
       const name = a.nickname || a.uid.slice(0, 8);
-      lines.push(`${mark} ${name} · ${d.elapsed_ms}ms${d.ok ? '' : ' · ' + d.msg}`);
+      lines.push(`${mark} ${name} · ${d.elapsed_ms}ms${d.ok ? '' : ' · ' + (d.msg || '')}`);
     } catch (e) {
       lines.push(`❌ ${a.nickname || a.uid} · ${e.message}`);
     }
   }
-  alert('连通性测试结果\n\n' + lines.join('\n'));
+  showTextDialog('连通性测试报告', lines.join('\n'));
   loadPool();
 }

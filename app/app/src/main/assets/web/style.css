@@ -516,3 +516,196 @@ body {
 }
 .switch input:checked + .slider { background: var(--primary, #6c8cff); }
 .switch input:checked + .slider:before { transform: translateX(20px); }
+
+/* ── 移动端专属账号卡片流 (高颜值上下分层，告别挤压截断) ── */
+.account-card {
+  background: var(--surface-color);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+.account-card:active {
+  border-color: rgba(255, 255, 255, 0.15);
+}
+.account-card-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+}
+.account-card-info {
+  flex: 1;
+  min-width: 0;
+}
+.account-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.account-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-main);
+  word-break: break-word;
+}
+.account-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  word-break: break-all;
+}
+.account-actions-grid {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.account-actions-grid .btn {
+  flex: 1 1 calc(20% - 6px);
+  min-width: 60px;
+  padding: 6px 4px;
+  font-size: 12px;
+  min-height: 34px;
+  white-space: nowrap;
+}
+.account-test-banner {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  display: none;
+  animation: fadeIn 0.2s ease;
+  line-height: 1.4;
+  word-break: break-all;
+}
+.account-test-banner.success {
+  display: block;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  color: #34d399;
+}
+.account-test-banner.warning {
+  display: block;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  color: #fbbf24;
+}
+.account-test-banner.error {
+  display: block;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #f87171;
+}
+
+/* ── 移动端专属日志卡片 (垂直清晰流) ── */
+.log-card {
+  background: var(--surface-color);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+.log-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.log-path-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.log-path-text {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-main);
+  word-break: break-all;
+}
+.log-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  gap: 8px;
+}
+.log-model-text {
+  font-family: var(--font-mono);
+  color: var(--accent);
+  word-break: break-all;
+}
+.log-metrics-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.log-note-box {
+  font-size: 11px;
+  color: var(--danger);
+  font-family: var(--font-mono);
+  word-break: break-all;
+  background: rgba(239, 68, 68, 0.08);
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-top: 2px;
+}
+
+/* ── 现代轻量 Toast 浮动提示 ── */
+.toast-container {
+  position: fixed;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 99999;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: 90%;
+}
+.toast-msg {
+  background: rgba(20, 26, 38, 0.95);
+  color: #fff;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-full);
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  animation: fadeInDown 0.25s ease, fadeOutUp 0.25s ease 2s forwards;
+  text-align: center;
+}
+.toast-msg.success { border-color: rgba(16, 185, 129, 0.4); color: #34d399; }
+.toast-msg.error { border-color: rgba(239, 68, 68, 0.4); color: #f87171; }
+.toast-msg.warn { border-color: rgba(245, 158, 11, 0.4); color: #fbbf24; }
+
+@keyframes fadeInDown {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeOutUp {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(-10px); }
+}

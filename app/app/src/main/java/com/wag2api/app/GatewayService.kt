@@ -55,24 +55,15 @@ class GatewayService : Service() {
                 .getBoolean(KEY_GATEWAY_ON, true)
 
         /**
-         * 开关网关。关闭时停掉前门并清掉常驻通知；开启时重新拉起。
+         * 开关网关。
+         * 数据面开关：关闭时在分流层拒绝对外推理 API（返回 503），但控制面与本地管理控制台保持常驻运行，
+         * 绝不停止前门 HTTP 服务，确保 App 内嵌 WebView 绝不会断网或崩溃。
          * @return 操作后的状态
          */
         fun setGatewayEnabled(ctx: Context, enabled: Boolean): Boolean {
             ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
                 .edit().putBoolean(KEY_GATEWAY_ON, enabled).apply()
-
-            val intent = Intent(ctx, GatewayService::class.java)
-            if (enabled) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    ctx.startForegroundService(intent)
-                } else {
-                    ctx.startService(intent)
-                }
-            } else {
-                // 停止服务：onDestroy 里会关掉前门、释放引擎与 WakeLock
-                ctx.stopService(intent)
-            }
+            instance?.updateNotification()
             return enabled
         }
 
@@ -132,14 +123,7 @@ class GatewayService : Service() {
         engine = EngineFactory.create(applicationContext)
         EngineFactory.injectToken(applicationContext)
 
-        // 网关总开关关闭时，只保留常驻通知，不启动前门
-        if (!isGatewayEnabled(applicationContext)) {
-            isRunning = false
-            updateNotification()
-            return
-        }
-
-        // 前门先起来，WB 毫秒级就绪
+        // 前门服务启动，管理面板始终保持可用
         val listenPort = getPort(applicationContext)
         server = LocalGatewayServer(
             applicationContext, listenPort, engine,
@@ -207,7 +191,7 @@ class GatewayService : Service() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
         val on = isGatewayEnabled(this)
         val text = if (!on) {
-            "网关已关闭 · 点按打开"
+            "网关已暂停 · 控制台运行中 (点按打开)"
         } else {
             "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
         }

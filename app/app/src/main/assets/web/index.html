@@ -103,7 +103,7 @@
         <button class="btn btn-primary btn-sm" onclick="savePort()">保存</button>
       </div>
       <p style="font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.6;">
-        关闭网关后前门停止监听，客户端会断开。端口修改后需重启网关生效，范围 1024~65535。
+        数据面网关总开关：关闭后外部推理 API 暂停响应（返回 503），本地控制台始终保持运行，随时可重新开启。端口修改后需重启 App 生效。
       </p>
     </div>
 
@@ -122,9 +122,9 @@
 
   <!-- 2. 账号 Tab -->
   <main id="view-accounts" class="tab-content">
-    <div class="section-title">
+    <div class="section-title" style="flex-wrap: wrap; gap: 8px;">
       <span>账号列表 (<span id="accountCount">0</span>)</span>
-      <div style="display: flex; gap: 6px;">
+      <div style="display: flex; gap: 6px; flex-wrap: wrap;">
         <button class="btn btn-outline btn-sm" onclick="openImportModal()">📥 导入</button>
         <button class="btn btn-outline btn-sm" onclick="openExportModal()">📤 导出</button>
         <button class="btn btn-primary btn-sm" onclick="openAuthModal()">+ 授权</button>
