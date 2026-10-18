@@ -56,7 +56,7 @@ function emptyBucket() {
   };
 }
 
-function emptySlot() { return { requests: 0, errors: 0, input: 0, cached: 0, output: 0, tokens: 0 }; }
+function emptySlot() { return { requests: 0, errors: 0, input: 0, cached: 0, output: 0, tokens: 0, thoughts: 0, lat_sum: 0, lat_n: 0, ttft_sum: 0, ttft_n: 0 }; }
 
 /** 旧版 user_stats.json → schema 2（就地迁移，幂等） */
 export function migrateBucket(b) {
@@ -215,6 +215,11 @@ export class StatsTracker {
       s.requests++;
       if (!ok) s.errors++;
       s.input += inp; s.cached += cac; s.output += out; s.tokens += tot;
+      s.thoughts = num(s.thoughts) + thk;
+      if (ok && lat > 0) { s.lat_sum = num(s.lat_sum) + lat; s.lat_n = num(s.lat_n) + 1; }
+      if (ok && ttft_ms !== null && ttft_ms !== undefined && num(ttft_ms) >= 0) {
+        s.ttft_sum = num(s.ttft_sum) + Math.round(num(ttft_ms)); s.ttft_n = num(s.ttft_n) + 1;
+      }
       map[key] = s;
     };
     addSlot(bucket.hourly, utcHourKey(now));
@@ -295,6 +300,7 @@ export class StatsTracker {
     accounts.sort((a, b) => b.total_tokens - a.total_tokens || b.total_requests - a.total_requests);
     return {
       ...this.summarize(agg),
+      today: this.todaySummary(),
       accounts,
       schema: STATS_SCHEMA,
       legacy_data: Object.values(this.userStats).some(b => b.migrated_from_v1),
@@ -333,6 +339,47 @@ export class StatsTracker {
       tokens: points.map(p => p.tokens),
       requests: points.map(p => p.requests),
     };
+  }
+
+  /** 手机本地日 0 点至今（按小时桶累加，与 WB 引擎"今日"口径一致） */
+  todaySummary(now = new Date()) {
+    const mid = new Date(now); mid.setHours(0, 0, 0, 0);
+    const t = emptySlot();
+    for (const b of Object.values(this.userStats)) {
+      for (const [k, v] of Object.entries(b.hourly || {})) {
+        if (hourKeyToMs(k) + 3600 * 1000 <= mid.getTime()) continue;
+        for (const f of Object.keys(t)) t[f] += num(v[f]);
+      }
+    }
+    return {
+      total_requests: t.requests,
+      success_requests: t.requests - t.errors,
+      error_requests: t.errors,
+      input_tokens: t.input,
+      cached_tokens: t.cached,
+      output_tokens: t.output,
+      thoughts_tokens: t.thoughts,
+      total_tokens: t.input + t.cached + t.output,
+      cache_hit_rate: cacheHitRate(t.input, t.cached),
+      avg_latency_ms: t.lat_n ? Math.round(t.lat_sum / t.lat_n) : 0,
+      avg_ttft_ms: t.ttft_n ? Math.round(t.ttft_sum / t.ttft_n) : null,
+    };
+  }
+
+  /** 所有账号合计的 24 小时趋势（UTC 整点，ts 为毫秒） */
+  getAggregateTrend() {
+    const now = new Date();
+    const points = [];
+    for (let i = 23; i >= 0; i--) {
+      const k = utcHourKey(new Date(now.getTime() - i * 3600000));
+      const p = { key: k, ts: hourKeyToMs(k), ...emptySlot() };
+      for (const b of Object.values(this.userStats)) {
+        const v = b.hourly?.[k];
+        if (v) for (const f of Object.keys(emptySlot())) p[f] += num(v[f]);
+      }
+      points.push(p);
+    }
+    return { mode: '24h', timezone: 'UTC', points };
   }
 
   /** 近 7 天用量（UTC 日） */

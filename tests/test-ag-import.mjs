@@ -1,0 +1,12 @@
+import assert from 'assert';
+import { parseAgImport } from '../src/ag-import.mjs';
+const T1 = '1//0eAbcdefghijklmnopqrstuvwxyz0123';
+const T2 = '1//0eZYXWVUTSRQPONMLKJIHGFEDCBA9876';
+assert.deepStrictEqual(parseAgImport(T1).map(x => x.refresh_token), [T1]);
+assert.strictEqual(parseAgImport(`${T1}\n${T2}\n${T1}`).length, 2);
+const backup = JSON.stringify({ format: 'wag2api-ag', accounts: [{ email: 'A@x.com', refresh_token: T1 }, { email: 'b@x.com', refreshToken: T2 }] });
+const r = parseAgImport(backup);
+assert.strictEqual(r.length, 2); assert.strictEqual(r[0].email, 'a@x.com');
+assert.strictEqual(parseAgImport('eyJhbGciOi.not.ag').length, 0);
+assert.strictEqual(parseAgImport(JSON.stringify([T1, { token: T2 }])).length, 2);
+console.log('✅ ag-import tests passed');

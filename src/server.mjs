@@ -18,6 +18,7 @@ import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
+import { parseAgImport } from './ag-import.mjs';
 import { statsTracker } from './stats.mjs';
 import { ANTIGRAVITY_ENDPOINTS, ANTIGRAVITY_ENDPOINT_DAILY } from './constants.mjs';
 import { AccessControl } from './access-control.mjs';
@@ -75,8 +76,9 @@ function denyAdmin(res) {
 const ADMIN_PATHS = new Set([
   '/api/status', '/api/stats', '/api/logs', '/api/logs/clear', '/api/gemini/test', '/api/gemini/auth',
   '/api/oauth/exchange', '/api/oauth/token-exchange', '/api/accounts/add-token', '/api/accounts/switch',
-  '/api/accounts/remove',
+  '/api/accounts/remove', '/api/accounts/export', '/api/accounts/import', '/api/trend',
 ]);
+
 
 function readBody(req) {
   return new Promise(resolve => {
@@ -315,6 +317,46 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       sendJson(res, 500, { ok: false, error: e.message });
     }
+    return;
+  }
+
+  // 8.7 账号导出（含 Refresh Token，可直接回导）
+  if (url.pathname === '/api/accounts/export') {
+    const only = (url.searchParams.get('email') || '').trim().toLowerCase();
+    const accounts = [];
+    for (const [email, tm] of accountPool.managers.entries()) {
+      if (only && email !== only) continue;
+      if (!tm.tokenData.refreshToken) continue;
+      accounts.push({ email, refresh_token: tm.tokenData.refreshToken, project_id: tm.tokenData.projectId || '' });
+    }
+    sendJson(res, 200, { ok: true, format: 'wag2api-ag', version: 1, exported_at: new Date().toISOString(), accounts });
+    return;
+  }
+
+  // 8.8 批量导入：JSON 备份 / 多行 Refresh Token，逐个向 Google 校验后入池
+  if (url.pathname === '/api/accounts/import' && req.method === 'POST') {
+    const { raw } = await readBody(req);
+    const items = parseAgImport(raw);
+    if (!items.length) {
+      sendJson(res, 400, { ok: false, error: '没有识别到 Refresh Token（应以 1// 开头）' });
+      return;
+    }
+    const added = [], failed = [];
+    for (const it of items) {
+      try {
+        const r = await oauthFlowManager.validateAndAddRefreshToken(it.refresh_token);
+        added.push(r.email);
+      } catch (e) {
+        failed.push({ email: it.email || it.refresh_token.slice(0, 12) + '…', error: e.message });
+      }
+    }
+    sendJson(res, 200, { ok: added.length > 0, added, failed, message: `导入成功 ${added.length} 个${failed.length ? `，失败 ${failed.length} 个` : ''}` });
+    return;
+  }
+
+  // 8.9 全部账号汇总的 24 小时趋势
+  if (url.pathname === '/api/trend') {
+    sendJson(res, 200, statsTracker.getAggregateTrend());
     return;
   }
 

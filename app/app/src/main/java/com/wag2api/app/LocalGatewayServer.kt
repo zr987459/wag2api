@@ -137,6 +137,8 @@ class LocalGatewayServer(
                     path == "/health" ||
                     path.startsWith("/panel/") ||
                     path.startsWith("/m/") ||
+                    path.startsWith("/api/") ||   // AG 控制面（推理在 /v1/，不受影响）
+                    path == "/ag" || (path.startsWith("/ag/") && !path.contains("/v1/")) ||
                     path.endsWith(".css") ||
                     path.endsWith(".js") ||
                     path.endsWith(".json") ||
@@ -253,6 +255,16 @@ class LocalGatewayServer(
                     put("today_tokens", GatewayMetrics.getTodayTokens())
                 }
                 sendJsonResponse(output, 200, json.toString())
+            }
+
+            // 1.1b API: 详细统计（与 AG /api/stats 同口径）
+            path == "/panel/api/stats" || path == "/m/api/stats" -> {
+                sendJsonResponse(output, 200, GatewayMetrics.statsJson().toString())
+            }
+
+            path == "/panel/api/stats/reset" || path == "/m/api/stats/reset" -> {
+                GatewayMetrics.resetStats()
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
             }
 
             // 1.2 API: 清空日志
@@ -570,7 +582,7 @@ class LocalGatewayServer(
                             put("total_tokens", totalTokens)
                         })
                     }
-                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "sync", 200, totalTokens, System.currentTimeMillis() - startTime)
+                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "sync", 200, syncUsage(res), System.currentTimeMillis() - startTime)
                     sendJsonResponse(output, 200, oaiResp.toString())
                 } catch (e: Exception) {
                     val (st, body) = errorPayload(e)
@@ -589,17 +601,17 @@ class LocalGatewayServer(
                 output.write(sseHeader.toByteArray(Charsets.US_ASCII))
                 output.flush()
 
-                var streamTokens = 0
+                var streamUsage: JSONObject? = null
+                var ttft: Long? = null
                 try {
                     TencentGateway.streamChat(json, convId) { line ->
                         try {
                             if (line.startsWith("data: ")) {
                                 val s = line.substring(6).trim()
                                 if (s.startsWith("{") && s != "[DONE]") {
-                                    val u = JSONObject(s).optJSONObject("usage")
-                                    if (u != null) {
-                                        streamTokens = u.optInt("total_tokens", streamTokens)
-                                    }
+                                    val c = JSONObject(s)
+                                    c.optJSONObject("usage")?.let { streamUsage = it }
+                                    if (ttft == null && hasDelta(c)) ttft = System.currentTimeMillis() - startTime
                                 }
                             }
                             writeChunk(output, line)
@@ -608,8 +620,8 @@ class LocalGatewayServer(
                             false
                         }
                     }
-                    if (streamTokens == 0) streamTokens = 30 // 默认合理预估
-                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", 200, streamTokens, System.currentTimeMillis() - startTime)
+                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", 200,
+                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft)
                 } catch (e: Exception) {
                     val (st, payload) = errorPayload(e)
                     GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", st, 0, System.currentTimeMillis() - startTime, e.message)
@@ -643,9 +655,7 @@ class LocalGatewayServer(
                 try {
                     val oaiResp = TencentGateway.chatSync(oaiReq, convId)
                     val anthropicResp = AnthropicToOpenAI.convertResponse(oaiResp, modelRaw)
-                    val u = oaiResp.optJSONObject("usage")
-                    val totalTokens = (u?.optInt("prompt_tokens", 20) ?: 20) + (u?.optInt("completion_tokens", 20) ?: 20)
-                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", 200, totalTokens, System.currentTimeMillis() - startTime)
+                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", 200, syncUsage(oaiResp), System.currentTimeMillis() - startTime)
                     sendJsonResponse(output, 200, anthropicResp.toString())
                 } catch (e: Exception) {
                     val (st, body) = errorPayload(e)
@@ -668,25 +678,24 @@ class LocalGatewayServer(
                     writeChunk(output, "event: $event\ndata: $data\n\n")
                 }
 
-                var streamTokens = 0
+                var streamUsage: JSONObject? = null
+                var ttft: Long? = null
                 try {
                     TencentGateway.streamChat(oaiReq, convId) { line ->
                         val trimmed = line.trim()
                         if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
                             try {
                                 val chunk = JSONObject(trimmed.substring(6))
-                                val u = chunk.optJSONObject("usage")
-                                if (u != null) {
-                                    streamTokens = u.optInt("total_tokens", streamTokens)
-                                }
+                                chunk.optJSONObject("usage")?.let { streamUsage = it }
+                                if (ttft == null && hasDelta(chunk)) ttft = System.currentTimeMillis() - startTime
                                 translator.onChunk(chunk)
                             } catch (ignored: Exception) {}
                         }
                         true
                     }
                     translator.finish()
-                    if (streamTokens == 0) streamTokens = 35
-                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", 200, streamTokens, System.currentTimeMillis() - startTime)
+                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", 200,
+                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft)
                 } catch (e: Exception) {
                     val (st, body) = errorPayload(e)
                     GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", st, 0, System.currentTimeMillis() - startTime, e.message)
@@ -702,6 +711,21 @@ class LocalGatewayServer(
             GatewayMetrics.record("POST", "/v1/messages", modelRaw, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
             sendJsonResponse(output, st, body.toString())
         }
+    }
+
+    /** chatSync 结果里的用量：优先上游原始 usage，否则用扁平的 prompt/completion */
+    private fun syncUsage(res: JSONObject): GatewayMetrics.Usage? =
+        GatewayMetrics.Usage.fromOpenAi(res.optJSONObject("usage"))
+            ?: GatewayMetrics.Usage.fromOpenAi(JSONObject()
+                .put("prompt_tokens", res.optInt("prompt_tokens", 0))
+                .put("completion_tokens", res.optInt("completion_tokens", 0)))
+
+    /** 流式块里是否已有正文 / 思考 / 工具调用（用于首字耗时） */
+    private fun hasDelta(c: JSONObject): Boolean {
+        val d = c.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta") ?: return false
+        return d.optString("content", "").isNotEmpty() ||
+            d.optString("reasoning_content", "").isNotEmpty() ||
+            d.has("tool_calls")
     }
 
     private fun sendErrorJson(output: OutputStream, code: Int, msg: String) {
