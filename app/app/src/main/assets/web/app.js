@@ -285,6 +285,13 @@ function renderTiming(st) {
   ];
   $('timingGrid').innerHTML = cells.map(([k, v]) => `<div class="stat-cell"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
   const hosts = Object.entries(t.hosts || {}).map(([h, c]) => `${escapeHtml(h.split('.')[0])} ×${c}`).join('，');
+  const dg = st?.downgrade_24h;
+  const dgEl = $('dgFoot');
+  if (dgEl) {
+    const labels = { quota_all_accounts: '全部账号冷却', quota: '配额', upstream_5xx: '上游5xx', timeout: '超时', network: '网络', auth: '凭据' };
+    const rs = Object.entries(dg?.reasons || {}).map(([k, v]) => `${labels[k] || escapeHtml(k)} ${v}`).join('，');
+    dgEl.textContent = dg ? `近 24 小时降级 ${dg.count} 次 · 降级率 ${dg.rate === null ? '--' : fmtPct(dg.rate)}${rs ? ' · ' + rs : ''}` : '';
+  }
   $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次 · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
 }
 
@@ -1095,6 +1102,7 @@ async function loadLogs() {
         status: l.status, path: 'POST /v1/messages', model: l.model, ms: l.latency_ms, ttft: l.ttft_ms,
         u: l.tokens || {}, hit: l.cache_hit_rate, time: l.timestamp ? new Date(l.timestamp) : null,
         stream: l.is_stream, note: l.error, who: l.email, timing: l.timing,
+        dg: l.downgraded ? { to: l.model_used, reason: l.downgrade_reason } : null,
       }));
     }
     $('logTitle').textContent = `请求日志 (${logs.length})`;
@@ -1118,6 +1126,7 @@ async function loadLogs() {
               <span class="tag ${ok ? 'tag-online' : 'tag-offline'}">${escapeHtml(l.status)}</span>
               <span class="log-path-text">${escapeHtml(l.path)}</span>
               ${l.stream ? '<span class="tag tag-global">流式</span>' : ''}
+              ${l.dg ? `<span class="tag tag-offline" title="${escapeHtml(l.dg.reason || '')}">降级→${escapeHtml(l.dg.to || '?')}</span>` : ''}
             </div>
             <span class="mono" style="font-size: 11px; color: var(--text-dim);">${escapeHtml(tm)}</span>
           </div>

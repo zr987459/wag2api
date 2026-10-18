@@ -51,6 +51,7 @@ function emptyBucket() {
     ttft_count: 0,
     avg_ttft_ms: 0,
     logs: [],
+    downgrades: [], // PR1：最近 48h 的降级记录 { ts, from, to, reason }
     hourly: {}, // { 'YYYY-MM-DDTHH' (UTC): {requests, errors, input, cached, output, tokens} }
     daily: {},  // { 'YYYY-MM-DD'  (UTC): 同上 }
   };
@@ -203,6 +204,9 @@ export class StatsTracker {
     is_stream = false,
     error = null,
     timing = null,
+    model_used = null,
+    downgraded = false,
+    downgrade_reason = null,
     now = new Date(),
   }) {
     const { bucket } = this.getUserBucket(email);
@@ -263,7 +267,13 @@ export class StatsTracker {
       is_stream,
       error,
       ...(timing ? { timing: cleanTiming(timing) } : {}),
+      ...(model_used ? { model_used: String(model_used).slice(0, 80) } : {}),
+      ...(downgraded ? { downgraded: true, downgrade_reason: downgrade_reason ? String(downgrade_reason).slice(0, 40) : null } : {}),
     });
+    if (downgraded) {
+      if (!Array.isArray(bucket.downgrades)) bucket.downgrades = [];
+      bucket.downgrades.push({ ts, from: model, to: model_used, reason: downgrade_reason || 'unknown' });
+    }
     if (bucket.logs.length > this.maxLogsPerUser) bucket.logs.length = this.maxLogsPerUser;
 
     this.save();
@@ -275,6 +285,10 @@ export class StatsTracker {
     for (const k of Object.keys(bucket.hourly)) {
       const t = hourKeyToMs(k);
       if (!Number.isFinite(t) || t < hCut) delete bucket.hourly[k];
+    }
+    if (Array.isArray(bucket.downgrades)) {
+      bucket.downgrades = bucket.downgrades.filter(d => d.ts >= hCut);
+      if (bucket.downgrades.length > 1000) bucket.downgrades = bucket.downgrades.slice(-1000);
     }
     const dCut = utcDayKey(new Date(now.getTime() - DAILY_KEEP_DAYS * 86400000));
     for (const k of Object.keys(bucket.daily)) if (k < dCut) delete bucket.daily[k];
@@ -326,6 +340,7 @@ export class StatsTracker {
       ...this.summarize(agg),
       today: this.todaySummary(),
       timing_recent: this.getTimingSummary(20),
+      downgrade_24h: this.getDowngradeSummary(agg),
       accounts,
       schema: STATS_SCHEMA,
       legacy_data: Object.values(this.userStats).some(b => b.migrated_from_v1),
@@ -440,6 +455,26 @@ export class StatsTracker {
     out.switched_host = logs.filter(l => l.timing.switched_host).length;
     out.conn_reused = logs.filter(l => l.timing.conn_reused === true).length;
     out.conn_new = logs.filter(l => l.timing.conn_reused === false).length;
+    return out;
+  }
+
+  /** PR1：最近 24 小时降级次数、降级率（占同期请求）、原因分布、降到了哪些模型 */
+  getDowngradeSummary(agg = null, now = new Date()) {
+    const cut = now.getTime() - 24 * 3600 * 1000;
+    const out = { count: 0, requests: 0, rate: null, reasons: {}, models: {} };
+    for (const b of Object.values(this.userStats)) {
+      for (const d of b.downgrades || []) {
+        if (d.ts < cut) continue;
+        out.count++;
+        out.reasons[d.reason] = (out.reasons[d.reason] || 0) + 1;
+        if (d.to) out.models[d.to] = (out.models[d.to] || 0) + 1;
+      }
+    }
+    const hourly = agg ? agg.hourly : null;
+    if (hourly) {
+      for (const [k, v] of Object.entries(hourly)) if (hourKeyToMs(k) + 3600 * 1000 > cut) out.requests += num(v.requests);
+    }
+    out.rate = out.requests ? Math.round((out.count / out.requests) * 10000) / 10000 : null;
     return out;
   }
 

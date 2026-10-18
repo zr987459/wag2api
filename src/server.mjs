@@ -23,7 +23,7 @@ import { fetchRealQuota } from './quota-fetcher.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
 import { parseAgImport } from './ag-import.mjs';
 import { statsTracker } from './stats.mjs';
-import { ANTIGRAVITY_ENDPOINTS, ANTIGRAVITY_ENDPOINT_DAILY } from './constants.mjs';
+import { ANTIGRAVITY_ENDPOINTS, ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_AUTOPUSH } from './constants.mjs';
 const DAILY_HOST = new URL(ANTIGRAVITY_ENDPOINT_DAILY).hostname;
 import { AccessControl } from './access-control.mjs';
 import { Persist } from './persist.mjs';
@@ -31,7 +31,9 @@ import {
   buildAntigravityHeaders,
   buildCloudCodePayload,
   MODEL_FALLBACK_CHAINS,
+  mapToUpstreamModel,
 } from './cloudcode.mjs';
+import { runWithPolicy, Cooldowns, shouldInsertNotice, buildDowngradeNotice } from './upstream-policy.mjs';
 import { convertGoogleToAnthropic } from './content-converter.mjs';
 import { handleStreamConversion } from './sse-streamer.mjs';
 import { cacheProbe } from './cache-probe.mjs';
@@ -40,6 +42,18 @@ import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session
 import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
 
 let lastClientHeaders = null;
+
+// PR1：失败处理参数（环境变量可调）
+const POLICY = {
+  allowDowngrade: !['0', 'false'].includes(String(process.env.ALLOW_DOWNGRADE ?? '1')),
+  // 实测上游拿到首块才回响应头（长上下文 High 已到 14s），流式响应头超时至少 60s；拿到响应头后不再限时
+  streamHeaderTimeoutMs: Number(process.env.UPSTREAM_HEADER_TIMEOUT_MS) || 60000,
+  nonStreamHeaderTimeoutMs: Number(process.env.UPSTREAM_NONSTREAM_TIMEOUT_MS) || 180000,
+  // 重试不再发起超过这个总时长（首次尝试不受限，仍按响应头超时）
+  retryDeadlineMs: Number(process.env.RETRY_DEADLINE_MS) || 45000,
+};
+const cooldowns = new Cooldowns();
+const quotaCache = new Map(); // email → Gemini 5h 剩余比例（来自 /api/gemini/quota），只用来决定换到哪个号
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { DATA_DIR, IS_BINARY } from './paths.mjs';
@@ -261,13 +275,15 @@ const server = http.createServer(async (req, res) => {
     const mgr = email ? accountPool.getManager(email) : accountPool.getActiveManager();
     const targetMgr = mgr || accountPool.getActiveManager();
     const quotaData = await fetchRealQuota(targetMgr);
+    const frac = quotaData?.gemini_5h?.remaining_fraction;
+    if (quotaData?.ok && quotaData.email && typeof frac === 'number') quotaCache.set(quotaData.email, frac);
     sendJson(res, 200, quotaData);
     return;
   }
 
   // 3. 统计数据与日志
   if (url.pathname === '/api/stats') {
-    sendJson(res, 200, statsTracker.getStats());
+    sendJson(res, 200, { ...statsTracker.getStats(), cooldowns: cooldowns.list() });
     return;
   }
 
@@ -556,137 +572,107 @@ const server = http.createServer(async (req, res) => {
         }
 
         statsEmail = activeMgr.tokenData.email;
-        let accessToken = await activeMgr.getValidAccessToken();
         const isStreaming = Boolean(anthropicReq.stream);
-        let lastFailedDetails = null;
 
-        let response = null;
-        const trySendToAccount = async (mgr) => {
-          let tok = await mgr.getValidAccessToken();
-          if (!tok) return null;
-          if (!mgr.tokenData.projectId && typeof mgr.ensureProjectId === 'function') {
-            await mgr.ensureProjectId().catch(() => '');
-          }
-          mark('t_token');
-          anthropicReq._gwEmail = mgr.tokenData.email;
-          let p = buildCloudCodePayload(anthropicReq, mgr.tokenData.projectId);
-          cacheProbe.record(mgr.tokenData.email, anthropicReq.model, p);
-          mark('t_payload');
-
-          const streamUrl = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:streamGenerateContent?alt=sse`;
-          const nonStreamUrl = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:generateContent`;
-          const targetUrl = isStreaming ? streamUrl : nonStreamUrl;
-
+        // PR1：失败处理收敛到 upstream-policy（400 直接返回；429 冷却换号；5xx/超时换 host 一次再换号一次；最后才降级）
+        const send = async (payload, mgr, host, timeoutMs) => {
+          const tok = await mgr.getValidAccessToken();
+          const targetUrl = isStreaming ? `${host}/v1internal:streamGenerateContent?alt=sse` : `${host}/v1internal:generateContent`;
           timing.attempts++;
-          let r = await upstreamFetch(targetUrl, {
-            method: 'POST',
-            headers: buildAntigravityHeaders(tok),
-            body: JSON.stringify(p),
-          });
-          markHeaders(targetUrl, r);
-
-          if (r && r.status === 400) {
-            const errText = await r.clone().text().catch(() => '');
-            if (bumpSessionOnOverflow(anthropicReq, mgr.tokenData.email, errText)) {
-              p = buildCloudCodePayload(anthropicReq, mgr.tokenData.projectId);
-              mark('t_payload');
-              timing.attempts++;
-              r = await upstreamFetch(targetUrl, {
-                method: 'POST',
-                headers: buildAntigravityHeaders(tok),
-                body: JSON.stringify(p),
-              });
-              markHeaders(targetUrl, r);
-            }
+          const ac = timeoutMs ? new AbortController() : null;
+          const timer = ac ? setTimeout(() => {
+            const e = new Error(`upstream header timeout ${timeoutMs}ms`); e.name = 'TimeoutError'; ac.abort(e);
+          }, timeoutMs) : null;
+          try {
+            const r = await upstreamFetch(targetUrl, {
+              method: 'POST',
+              headers: buildAntigravityHeaders(tok),
+              body: JSON.stringify(payload),
+              ...(ac ? { signal: ac.signal } : {}),
+            });
+            markHeaders(targetUrl, r);
+            return r;
+          } finally {
+            if (timer) clearTimeout(timer);
           }
-          return r;
         };
 
-        try {
-          response = await trySendToAccount(activeMgr);
-          if (response && (response.status === 429 || response.status === 403 || response.status === 401)) {
-            const errBody = await response.clone().text().catch(() => '');
-            if (response.status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(errBody)) {
-              console.warn(`[Failover] 主账号 ${activeMgr.tokenData.email} 触发配额耗尽(${response.status})，借调备用账号...`);
-              const altMgr = accountPool.rotateToNext();
-              if (altMgr && altMgr !== activeMgr) {
-                const altResp = await trySendToAccount(altMgr);
-                if (altResp && altResp.ok) {
-                  activeMgr = altMgr;
-                  timing.switched_account = true;
-                  accessToken = await activeMgr.getValidAccessToken();
-                  statsEmail = activeMgr.tokenData.email;
-                  response = altResp;
-                }
-              }
+        const result = await runWithPolicy({
+          model: anthropicReq.model,
+          anthropicReq,
+          upstreamOf: mapToUpstreamModel,
+          accounts: () => Array.from(accountPool.managers.values()),
+          activeEmail: activeMgr.tokenData.email,
+          quotaOf: email => quotaCache.get(email) ?? null,
+          cooldowns,
+          prepare: async (mgr) => {
+            const tok = await mgr.getValidAccessToken();
+            if (!tok) return false;
+            if (!mgr.tokenData.projectId && typeof mgr.ensureProjectId === 'function') {
+              await mgr.ensureProjectId().catch(() => '');
             }
-          }
-        } catch (e) {
-          lastFailedDetails = { status: 500, body: e.message };
-        }
-
-        if (!response || !response.ok) {
-          const executeAttempt = async (modelToUse) => {
-            const reqCopy = { ...anthropicReq, model: modelToUse };
-            const payload = buildCloudCodePayload(reqCopy, activeMgr.tokenData.projectId);
-            const headers = buildAntigravityHeaders(accessToken);
+            mark('t_token');
+            return true;
+          },
+          buildPayload: (model, mgr) => {
+            if (model === anthropicReq.model) {
+              anthropicReq._gwEmail = mgr.tokenData.email;
+              const p = buildCloudCodePayload(anthropicReq, mgr.tokenData.projectId);
+              cacheProbe.record(mgr.tokenData.email, anthropicReq.model, p);
+              mark('t_payload');
+              return p;
+            }
+            const p = buildCloudCodePayload({ ...anthropicReq, model, _gwEmail: mgr.tokenData.email }, mgr.tokenData.projectId);
             mark('t_payload');
+            return p;
+          },
+          onBadRequest: (body, mgr) => bumpSessionOnOverflow(anthropicReq, mgr.tokenData.email, body),
+          send,
+          hosts: [ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_AUTOPUSH],
+          chain: MODEL_FALLBACK_CHAINS[anthropicReq.model] || [],
+          allowDowngrade: POLICY.allowDowngrade,
+          headerTimeoutMs: isStreaming ? POLICY.streamHeaderTimeoutMs : POLICY.nonStreamHeaderTimeoutMs,
+          deadlineMs: POLICY.retryDeadlineMs,
+          startedAt: startTime,
+          log: m => console.warn(m),
+        });
 
-            for (const host of ANTIGRAVITY_ENDPOINTS) {
-              const upstreamEndpoint = isStreaming
-                ? `${host}/v1internal:streamGenerateContent?alt=sse`
-                : `${host}/v1internal:generateContent`;
-
-              try {
-                timing.attempts++;
-                const r = await upstreamFetch(upstreamEndpoint, {
-                  method: 'POST',
-                  headers,
-                  body: JSON.stringify(payload),
-                });
-                markHeaders(upstreamEndpoint, r);
-                if (r.ok) return r;
-                const errText = await r.text().catch(() => '');
-                lastFailedDetails = { status: r.status, body: errText };
-              } catch (e) {
-                lastFailedDetails = { status: 500, body: e.message };
-              }
-            }
-            return null;
-          };
-
-          response = await executeAttempt(anthropicReq.model);
-          if (!response || !response.ok) {
-            const fallbacks = MODEL_FALLBACK_CHAINS[anthropicReq.model] || [];
-            for (const fallbackModel of fallbacks) {
-              response = await executeAttempt(fallbackModel);
-              if (response && response.ok) break;
-            }
-          }
+        timing.switched_account = result.switchedAccount;
+        if (result.mgr) { activeMgr = result.mgr; statsEmail = activeMgr.tokenData.email; }
+        const modelUsed = result.modelUsed || anthropicReq.model;
+        const dg = { model_used: modelUsed, downgraded: Boolean(result.downgraded), downgrade_reason: result.reason && result.downgraded ? result.reason : null };
+        res.setHeader('X-Gateway-Model-Requested', String(anthropicReq.model || ''));
+        res.setHeader('X-Gateway-Model-Used', String(modelUsed || ''));
+        if (dg.downgraded) {
+          res.setHeader('X-Gateway-Downgrade-Reason', dg.downgrade_reason);
+          console.warn(`[Downgrade] ${anthropicReq.model} → ${modelUsed}（${dg.downgrade_reason}）`);
         }
+        const notice = dg.downgraded && shouldInsertNotice(anthropicReq) ? buildDowngradeNotice(anthropicReq.model, modelUsed, dg.downgrade_reason) : null;
 
-        if (!response || !response.ok) {
-          const errDetail = lastFailedDetails ? lastFailedDetails.body : 'Google 集群无响应';
-          sendJson(res, 502, {
-            error: {
-              type: 'upstream_error',
-              message: errDetail,
-            },
-          });
+        if (!result.ok) {
+          const e = result.error || {};
+          const errDetail = e.body || 'Google 集群无响应';
+          let status = 502, type = 'upstream_error';
+          if (e.kind === 'bad_request') { status = e.status >= 400 && e.status < 500 ? e.status : 400; type = 'invalid_request_error'; }
+          else if (e.kind === 'quota') { status = 429; type = 'rate_limit_error'; }
+          if (result.reason && e.kind !== 'bad_request') res.setHeader('X-Gateway-Failure-Reason', result.reason);
+          sendJson(res, status, { type: 'error', error: { type, message: errDetail } });
           statsTracker.recordRequest({
             email: activeMgr.tokenData.email,
             model: anthropicReq.model,
             latency_ms: Date.now() - startTime,
-            status: 502,
+            status,
             error: String(errDetail).slice(0, 100),
             timing: timingOut(),
+            ...dg,
           });
           statsRecorded = true;
           return;
         }
+        const response = result.response;
 
         if (isStreaming) {
-          await handleStreamConversion(response, res, anthropicReq.model, (usage) => {
+          await handleStreamConversion(response, res, modelUsed, (usage) => {
             const status = usage.outcome === 'ok' ? 200 : usage.outcome === 'client_abort' ? 499 : 502;
             statsTracker.recordRequest({
               email: activeMgr.tokenData.email,
@@ -701,11 +687,16 @@ const server = http.createServer(async (req, res) => {
               thoughts_tokens: usage.thoughts_tokens,
               error: usage.error || null,
               timing: timingOut({ t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null }),
+              ...dg,
             });
-          }, startTime);
+          }, startTime, { notice });
         } else {
           const googleData = await response.json();
-          const anthropicResp = convertGoogleToAnthropic(googleData, anthropicReq.model);
+          const anthropicResp = convertGoogleToAnthropic(googleData, modelUsed);
+          if (notice) {
+            const tb = anthropicResp.content.find(b => b.type === 'text');
+            if (tb) tb.text = notice + tb.text;
+          }
           sendJson(res, 200, anthropicResp);
 
           const u = anthropicResp._gw_usage || {};
@@ -720,6 +711,7 @@ const server = http.createServer(async (req, res) => {
             cached_tokens: u.cached_tokens || 0,
             thoughts_tokens: u.thoughts_tokens || 0,
             timing: timingOut(),
+            ...dg,
           });
         }
         statsRecorded = true;
