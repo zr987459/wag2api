@@ -97,6 +97,7 @@ async function loadOverview() {
     await refreshEngineState();
     await loadPool();
     await loadPort();
+    await loadGatewayState();
   } catch (e) {
     statusText.textContent = '连接中断';
     statusPill.style.color = 'var(--danger)';
@@ -160,6 +161,8 @@ async function loadAccounts() {
             </div>
           </div>
           <div style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
+            <button class="btn btn-outline btn-sm" onclick="testAccount('${escapeHtml(a.uid)}', this)">测试</button>
+            <button class="btn btn-outline btn-sm" onclick="exportOne('${escapeHtml(a.uid)}')">导出</button>
             <button class="btn btn-outline btn-sm" onclick="selectAccount('${escapeHtml(a.uid)}').then(()=>{loadAccounts();loadPool();})">使用</button>
             <button class="btn btn-outline btn-sm" onclick="toggleAccount('${escapeHtml(a.uid)}', ${!disabled})">${disabled ? '启用' : '禁用'}</button>
             <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.4);" onclick="deleteAccount('${escapeHtml(a.uid)}')">删除</button>
@@ -762,4 +765,146 @@ async function savePort() {
     const d = await r.json();
     alert(d.msg || (d.ok ? '已保存' : '保存失败'));
   } catch (e) { alert('保存失败：' + e.message); }
+}
+
+
+// ── 网关总开关 ────────────────────────────────────────────
+
+async function loadGatewayState() {
+  try {
+    const res = await fetch('/panel/api/settings/gateway', { cache: 'no-store' });
+    if (!res.ok) return;
+    const d = await res.json();
+    const t = document.getElementById('gatewayToggle');
+    const txt = document.getElementById('gatewayStateText');
+    if (t) { t.checked = d.enabled !== false; t.dataset.init = '1'; }
+    if (txt) {
+      txt.textContent = d.enabled ? '运行中 · 客户端可访问' : '已关闭 · 客户端将断开';
+      txt.style.color = d.enabled ? 'var(--text-muted)' : 'var(--warning)';
+    }
+  } catch (e) {}
+}
+
+async function toggleGateway(on) {
+  if (!on && !confirm('关闭网关后，所有客户端将无法访问，确定吗？')) {
+    document.getElementById('gatewayToggle').checked = true;
+    return;
+  }
+  try {
+    const r = await fetch('/panel/api/settings/gateway', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: on })
+    });
+    const d = await r.json();
+    if (!on) {
+      alert('网关已关闭。如需重新打开，请回到本页面开启开关。');
+    }
+    setTimeout(loadGatewayState, 500);
+  } catch (e) {
+    alert('操作失败：' + e.message);
+  }
+}
+
+// ── 单账号导出 ────────────────────────────────────────────
+
+async function exportOne(uid) {
+  try {
+    const r = await fetch('/panel/api/accounts/export-one', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert(d.msg || '导出失败'); return; }
+    const text = JSON.stringify(d.account, null, 2);
+    // 弹窗展示 + 复制
+    showTextDialog('导出账号凭据', text);
+  } catch (e) { alert('导出失败：' + e.message); }
+}
+
+function showTextDialog(title, text) {
+  const old = document.getElementById('__dlg');
+  if (old) old.remove();
+  const wrap = document.createElement('div');
+  wrap.id = '__dlg';
+  wrap.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--card-bg,#161b26);border-radius:14px;padding:16px;width:100%;max-width:520px;max-height:80vh;display:flex;flex-direction:column;';
+  const h = document.createElement('div');
+  h.textContent = title;
+  h.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:10px;color:var(--text-main,#fff);';
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.readOnly = true;
+  ta.style.cssText = 'flex:1;min-height:200px;background:rgba(0,0,0,.4);color:#ddd;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:10px;font-family:monospace;font-size:11px;resize:vertical;';
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;margin-top:12px;';
+  const bCopy = document.createElement('button');
+  bCopy.textContent = '复制';
+  bCopy.className = 'btn btn-primary';
+  bCopy.style.flex = '1';
+  bCopy.onclick = () => { ta.select(); document.execCommand('copy'); bCopy.textContent = '已复制 ✓'; };
+  const bClose = document.createElement('button');
+  bClose.textContent = '关闭';
+  bClose.className = 'btn btn-outline';
+  bClose.style.flex = '1';
+  bClose.onclick = () => wrap.remove();
+  row.appendChild(bCopy); row.appendChild(bClose);
+  box.appendChild(h); box.appendChild(ta); box.appendChild(row);
+  wrap.appendChild(box);
+  document.body.appendChild(wrap);
+}
+
+// ── 连通性测试 ────────────────────────────────────────────
+
+async function testAccount(uid, btn) {
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = '测试中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('/panel/api/accounts/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid })
+    });
+    const d = await r.json();
+    let msg;
+    if (d.ok) {
+      msg = `✅ 连通正常\n耗时 ${d.elapsed_ms}ms\n端点 ${d.endpoint || '-'}`;
+    } else if (d.partial) {
+      msg = `⚠️ 账号可用，但上游繁忙\n${d.msg}\n耗时 ${d.elapsed_ms}ms`;
+    } else {
+      msg = `❌ 测试失败\n${d.msg}\n耗时 ${d.elapsed_ms}ms`;
+    }
+    alert(msg);
+  } catch (e) {
+    alert('测试失败：' + e.message);
+  } finally {
+    if (btn) { btn.textContent = orig; btn.disabled = false; }
+  }
+}
+
+async function testAllAccounts() {
+  const pool = await loadPool();
+  const list = (pool && pool.accounts ? pool.accounts : []).filter(a => !a.disabled);
+  if (list.length === 0) { alert('没有可测试的账号'); return; }
+
+  const lines = [];
+  for (const a of list) {
+    try {
+      const r = await fetch('/panel/api/accounts/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uid: a.uid })
+      });
+      const d = await r.json();
+      const mark = d.ok ? '✅' : (d.partial ? '⚠️' : '❌');
+      const name = a.nickname || a.uid.slice(0, 8);
+      lines.push(`${mark} ${name} · ${d.elapsed_ms}ms${d.ok ? '' : ' · ' + d.msg}`);
+    } catch (e) {
+      lines.push(`❌ ${a.nickname || a.uid} · ${e.message}`);
+    }
+  }
+  alert('连通性测试结果\n\n' + lines.join('\n'));
+  loadPool();
 }

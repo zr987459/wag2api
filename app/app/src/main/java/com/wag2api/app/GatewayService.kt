@@ -47,6 +47,35 @@ class GatewayService : Service() {
             return true
         }
 
+        private const val KEY_GATEWAY_ON = "gateway_enabled"
+
+        /** 网关总开关：关闭后前门停止监听，客户端全部断开 */
+        fun isGatewayEnabled(ctx: Context): Boolean =
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .getBoolean(KEY_GATEWAY_ON, true)
+
+        /**
+         * 开关网关。关闭时停掉前门并清掉常驻通知；开启时重新拉起。
+         * @return 操作后的状态
+         */
+        fun setGatewayEnabled(ctx: Context, enabled: Boolean): Boolean {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_GATEWAY_ON, enabled).apply()
+
+            val intent = Intent(ctx, GatewayService::class.java)
+            if (enabled) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(intent)
+                } else {
+                    ctx.startService(intent)
+                }
+            } else {
+                // 停止服务：onDestroy 里会关掉前门、释放引擎与 WakeLock
+                ctx.stopService(intent)
+            }
+            return enabled
+        }
+
         @Volatile var isRunning = false
         @Volatile private var instance: GatewayService? = null
 
@@ -102,6 +131,13 @@ class GatewayService : Service() {
 
         engine = EngineFactory.create(applicationContext)
         EngineFactory.injectToken(applicationContext)
+
+        // 网关总开关关闭时，只保留常驻通知，不启动前门
+        if (!isGatewayEnabled(applicationContext)) {
+            isRunning = false
+            updateNotification()
+            return
+        }
 
         // 前门先起来，WB 毫秒级就绪
         val listenPort = getPort(applicationContext)
@@ -169,7 +205,12 @@ class GatewayService : Service() {
 
     private fun updateNotification() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
+        val on = isGatewayEnabled(this)
+        val text = if (!on) {
+            "网关已关闭 · 点按打开"
+        } else {
+            "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
+        }
         nm.notify(NOTIF_ID, buildNotification(text))
     }
 

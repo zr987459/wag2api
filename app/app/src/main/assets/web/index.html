@@ -87,6 +87,15 @@
 
     <div class="card">
       <div class="section-title">服务设置</div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.06); margin-bottom: 12px;">
+        <div>
+          <div style="font-size: 14px; font-weight: 600;">网关总开关</div>
+          <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;" id="gatewayStateText">运行中</div>
+        </div>
+        <label class="switch"><input type="checkbox" id="gatewayToggle" onchange="toggleGateway(this.checked)"><span class="slider"></span></label>
+      </div>
+
       <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
         <span style="font-size: 13px; white-space: nowrap;">监听端口</span>
         <input type="number" id="portInput" class="input-field" style="margin-bottom: 0; flex: 1;"
@@ -94,7 +103,7 @@
         <button class="btn btn-primary btn-sm" onclick="savePort()">保存</button>
       </div>
       <p style="font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.6;">
-        修改后需重启网关（或重开 App）生效。范围 1024~65535。
+        关闭网关后前门停止监听，客户端会断开。端口修改后需重启网关生效，范围 1024~65535。
       </p>
     </div>
 
@@ -138,7 +147,7 @@
       </div>
       <div style="display: flex; gap: 8px; margin-top: 10px;">
         <button class="btn btn-outline" style="flex: 1;" onclick="refreshTokens()">🔄 Token 保活</button>
-        <button class="btn btn-outline" style="flex: 1;" onclick="loadPool()">刷新状态</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="testAllAccounts()">⚡ 全部测试</button>
       </div>
     </div>
 

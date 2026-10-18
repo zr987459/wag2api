@@ -350,6 +350,51 @@ class LocalGatewayServer(
                 }
             }
 
+            // 1.16 API: 网关总开关（读状态 / 开关）
+            path == "/panel/api/settings/gateway" || path == "/m/api/settings/gateway" -> {
+                if (method == "POST") {
+                    val on = try { JSONObject(body).optBoolean("enabled", true) } catch (e: Exception) { true }
+                    val now = GatewayService.setGatewayEnabled(context, on)
+                    sendJsonResponse(output, 200, JSONObject().apply {
+                        put("ok", true)
+                        put("enabled", now)
+                        put("msg", if (now) "网关已开启" else "网关已关闭")
+                    }.toString())
+                } else {
+                    sendJsonResponse(output, 200, JSONObject().apply {
+                        put("ok", true)
+                        put("enabled", GatewayService.isGatewayEnabled(context))
+                    }.toString())
+                }
+            }
+
+            // 1.17 API: 单个账号导出（含完整 token）
+            path == "/panel/api/accounts/export-one" || path == "/m/api/accounts/export-one" -> {
+                val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
+                if (uid.isEmpty()) {
+                    sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "uid 不能为空").toString())
+                } else {
+                    val one = AccountVault.exportOneAccount(uid)
+                    if (one == null) {
+                        sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "未找到该账号").toString())
+                    } else {
+                        sendJsonResponse(output, 200, JSONObject().apply {
+                            put("ok", true)
+                            put("account", one)
+                        }.toString())
+                    }
+                }
+            }
+
+            // 1.18 API: 连通性测试（测指定账号能否真正跑通一次请求）
+            path == "/panel/api/accounts/test" || path == "/m/api/accounts/test" -> {
+                val j = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
+                val uid = j.optString("uid", "")
+                val model = j.optString("model", "deepseek-v4.1-flash-1017")
+                val result = ConnectivityTest.run(context, uid, model)
+                sendJsonResponse(output, 200, result.toString())
+            }
+
             // 2. API: 发起授权
             path == "/panel/api/login/start" || path == "/m/api/auth/start" -> {
                 val realm = try { JSONObject(body).optString("realm", "global") } catch (e: Exception) { "global" }

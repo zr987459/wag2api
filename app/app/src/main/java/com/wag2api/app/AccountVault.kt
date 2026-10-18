@@ -246,6 +246,24 @@ object AccountVault {
         return null
     }
 
+    /** 导出单个账号的完整凭据（含 accessToken / refreshToken），用于迁移或备份 */
+    @Synchronized
+    fun exportOneAccount(uid: String): JSONObject? {
+        val list = getAccounts()
+        for (i in 0 until list.length()) {
+            val a = list.optJSONObject(i) ?: continue
+            if (a.optString("uid") != uid) continue
+            return JSONObject().apply {
+                put("uid", a.optString("uid"))
+                put("nickname", a.optString("nickname"))
+                put("realm", a.optString("realm", "global"))
+                put("accessToken", a.optString("accessToken"))
+                put("refreshToken", a.optString("refreshToken"))
+            }
+        }
+        return null
+    }
+
     /** 就地修改某个账号的字段（不动 token），用于记 last_used / 冷却等 */
     @Synchronized
     fun updateAccount(uid: String, block: (JSONObject) -> Unit) {
