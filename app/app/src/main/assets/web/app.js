@@ -163,12 +163,16 @@ async function loadAccounts() {
 
           <div class="account-test-banner" id="test-banner-${escapeHtml(a.uid)}"></div>
 
-          <div class="account-actions-grid">
-            <button class="btn btn-outline btn-sm" onclick="testAccount('${escapeHtml(a.uid)}', this)">⚡ 测试</button>
-            <button class="btn btn-outline btn-sm" onclick="exportOne('${escapeHtml(a.uid)}')">📤 导出</button>
-            <button class="btn btn-outline btn-sm" onclick="selectAccount('${escapeHtml(a.uid)}').then(()=>{loadAccounts();loadPool();showToast('已切换至该账号','success');})">🌟 使用</button>
-            <button class="btn btn-outline btn-sm" onclick="toggleAccount('${escapeHtml(a.uid)}', ${!disabled})">${disabled ? '▶ 启用' : '⏸ 禁用'}</button>
-            <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.4);" onclick="deleteAccount('${escapeHtml(a.uid)}')">🗑 删除</button>
+          <div class="account-actions-wrap">
+            <div class="account-actions-row">
+              <button class="btn btn-outline btn-sm" onclick="testAccount('${escapeHtml(a.uid)}', this)">⚡ 测试</button>
+              <button class="btn btn-outline btn-sm" onclick="exportOne('${escapeHtml(a.uid)}')">📤 导出</button>
+              <button class="btn btn-outline btn-sm" onclick="selectAccount('${escapeHtml(a.uid)}').then(()=>{loadAccounts();loadPool();showToast('已设为当前默认账号','success');})">🌟 使用</button>
+            </div>
+            <div class="account-actions-row">
+              <button class="btn btn-outline btn-sm" onclick="toggleAccount('${escapeHtml(a.uid)}', ${!disabled})">${disabled ? '▶ 启用账号' : '⏸ 暂停使用'}</button>
+              <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.4);" onclick="deleteAccount('${escapeHtml(a.uid)}')">🗑 删除账号</button>
+            </div>
           </div>
         </div>`;
     }).join('');

@@ -563,19 +563,23 @@ body {
   line-height: 1.5;
   word-break: break-all;
 }
-.account-actions-grid {
+.account-actions-wrap {
   display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 8px;
   padding-top: 10px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
-.account-actions-grid .btn {
-  flex: 1 1 calc(20% - 6px);
-  min-width: 60px;
+.account-actions-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.account-actions-row .btn {
+  flex: 1;
   padding: 6px 4px;
   font-size: 12px;
-  min-height: 34px;
+  min-height: 36px;
   white-space: nowrap;
 }
 .account-test-banner {

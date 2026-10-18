@@ -82,10 +82,10 @@ object ConnectivityTest {
         // 2. 模型映射与规范化
         val cleanModel = MODEL_ALIASES[model] ?: model
 
-        // 3. 构造上游合规最小 Payload（必须带 system 角色，stream=false）
+        // 3. 构造上游合规最小 Payload（腾讯上游强制要求流式 stream=true）
         val payload = JSONObject().apply {
             put("model", cleanModel)
-            put("stream", false)
+            put("stream", true)
             put("max_tokens", 8)
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
@@ -151,21 +151,31 @@ object ConnectivityTest {
                 val req = reqBuilder.post(payload.toString().toRequestBody(jsonMedia)).build()
 
                 client.newCall(req).execute().use { resp ->
-                    val body = resp.body?.string().orEmpty()
                     lastStatus = resp.code
 
                     if (resp.isSuccessful) {
-                        // 成功：判断返回内容
-                        val hasContent = body.contains("\"content\"") ||
-                                body.contains("\"choices\"") ||
-                                body.contains("\"text\"") ||
-                                body.contains("\"message\"")
+                        val source = resp.body?.source()
+                        var hasContent = false
+                        if (source != null) {
+                            // 读取前若干帧，只要收到首个有效 chunk 即确认链路通畅
+                            var linesRead = 0
+                            while (!source.exhausted() && linesRead < 30) {
+                                val line = source.readUtf8Line() ?: break
+                                linesRead++
+                                if (line.startsWith("data:") && (line.contains("\"choices\"") || line.contains("\"delta\"") || line.contains("\"content\""))) {
+                                    hasContent = true
+                                    break
+                                }
+                            }
+                        }
                         if (hasContent) {
                             return success(started, accUid, url, realm, cleanModel)
                         } else {
-                            lastError = "上游返回 200 但内容异常"
+                            lastError = "上游响应 200 但未返回内容帧"
                         }
                     }
+
+                    val body = resp.body?.string().orEmpty()
 
                     // 失败分析
                     val code = try {
