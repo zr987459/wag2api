@@ -64,9 +64,13 @@ android {
             isMinifyEnabled = false
             val hasKs = rootProject.file("keystore/release.p12").exists() &&
                     !System.getenv("KS_PW").isNullOrEmpty()
-            // CI 环境（GITHUB_ACTIONS）必须用正式签名，否则每次签名不同会导致无法覆盖安装
+            // CI 环境打包 APK 时必须用正式签名，否则每次签名不同会导致无法覆盖安装。
+            // 注意：只编译 Kotlin 的检查任务不涉及签名，不触发此保护。
             val inCi = !System.getenv("GITHUB_ACTIONS").isNullOrEmpty()
-            if (inCi && !hasKs) {
+            val packagingTask = gradle.startParameter.taskNames.any {
+                it.contains("assemble", ignoreCase = true) || it.contains("bundle", ignoreCase = true)
+            }
+            if (inCi && packagingTask && !hasKs) {
                 throw GradleException(
                     "CI 环境缺少固定签名密钥库（keystore/release.p12 或 KS_PW），" +
                     "继续构建会导致签名不一致、手机无法覆盖安装。已中止。"
