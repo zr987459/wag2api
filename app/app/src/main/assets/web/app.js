@@ -37,8 +37,10 @@ function fmtNum(n) {
 function fmtPct(r) { return r === null || r === undefined ? '--' : (r * 100).toFixed(1) + '%'; }
 function fmtMs(ms) { return ms === null || ms === undefined || ms === 0 ? '--' : ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
 
-// 独立运行（Linux / 源码版）只有 AG 引擎；设置了 ADMIN_KEY 时管理接口需带密钥
+// 独立运行：standalone=只有 AG（WB_ENGINE=0）；dual=Linux / 源码版双引擎（没有安卓宿主）。
+// 设置了 ADMIN_KEY 时管理接口需带密钥
 const isStandalone = () => !!engineInfo.standalone;
+const isDual = () => !!engineInfo.dual;
 function authHeaders(h) {
   const k = localStorage.getItem('wag2api_admin_key');
   return k ? { ...(h || {}), 'x-admin-key': k } : (h || {});
@@ -46,7 +48,7 @@ function authHeaders(h) {
 
 async function getJson(url, opts, retried) {
   const res = await fetch(url, { cache: 'no-store', ...opts, headers: authHeaders(opts && opts.headers) });
-  if (res.status === 401 && !retried && url.startsWith('/api/')) {
+  if (res.status === 401 && !retried && (url.startsWith('/api/') || url.startsWith('/panel/api/'))) {
     const k = prompt('此网关设置了管理密钥（ADMIN_KEY），请输入：', '');
     if (k) { localStorage.setItem('wag2api_admin_key', k.trim()); return getJson(url, opts, true); }
   }
@@ -120,6 +122,7 @@ async function refreshEngineInfo() {
     document.body.classList.add('standalone');
     if (engine !== 'ag') { engine = 'ag'; localStorage.setItem('wag2api_engine', 'ag'); }
   }
+  document.body.classList.toggle('dual', isDual());
   const mini = $('miniAg');
   const tab = $('tabSwitchAg');
   if (!engineInfo.supported) { mini.textContent = '未内置'; tab.classList.add('disabled'); }
@@ -153,7 +156,7 @@ function applyEngineChrome() {
   $('brandIcon').textContent = m.icon;
   $('currentEngineBadge').textContent = m.title;
   if ($('navEngine')) $('navEngine').textContent = isStandalone() ? 'AG' : m.name;
-  $('agEngineCard').style.display = engine === 'ag' && engineInfo.supported && !isStandalone() ? 'block' : 'none';
+  $('agEngineCard').style.display = engine === 'ag' && engineInfo.supported && !isStandalone() && !isDual() ? 'block' : 'none';
 }
 
 function switchEngine(e) {
@@ -770,7 +773,7 @@ async function submitImport() {
 async function openExportModal() {
   try {
     if (engine === 'wb') {
-      const txt = await (await fetch('/panel/api/tokens/export', { cache: 'no-store' })).text();
+      const txt = await (await fetch('/panel/api/tokens/export', { cache: 'no-store', headers: authHeaders() })).text();
       showText('导出 WB 账号', '全部账号与完整 Token，可在 WB 引擎「导入」里恢复。请妥善保管。', txt);
     } else {
       if (!agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
@@ -782,7 +785,7 @@ async function openExportModal() {
 
 async function openBackupModal() {
   const out = { format: 'wag2api-backup', version: 1, exported_at: new Date().toISOString(), wb: [], ag: null };
-  try { out.wb = JSON.parse(await (await fetch('/panel/api/tokens/export', { cache: 'no-store' })).text()); } catch (e) { /* 空 */ }
+  try { out.wb = JSON.parse(await (await fetch('/panel/api/tokens/export', { cache: 'no-store', headers: authHeaders() })).text()); } catch (e) { /* 空 */ }
   if (agReady()) { try { out.ag = await getJson('/api/accounts/export'); } catch (e) { /* 空 */ } }
   const n = (out.wb || []).length + ((out.ag && out.ag.accounts) || []).length;
   showText('双引擎备份', `共 ${n} 个账号（WB ${(out.wb || []).length}，AG ${((out.ag && out.ag.accounts) || []).length}）。在任一引擎的「导入」里粘贴即可整体恢复。`, JSON.stringify(out, null, 2));
@@ -914,7 +917,7 @@ async function sendMessage() {
     const isAg = eng === 'ag';
     const res = await fetch(isAg ? '/v1/messages' : '/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01', 'x-api-key': 'local' },
+      headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01', 'x-api-key': localStorage.getItem('wag2api_admin_key') || 'local' },
       signal: currentAbort.signal,
       body: JSON.stringify(isAg
         ? { model: 'ag:' + model, max_tokens: 8192, stream: true, messages: st.history }
