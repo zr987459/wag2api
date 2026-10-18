@@ -227,6 +227,10 @@ jobs:
           fi
           exit 0
 
+      # 只上传压缩后的单文件和 Node 轻量包，原始二进制太大
+      - name: 清理未压缩二进制
+        run: rm -f dist/wag2api-linux-x64 dist/wag2api-linux-arm64 && ls -la dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux
