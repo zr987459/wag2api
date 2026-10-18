@@ -425,10 +425,18 @@ class LocalGatewayServer(
         val (status, type) = when {
             e is UpstreamException && e.code == 11128 -> 403 to "upstream_channel_rejected"
             e is UpstreamException && e.status == 403 -> 403 to "upstream_forbidden"
+            // 限流：映射成客户端能识别的可重试类型（Anthropic 标准 overloaded_error）
+            e is UpstreamException && (e.status == 429 || e.code == 14003) ->
+                529 to "overloaded_error"
             e is UpstreamException -> 502 to "upstream_error"
             else -> 500 to "gateway_error"
         }
-        val err = JSONObject().put("message", e.message ?: type).put("type", type)
+        val msg = if (type == "overloaded_error") {
+            "上游模型繁忙，请稍后重试（已自动尝试切换账号）"
+        } else {
+            e.message ?: type
+        }
+        val err = JSONObject().put("message", msg).put("type", type)
         if (e is UpstreamException) err.put("code", e.code ?: e.status)
         return status to JSONObject().put("type", "error").put("error", err)
     }

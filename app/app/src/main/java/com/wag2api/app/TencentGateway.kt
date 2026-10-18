@@ -553,31 +553,37 @@ object TencentGateway {
 
                         val source = resp.body?.source()
                             ?: throw IOException("empty upstream body @ $url")
-                        var first = true
                         val reasoningBuf = java.lang.StringBuilder()
                         val toolIds = java.util.ArrayList<String>()
 
                         while (!source.exhausted()) {
                             val line = source.readUtf8Line() ?: break
                             if (line.isEmpty()) continue
-                            if (first) {
-                                first = false
-                                val code = upstreamCode(line)
-                                if (code != null && code != 0) {
-                                    val err = UpstreamException(resp.code, code, url, line.take(500))
-                                    // 首帧就是限流错误：还没吐字，安全重试
+
+                            // 每一帧都检查错误码，不能只查首帧：
+                            // 上游可能在 200 的流中途插入 {"code":14003}，
+                            // 若不拦下，客户端会把半截回答当成完整的（不会重试）
+                            val code = upstreamCode(line)
+                            if (code != null && code != 0) {
+                                val err = UpstreamException(resp.code, code, url, line.take(500))
+                                if (emittedAny) {
+                                    // 已吐字：不重试，打冷却后抛出，由前门发 error 事件
                                     if (isRateLimited(resp.code, code, line)) {
-                                        rateLimited = true
                                         AccountScheduler.markCooling(uid)
-                                        lastErr = err
-                                        return@use
-                                    }
-                                    if (!isLast && shouldTryNext(resp.code, code, line)) {
-                                        lastErr = err
-                                        return@use
                                     }
                                     throw err
                                 }
+                                if (isRateLimited(resp.code, code, line)) {
+                                    rateLimited = true
+                                    AccountScheduler.markCooling(uid)
+                                    lastErr = err
+                                    return@use
+                                }
+                                if (!isLast && shouldTryNext(resp.code, code, line)) {
+                                    lastErr = err
+                                    return@use
+                                }
+                                throw err
                             }
 
                             try {
@@ -615,6 +621,8 @@ object TencentGateway {
                         return
                     }
                 } catch (e: UpstreamException) {
+                    // 已经吐字：绝不重试，直接抛出（否则会重复输出）
+                    if (emittedAny) throw e
                     // 限流已在上面处理；其余错误若还有端点可退，继续
                     if (!isLast && !rateLimited) {
                         lastErr = e
@@ -624,6 +632,8 @@ object TencentGateway {
                     throw e
                 } catch (e: IOException) {
                     Log.w(TAG, "network error @ $url: ${e.message}")
+                    // 已经吐字：中途断网也不能换端点重来，否则客户端会收到两段内容
+                    if (emittedAny) throw e
                     lastErr = e
                     if (isLast) continue
                 }
