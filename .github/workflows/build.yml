@@ -85,11 +85,13 @@ jobs:
 
       # keystore：有 Secret 就用正式签名，没有就退回 debug
       - name: 解密 keystore
-        if: ${{ env.KS_B64 != '' }}
         env:
           KS_B64: ${{ secrets.KEYSTORE_B64 }}
         run: |
-          set -e
+          if [ -z "$KS_B64" ]; then
+            echo "::notice::未配置 KEYSTORE_B64，将使用 debug 签名构建"
+            exit 0
+          fi
           mkdir -p app/keystore
           echo "$KS_B64" | base64 -d > app/keystore/release.p12
 
@@ -104,12 +106,13 @@ jobs:
 
       # 签名硬校验：证书指纹必须与仓库变量一致，否则失败
       - name: 校验签名指纹
-        if: ${{ secrets.KEYSTORE_B64 != '' }}
         env:
           EXPECTED: ${{ vars.RELEASE_CERT_SHA256 }}
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
         run: |
           set -e
-          if [ -z "$EXPECTED" ]; then echo "未配置 RELEASE_CERT_SHA256，跳过"; exit 0; fi
+          if [ -z "$KS_B64" ]; then echo "debug 签名构建，跳过指纹校验"; exit 0; fi
+          if [ -z "$EXPECTED" ]; then echo "::notice::未配置 RELEASE_CERT_SHA256，跳过"; exit 0; fi
           BT=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
           for f in app/app/build/outputs/apk/full/release/*.apk \
                    app/app/build/outputs/apk/lite/release/*.apk; do
