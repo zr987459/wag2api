@@ -15,6 +15,9 @@ import androidx.core.app.NotificationCompat
 import com.wag2api.app.engine.EngineFactory
 import com.wag2api.app.engine.EngineState
 import com.wag2api.app.engine.NodeEngineApi
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -43,8 +46,37 @@ class GatewayService : Service() {
         fun setPort(ctx: Context, port: Int): Boolean {
             if (port !in 1024..65535) return false
             ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-                .edit().putInt(KEY_PORT, port).apply()
+                .edit().putInt(KEY_PORT, port).commit()
             return true
+        }
+
+        /** 试绑定 127.0.0.1:port 后立即释放，用于保存前判断端口是否可用 */
+        fun canBind(port: Int): Boolean = try {
+            ServerSocket().use {
+                it.reuseAddress = true
+                it.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 1)
+            }
+            true
+        } catch (e: Exception) {
+            false
+        }
+
+        /** 最近一次热切换失败的原因（已回退），GET /panel/api/settings/port 带给前端 */
+        @Volatile var lastPortSwitchError: String? = null
+
+        /**
+         * 热切换前门端口：在后台线程里先在新端口起一个新的 LocalGatewayServer，成功后再停旧的；
+         * 新端口起不来就保留旧前门并把设置改回旧端口。只动前门，Node AG 引擎不重启。
+         * 调用方应已把响应发出去（本方法会先等一小会儿让旧连接收尾）。
+         */
+        fun switchFrontDoorPort(ctx: Context, newPort: Int, oldPort: Int) {
+            val svc = instance
+            if (svc == null) {
+                // 服务不在（理论上不会，因为请求就是它的前门收的）：只保存，下次启动生效
+                return
+            }
+            lastPortSwitchError = null
+            svc.restartFrontDoor(newPort, oldPort)
         }
 
         private const val KEY_GATEWAY_ON = "gateway_enabled"
@@ -76,7 +108,46 @@ class GatewayService : Service() {
         }
     }
 
-    private var server: LocalGatewayServer? = null
+    @Volatile private var server: LocalGatewayServer? = null
+    private val frontDoorLock = Any()
+
+    private fun newFrontDoor(port: Int) = LocalGatewayServer(
+        applicationContext, port, engine,
+        onBusy = ::onRequestStart,
+        onIdle = ::onRequestEnd
+    )
+
+    /** 见 [switchFrontDoorPort] */
+    private fun restartFrontDoor(newPort: Int, oldPort: Int) {
+        Thread({
+            try { Thread.sleep(300) } catch (ignored: InterruptedException) {}
+            synchronized(frontDoorLock) {
+                val old = server
+                if (old != null && old.listenPort == newPort && old.isListening) return@synchronized
+                val next = newFrontDoor(newPort)
+                var started = next.startBlocking()
+                if (!started) {
+                    // 检查到真正绑定之间端口可能被抢，稍后再试一次
+                    try { Thread.sleep(300) } catch (ignored: InterruptedException) {}
+                    started = next.startBlocking()
+                }
+                if (started) {
+                    server = next
+                    old?.stop()
+                    lastPortSwitchError = null
+                } else {
+                    // 新端口起不来：旧前门本来就没停，只把设置改回去
+                    setPort(applicationContext, oldPort)
+                    lastPortSwitchError = "端口 $newPort 启动失败，已回退到 $oldPort"
+                    if (old == null || !old.isListening) {
+                        val back = newFrontDoor(oldPort)
+                        if (back.startBlocking()) server = back
+                    }
+                }
+            }
+            updateNotification()
+        }, "FrontDoorPortSwitch").start()
+    }
     private lateinit var engine: NodeEngineApi
 
     /**
@@ -125,11 +196,7 @@ class GatewayService : Service() {
 
         // 前门服务启动，管理面板始终保持可用
         val listenPort = getPort(applicationContext)
-        server = LocalGatewayServer(
-            applicationContext, listenPort, engine,
-            onBusy = ::onRequestStart,
-            onIdle = ::onRequestEnd
-        )
+        server = newFrontDoor(listenPort)
         server?.start()
         isRunning = true
 
@@ -193,7 +260,7 @@ class GatewayService : Service() {
         val text = if (!on) {
             "网关已暂停 · 控制台运行中 (点按打开)"
         } else {
-            "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
+            "WB ✓ · ${nodeStateLabel()} · 本地端口 :${server?.listenPort ?: getPort(this)}"
         }
         nm.notify(NOTIF_ID, buildNotification(text))
     }

@@ -799,7 +799,8 @@ body.theme-ag .nav-item.active {
 body.standalone .standalone-only { display: inline; }
 body.standalone .android-only { display: none !important; }
 /* Linux / 源码版双引擎：没有安卓宿主，端口等宿主设置不显示 */
-body.dual .host-only { display: none !important; }
+body.dual .host-only,
+body.standalone .host-only { display: none !important; }
 .nav-brand { display: none; }
 
 /* ── 电脑端：左侧导航 + 宽内容区 ── */

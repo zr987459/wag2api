@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.*
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
@@ -21,14 +22,41 @@ class LocalGatewayServer(
     private var serverSocket: ServerSocket? = null
     @Volatile private var isRunning = false
 
+    /** 本实例监听的端口（热切换时 GatewayService 用它判断新旧） */
+    val listenPort: Int get() = port
+
+    /** 是否已成功绑定并在接受连接 */
+    val isListening: Boolean get() = isRunning && serverSocket?.isClosed == false
+
+    /** 异步启动（服务 onCreate 用，不在主线程做 bind） */
     fun start() {
         if (isRunning) return
-        isRunning = true
-        thread(name = "LocalGatewayServer") {
+        thread(name = "LocalGatewayServer-boot") { startBlocking() }
+    }
+
+    /**
+     * 同步绑定 127.0.0.1:port，成功后在后台线程接受连接。
+     * @return 是否绑定成功（端口被占用等返回 false），热切换端口时据此决定是否回退
+     */
+    fun startBlocking(): Boolean {
+        val ss: ServerSocket
+        synchronized(this) {
+            if (isRunning) return serverSocket?.isClosed == false
+            ss = try {
+                ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 50)
+                }
+            } catch (e: Exception) {
+                return false
+            }
+            serverSocket = ss
+            isRunning = true
+        }
+        thread(name = "LocalGatewayServer:$port") {
             try {
-                serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
                 while (isRunning) {
-                    val client = serverSocket?.accept() ?: break
+                    val client = ss.accept()
                     client.tcpNoDelay = true // 减少小包网络延迟
                     client.soTimeout = 120000 // 120 秒空闲读超时，适应超长思考模型首字返回
                     thread {
@@ -44,13 +72,17 @@ class LocalGatewayServer(
                 // server closed
             }
         }
+        return true
     }
 
+    /** 关闭监听：新连接立即被拒，已在处理中的请求（含流式）各自跑完 */
     fun stop() {
-        isRunning = false
-        try {
-            serverSocket?.close()
-        } catch (ignored: Exception) {}
+        synchronized(this) {
+            isRunning = false
+            try {
+                serverSocket?.close()
+            } catch (ignored: Exception) {}
+        }
     }
 
     private fun readHeaderBlock(input: InputStream, max: Int = 64 * 1024): ByteArray? {
@@ -383,23 +415,38 @@ class LocalGatewayServer(
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).put("msg", "已在后台刷新").toString())
             }
 
-            // 1.15 API: 读取 / 修改监听端口
+            // 1.15 API: 读取 / 修改监听端口（保存后热切换前门，不重启 AG 引擎）
             path == "/panel/api/settings/port" || path == "/m/api/settings/port" -> {
                 if (method == "POST") {
                     val np = try { JSONObject(body).optInt("port", 0) } catch (e: Exception) { 0 }
-                    val ok = GatewayService.setPort(context, np)
-                    val res = JSONObject().apply {
-                        put("ok", ok)
-                        put("port", GatewayService.getPort(context))
-                        if (ok) put("msg", "端口已保存，重启网关后生效")
-                        else put("msg", "端口需在 1024~65535 之间")
+                    val current = GatewayService.getPort(context)
+                    val res = JSONObject()
+                    var switchTo = 0
+                    when {
+                        np !in 1024..65535 -> res.put("ok", false).put("msg", "端口需在 1024~65535 之间")
+                        np == current -> res.put("ok", true).put("new_port", np).put("unchanged", true)
+                            .put("msg", "已在使用端口 $np")
+                        engine.port > 0 && np == engine.port ->
+                            res.put("ok", false).put("msg", "端口 $np 是 AG 引擎内部端口，请换一个")
+                        !GatewayService.canBind(np) ->
+                            res.put("ok", false).put("msg", "端口 $np 已被占用或无法监听，未保存")
+                        else -> {
+                            GatewayService.setPort(context, np)
+                            res.put("ok", true).put("new_port", np).put("old_port", current)
+                                .put("msg", "已切换到端口 $np")
+                            switchTo = np
+                        }
                     }
+                    res.put("port", if (switchTo > 0) switchTo else current)
+                    // 先把响应发出去，再由 GatewayService 在后台线程热切换前门
                     sendJsonResponse(output, 200, res.toString())
+                    if (switchTo > 0) GatewayService.switchFrontDoorPort(context, switchTo, current)
                 } else {
                     val json = JSONObject().apply {
                         put("ok", true)
                         put("port", GatewayService.getPort(context))
                         put("default_port", GatewayService.DEFAULT_PORT)
+                        GatewayService.lastPortSwitchError?.let { put("switch_error", it) }
                     }
                     sendJsonResponse(output, 200, json.toString())
                 }

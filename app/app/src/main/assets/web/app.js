@@ -310,11 +310,53 @@ async function loadGlobalSettings() {
   } catch (e) { /* ignore */ }
 }
 
+// 把当前页面地址换成同主机的另一个端口（改监听端口后跳转用）
+function urlWithPort(href, port) {
+  const u = new URL(href);
+  u.port = String(port);
+  return u.toString();
+}
+
+// 轮询新端口的引擎状态接口，可用即返回 true；超时返回 false
+async function waitForPort(port, timeoutMs = 10000) {
+  const url = urlWithPort(location.origin + '/panel/api/engine/state', port);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { cache: 'no-store', headers: authHeaders() });
+      if (res.ok) return true;
+    } catch (e) { /* 还没起来 */ }
+    await new Promise(r => setTimeout(r, 400));
+  }
+  return false;
+}
+
+let portSwitching = false;
 async function savePort() {
+  // Linux / 源码版端口由 PORT 环境变量决定，只读
+  if (isDual() || isStandalone()) { showToast('此版本的端口由 PORT 环境变量决定', 'warn'); return; }
+  if (portSwitching) return;
   const port = parseInt($('portInput').value, 10);
   if (!port || port < 1024 || port > 65535) { showToast('端口需在 1024~65535 之间', 'warn'); return; }
   const r = await postJson('/panel/api/settings/port', { port });
-  showToast(r.msg || (r.ok ? '已保存' : '保存失败'), r.ok ? 'success' : 'error');
+  if (!r || !r.ok) { showToast((r && r.msg) || '保存失败', 'error'); return; }
+  const np = Number(r.new_port || r.port);
+  if (r.unchanged || !np || String(np) === (location.port || '')) { showToast(r.msg || '端口未变化', 'info'); return; }
+  portSwitching = true;
+  showToast(`已切换到端口 ${np}，正在跳转…`, 'success');
+  if (await waitForPort(np)) {
+    location.replace(urlWithPort(location.href, np));
+    return;
+  }
+  portSwitching = false;
+  // 新端口没起来：前门已回退到旧端口，读一下原因
+  try {
+    const p = await getJson('/panel/api/settings/port');
+    $('portInput').value = p.port || '';
+    showToast(p.switch_error || `端口 ${np} 未能启动，仍使用 ${p.port}`, 'error');
+  } catch (e) {
+    showToast(`端口 ${np} 未能启动，请重开应用`, 'error');
+  }
 }
 
 async function toggleGateway(on) {

@@ -56,7 +56,13 @@ class MainActivity : AppCompatActivity() {
                     view: WebView?,
                     request: WebResourceRequest?
                 ): Boolean {
-                    val url = request?.url?.toString() ?: return false
+                    val uri = request?.url ?: return false
+                    val url = uri.toString()
+                    // 本地前门：127.0.0.1 / localhost 的任意端口都留在 WebView 里
+                    // （改监听端口后页面会跳到新端口，不能被当成外链拦走）
+                    if (uri.scheme == "http" && (uri.host == "127.0.0.1" || uri.host == "localhost")) {
+                        return false
+                    }
                     // 官方授权链接跳出到系统浏览器完成登录
                     if (url.startsWith("https://copilot.tencent.com") ||
                         url.startsWith("https://www.workbuddy.ai") ||
@@ -86,6 +92,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             handler.post {
+                // 始终按已保存的端口加载（热切换成功才会保存，失败会回退），与前门实际监听一致
                 // 直接访问本地前门，100% 同源，零跨域阻断
                 webView.loadUrl("http://127.0.0.1:$port/")
             }
