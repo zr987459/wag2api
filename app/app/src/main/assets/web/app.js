@@ -337,7 +337,16 @@ async function resetStats() {
 
 // ── 2. 账号 ─────────────────────────────────────────────
 async function loadAccounts() {
+  const want = engine;
+  // 切换引擎时先显示加载中，避免短暂出现「0 个账号」或上一个引擎的列表
+  if ($('accountList').dataset.engine !== want) {
+    $('accountList').dataset.engine = want;
+    $('accountList').innerHTML = '<div class="empty">加载中…</div>';
+    $('accountCount').textContent = '…';
+    $('schedulerCard').style.display = 'none';
+  }
   await refreshEngineInfo();
+  if (engine !== want) return;
   applyEngineChrome();
   if (engine === 'wb') return loadWbAccounts();
   if (!agReady()) {
@@ -355,6 +364,7 @@ async function loadWbAccounts() {
   sch.style.display = 'block';
   try {
     const [ov, pool] = await Promise.all([getJson('/panel/api/overview'), getJson('/panel/api/pool')]);
+    if (engine !== 'wb') return;
     const accounts = ov.accounts || [];
     const poolMap = {};
     (pool.accounts || []).forEach(x => { poolMap[x.uid] = x; });
@@ -487,6 +497,7 @@ async function loadAgAccounts() {
   sch.style.display = 'block';
   try {
     const [status, st] = await Promise.all([getJson('/api/status'), getJson('/api/stats')]);
+    if (engine !== 'ag') return;
     const accs = status.accounts || [];
     const usage = {};
     (st.accounts || []).forEach(a => { usage[a.email] = a; });

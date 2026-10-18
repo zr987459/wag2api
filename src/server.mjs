@@ -148,12 +148,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 1.5 OAuth 回调
-  if (url.pathname === '/oauth-callback') {
-    const code = url.searchParams.get('code');
-    const redirectUri = `http://localhost:${oauthFlowManager.fixedPort}/oauth-callback`;
-    const result = await oauthFlowManager.processCallbackCode(code, redirectUri);
-    res.writeHead(result.status, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(result.html);
+  if ((url.pathname === '/oauth-callback' || url.pathname === '/oauth-result') && oauthFlowManager.handleHttp(url, res)) {
     return;
   }
 
