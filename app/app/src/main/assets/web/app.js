@@ -568,7 +568,7 @@ function quotaHtml(q) {
     return `<div class="quota-row">
       <span class="qn">${name}</span>
       <div class="qbar"><i class="${cls}" style="width:${p ?? 0}%"></i></div>
-      <span class="qp">${p === null ? '--' : p + '%'}</span>
+      <span class="qp">${p === null ? '--' : '剩 ' + p + '%'}</span>
       <span class="qr">${b ? (b.reset_text || '') + (b.inferred ? '（推算）' : '') : '暂无数据'}</span>
     </div>`;
   }).join('') + `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time || '')}</div>`;

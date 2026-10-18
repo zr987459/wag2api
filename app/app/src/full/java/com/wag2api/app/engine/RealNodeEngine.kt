@@ -77,7 +77,10 @@ class RealNodeEngine(
             val ok = ctx.bindService(
                 Intent(ctx, NodeService::class.java),
                 c,
-                Context.BIND_AUTO_CREATE
+                // BIND_IMPORTANT：App 退到后台（比如去浏览器授权）时 :node 进程不被降级冻结
+                // BIND_INCLUDE_CAPABILITIES：继承前台服务的网络能力
+                Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT or
+                    (if (android.os.Build.VERSION.SDK_INT >= 29) Context.BIND_INCLUDE_CAPABILITIES else 0)
             )
             if (!ok) {
                 state = EngineState.FAILED
