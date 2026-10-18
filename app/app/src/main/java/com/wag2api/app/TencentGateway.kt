@@ -24,12 +24,19 @@ object TencentGateway {
 
     private const val TAG = "TencentGateway"
 
-    /** 最多轮换几个账号 */
+    /** 每一轮最多轮换几个账号 */
     private const val MAX_ACCOUNT_ATTEMPTS = 3
-    /** 换账号前的退避时长 */
+    /** 全忙退避的基础时长 */
     private const val RETRY_BACKOFF_MS = 1200L
-    /** 全部繁忙时的额外退避轮数 */
+    /** 单次退避等待上限（避免客户端那头干等太久） */
+    private const val MAX_BACKOFF_WAIT_MS = 8_000L
+    /** 全部繁忙时的额外退避轮数（迭代实现，不递归） */
     private const val FINAL_BACKOFF_ROUNDS = 2
+
+    /** 仅测试用：覆盖上游 base URL */
+    @Volatile internal var baseOverride: String? = null
+    internal fun baseFor(realm: String): String =
+        baseOverride ?: if (realm == "cn") UPSTREAM_CN else UPSTREAM_GLOBAL
 
     /** 由 GatewayService 在启动时注入，供账号调度器读取偏好 */
     @Volatile private var appCtx: android.content.Context? = null
@@ -87,32 +94,23 @@ object TencentGateway {
         return false
     }
 
-    // LRU 缓存：$uid:$tool_call_id -> reasoning_content
-    // 内存上限设为 100 条，保护手机内存低耗运行
-    private val reasoningCache = object : LinkedHashMap<String, String>(50, 0.75f, true) {
+    // LRU 缓存：tool_call_id -> reasoning_content（access-order，上限 100 条）
+    // tool_call_id 由上游生成、全局唯一，不需要再拼 uid 前缀；按 key 直接 O(1) 取，
+    // 也就不存在「遍历 access-order LinkedHashMap」的问题。所有访问都在 @Synchronized 内。
+    private val reasoningCache = object : LinkedHashMap<String, String>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 100
     }
 
     @Synchronized
-    fun recordReasoning(key: String, content: String) {
-        if (key.isNotEmpty() && content.isNotEmpty()) {
-            reasoningCache[key] = content
+    fun recordReasoning(toolCallId: String, content: String) {
+        if (toolCallId.isNotEmpty() && content.isNotEmpty()) {
+            reasoningCache[toolCallId] = content
         }
     }
 
     @Synchronized
-    fun getReasoning(key: String): String? = reasoningCache[key]
-
-    /** 按 tool_call_id 后缀查找思考内容（不依赖当前账号，兼容多账号轮换） */
-    @Synchronized
-    fun getReasoningByToolId(toolCallId: String): String? {
-        if (toolCallId.isEmpty()) return null
-        val suffix = ":$toolCallId"
-        for ((k, v) in reasoningCache) {
-            if (k.endsWith(suffix)) return v
-        }
-        return null
-    }
+    fun getReasoningByToolId(toolCallId: String): String? =
+        if (toolCallId.isEmpty()) null else reasoningCache[toolCallId]
 
     const val UPSTREAM_GLOBAL = "https://www.workbuddy.ai"
     const val UPSTREAM_CN = "https://copilot.tencent.com"
@@ -337,17 +335,7 @@ object TencentGateway {
             toolCallsArray.put(slot)
         }
 
-        val fullR = sbReasoning.toString()
-        val acc = AccountVault.getActiveAccount(realm)
-        val uid = acc?.optString("uid", "user_default") ?: "user_default"
-        if (fullR.isNotEmpty()) {
-            for (slot in toolCallsMap.values) {
-                val tid = slot.optString("id")
-                if (tid.isNotEmpty()) {
-                    recordReasoning("$uid:$tid", fullR)
-                }
-            }
-        }
+        // reasoning 已由 streamChat 按 tool_call_id 记录，这里不再用 getActiveAccount() 的 uid 重复写一份
 
         return JSONObject().apply {
             put("content", text)
@@ -380,7 +368,7 @@ object TencentGateway {
         cleanModel = MODEL_ALIASES[cleanModel] ?: cleanModel
 
         val ctx = applicationContextOrNull()
-        val base = if (realm == "global") UPSTREAM_GLOBAL else UPSTREAM_CN
+        val base = baseFor(realm)
 
         // 复制上游 Payload，仅做 model 映射与 messages[0]=system 规范化，其余字段完整透传
         val upstreamPayload = JSONObject(payload.toString())
@@ -444,7 +432,7 @@ object TencentGateway {
                         for (k in 0 until calls.length()) {
                             val id = calls.getJSONObject(k).optString("id")
                             if (id.isNotEmpty()) {
-                                // 按 $uid:$tool_call_id 精准匹配，避免跨账号串味
+                                // tool_call_id 全局唯一，账号轮换后也能回填
                                 val cached = getReasoningByToolId(id)
                                 if (!cached.isNullOrEmpty()) {
                                     m.put("reasoning_content", cached)
@@ -460,208 +448,220 @@ object TencentGateway {
         val endpoints = listOf("$base/v2/chat/completions", "$base/console/chat/completions")
         val cId = convId ?: UUID.randomUUID().toString().replace("-", "")
 
+        val body = upstreamPayload.toString()
+        val emit = EmitState()
         var lastErr: Exception? = null
-        val triedUids = LinkedHashSet<String>()
-        // 一旦已经向客户端吐过字，就不能再重试，否则会出现重复输出
-        var emittedAny = false
+        var lastRoundRateLimited = false
 
-        // 最多轮换 3 个账号；每个账号内部再按端点回退
-        for (attempt in 1..MAX_ACCOUNT_ATTEMPTS) {
-            val acc = AccountScheduler.pick(ctx, realm, triedUids)
-                ?: AccountVault.getActiveAccount(realm)
-                ?: throw IllegalStateException("未登录账号，请先在面板添加账号")
+        // 外层：全忙退避轮（迭代，不递归）；中层：账号轮换；内层：端点回退
+        for (round in 0..FINAL_BACKOFF_ROUNDS) {
+            if (round > 0) {
+                if (!lastRoundRateLimited) break          // 只有「全是限流」才值得等
+                val wait = maxOf(RETRY_BACKOFF_MS * round, AccountScheduler.minCooldownRemainMs(realm))
+                    .coerceAtMost(MAX_BACKOFF_WAIT_MS)
+                Log.i(TAG, "全部账号繁忙，退避 ${wait}ms 后第 $round 轮重试")
+                Thread.sleep(wait)
+            }
 
-            val uid = acc.optString("uid", "user_default")
-            triedUids.add(uid)
+            val triedUids = LinkedHashSet<String>()
+            var sawRateLimit = false
+            var pickedAny = false
 
-            val machineId = sha256Prefix("wb2a:machine:$uid")
-            val sessionId = sha256Prefix("wb2a:session:$uid")
-
-            var rateLimited = false
-
-            for ((i, url) in endpoints.withIndex()) {
-                val isLast = i == endpoints.lastIndex
-                val reqBuilder = Request.Builder()
-                    .url(url)
-                    .header("Authorization", "Bearer ${acc.optString("accessToken")}")
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json, text/event-stream")
-                    .header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
-                    .header("X-Requested-With", "XMLHttpRequest")
-                    .header("X-CodeBuddy-Request", "1")
-                    .header("User-Agent", CLIENT_UA)
-                    .header("Origin", base)
-                    .header("Referer", "$base/")
-                    .header("X-User-Id", uid)
-                    .header("X-Product", "WorkBuddy")
-                    .header("X-Agent-Purpose", "conversation")
-                    .header("X-IDE-Name", "WorkBuddy")
-                    .header("X-IDE-Type", "WorkBuddy")
-                    .header("X-IDE-Version", "5.5.4")
-                    .header("X-Machine-ID", machineId)
-                    .header("X-Session-ID", sessionId)
-                    .header("X-Conversation-ID", cId)
-                    .header("X-Conversation-Request-ID", UUID.randomUUID().toString().replace("-", ""))
-                    .header("X-Conversation-Message-ID", UUID.randomUUID().toString().replace("-", ""))
-                    .header("X-Root-Request-ID", UUID.randomUUID().toString().replace("-", ""))
-                    .header("X-Trace-ID", UUID.randomUUID().toString().replace("-", ""))
-
-                if (realm == "global") {
-                    reqBuilder.header("X-No-Enterprise-Id", "1")
-                    reqBuilder.header("X-Domain", "www.workbuddy.ai")
-                } else {
-                    reqBuilder.header("X-No-Enterprise-Id", "1")
-                    reqBuilder.header("X-No-Department-Info", "1")
-                }
-
-                val req = reqBuilder.post(upstreamPayload.toString().toRequestBody(jsonMedia)).build()
-
+            accounts@ for (attempt in 1..MAX_ACCOUNT_ATTEMPTS) {
+                val acc = AccountScheduler.pick(ctx, realm, triedUids) ?: break
+                pickedAny = true
+                val uid = acc.optString("uid")
+                triedUids.add(uid)
                 try {
-                    okHttpClient.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) {
-                            val body = resp.body?.string().orEmpty()
-                            val errCode = upstreamCode(body)
-                            val snippet = if (isWafBlocked(resp.code, body)) {
-                                "Tencent Cloud WAF blocked request (pattern in prompt)"
-                            } else {
-                                body.take(300)
-                            }
-                            val err = UpstreamException(resp.code, errCode, url, snippet)
-                            Log.w(TAG, err.message ?: "")
-
-                            // 429 / 14003：限流，打冷却 + 换账号
-                            if (isRateLimited(resp.code, errCode, body)) {
-                                rateLimited = true
+                    var token = acc.optString("accessToken")
+                    var authRetried = false
+                    var i = 0
+                    endpoints@ while (i < endpoints.size) {
+                        val url = endpoints[i]
+                        val isLast = i == endpoints.lastIndex
+                        when (val r = attemptOnce(url, isLast, realm, base, uid, token, cId, body, emit, onLine)) {
+                            is Outcome.Done -> return
+                            is Outcome.RateLimited -> {
+                                // 限流跟账号走，换端点没意义：冷却并直接换账号
                                 AccountScheduler.markCooling(uid)
-                                lastErr = err
-                                return@use
+                                sawRateLimit = true
+                                lastErr = r.err
+                                break@endpoints
                             }
-
-                            // token 失效：先尝试刷新，再换账号
-                            if (isAuthExpired(resp.code, body)) {
-                                TokenKeeper.refreshIfPossible(uid)
-                                lastErr = err
-                                return@use
-                            }
-
-                            if (!isLast && shouldTryNext(resp.code, errCode, body)) {
-                                lastErr = err
-                                return@use
-                            }
-                            throw err
-                        }
-
-                        val source = resp.body?.source()
-                            ?: throw IOException("empty upstream body @ $url")
-                        var first = true
-                        val reasoningBuf = java.lang.StringBuilder()
-                        val toolIds = java.util.ArrayList<String>()
-
-                        while (!source.exhausted()) {
-                            val line = source.readUtf8Line() ?: break
-                            if (line.isEmpty()) continue
-                            if (first) {
-                                first = false
-                                val code = upstreamCode(line)
-                                if (code != null && code != 0) {
-                                    val err = UpstreamException(resp.code, code, url, line.take(500))
-                                    // 首帧就是限流错误：还没吐字，安全重试
-                                    if (isRateLimited(resp.code, code, line)) {
-                                        rateLimited = true
-                                        AccountScheduler.markCooling(uid)
-                                        lastErr = err
-                                        return@use
-                                    }
-                                    if (!isLast && shouldTryNext(resp.code, code, line)) {
-                                        lastErr = err
-                                        return@use
-                                    }
-                                    throw err
-                                }
-                            }
-
-                            try {
-                                if (line.startsWith("data: ")) {
-                                    val s = line.substring(6).trim()
-                                    if (s.startsWith("{") && s != "[DONE]") {
-                                        val delta = JSONObject(s).optJSONArray("choices")
-                                            ?.optJSONObject(0)?.optJSONObject("delta")
-                                        val r = delta?.optString("reasoning_content")
-                                        if (!r.isNullOrEmpty()) reasoningBuf.append(r)
-                                        val tc = delta?.optJSONArray("tool_calls")
-                                        if (tc != null) {
-                                            for (idx in 0 until tc.length()) {
-                                                val tid = tc.getJSONObject(idx).optString("id")
-                                                if (tid.isNotEmpty()) toolIds.add(tid)
-                                            }
-                                        }
+                            is Outcome.AuthExpired -> {
+                                lastErr = r.err
+                                if (!authRetried) {
+                                    authRetried = true
+                                    val fresh = TokenKeeper.refreshAfter401(uid, token)
+                                    if (fresh != null) {
+                                        token = fresh
+                                        continue@endpoints   // 新 token 重试同一端点
                                     }
                                 }
-                            } catch (ignored: Exception) {}
-
-                            emittedAny = true
-                            val keepGoing = onLine("$line\n\n")
-                            if (!keepGoing) break
-                        }
-
-                        if (reasoningBuf.isNotEmpty()) {
-                            val fullR = reasoningBuf.toString()
-                            for (tid in toolIds) {
-                                recordReasoning("$uid:$tid", fullR)
+                                break@endpoints              // 刷新失败：换账号
+                            }
+                            is Outcome.TryNext -> {
+                                lastErr = r.err
+                                i++
                             }
                         }
-
-                        AccountScheduler.touch(uid)
-                        return
                     }
-                } catch (e: UpstreamException) {
-                    // 限流已在上面处理；其余错误若还有端点可退，继续
-                    if (!isLast && !rateLimited) {
-                        lastErr = e
-                        continue
-                    }
-                    if (rateLimited) continue
-                    throw e
-                } catch (e: IOException) {
-                    Log.w(TAG, "network error @ $url: ${e.message}")
-                    lastErr = e
-                    if (isLast) continue
+                } finally {
+                    AccountScheduler.release(uid)
                 }
             }
 
-            // 已经吐字给客户端了，无论成败都不能再重试（否则重复输出）
-            if (emittedAny) {
-                lastErr?.let { throw it }
-                return
+            if (!pickedAny && round == 0) {
+                throw IllegalStateException("未登录账号，请先在面板添加账号")
             }
-
-            // 这个账号的所有端点都试完了
-            if (!rateLimited && lastErr == null) break
-            if (attempt < MAX_ACCOUNT_ATTEMPTS) {
-                // 全是限流的话，短暂退避再换账号（腾讯限流是瞬时的）
-                if (rateLimited) Thread.sleep(RETRY_BACKOFF_MS)
-            }
+            lastRoundRateLimited = sawRateLimit
         }
 
-        // 已经吐字了就不再退避重试，直接结束
-        if (emittedAny) return
+        throw lastErr ?: IOException("upstream unavailable")
+    }
 
-        // 所有账号都被限流：最后再做一轮退避重试
-        for (round in 1..FINAL_BACKOFF_ROUNDS) {
-            val acc = AccountScheduler.pick(ctx, realm, emptySet())
-                ?: AccountVault.getActiveAccount(realm)
-                ?: break
-            Log.i(TAG, "全部账号繁忙，退避第 $round 轮重试")
-            Thread.sleep(RETRY_BACKOFF_MS * round)
-            try {
-                AccountScheduler.clearAllCooldowns()
-                streamChat(payload, convId, onLine)
-                return
-            } catch (e: Exception) {
-                lastErr = e
+    private class EmitState { var emitted = false }
+
+    private sealed class Outcome {
+        object Done : Outcome()
+        class RateLimited(val err: Exception) : Outcome()
+        class AuthExpired(val err: Exception) : Outcome()
+        class TryNext(val err: Exception) : Outcome()
+    }
+
+    /**
+     * 打一次上游。返回 Outcome 表示「可以安全重试/已完成」；抛异常表示不可重试。
+     * 不变量：emit.emitted == true 之后任何异常都直接抛出，绝不返回可重试结果。
+     */
+    private fun attemptOnce(
+        url: String,
+        isLast: Boolean,
+        realm: String,
+        base: String,
+        uid: String,
+        token: String,
+        cId: String,
+        body: String,
+        emit: EmitState,
+        onLine: (String) -> Boolean
+    ): Outcome {
+        val req = buildChatRequest(url, realm, base, uid, token, cId, body)
+        try {
+            okHttpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val errBody = resp.body?.string().orEmpty()
+                    val errCode = upstreamCode(errBody)
+                    val snippet = if (isWafBlocked(resp.code, errBody)) {
+                        "Tencent Cloud WAF blocked request (pattern in prompt)"
+                    } else errBody.take(300)
+                    val err = UpstreamException(resp.code, errCode, url, snippet)
+                    Log.w(TAG, err.message ?: "")
+                    return when {
+                        isRateLimited(resp.code, errCode, errBody) -> Outcome.RateLimited(err)
+                        isAuthExpired(resp.code, errBody) -> Outcome.AuthExpired(err)
+                        !isLast && shouldTryNext(resp.code, errCode, errBody) -> Outcome.TryNext(err)
+                        else -> throw err
+                    }
+                }
+
+                val source = resp.body?.source() ?: return Outcome.TryNext(IOException("empty upstream body @ $url"))
+                var first = true
+                val reasoningBuf = StringBuilder()
+                val toolIds = ArrayList<String>()
+
+                while (!source.exhausted()) {
+                    val line = source.readUtf8Line() ?: break
+                    if (line.isEmpty()) continue
+                    // SSE 注释 / keep-alive 不算业务首帧，也不转发
+                    if (line.startsWith(":")) continue
+                    if (first) {
+                        first = false
+                        val code = upstreamCode(line)
+                        if (code != null && code != 0) {
+                            val err = UpstreamException(resp.code, code, url, line.take(500))
+                            return when {
+                                isRateLimited(resp.code, code, line) -> Outcome.RateLimited(err)
+                                !isLast && shouldTryNext(resp.code, code, line) -> Outcome.TryNext(err)
+                                else -> throw err
+                            }
+                        }
+                    }
+
+                    try {
+                        if (line.startsWith("data: ")) {
+                            val s = line.substring(6).trim()
+                            if (s.startsWith("{")) {
+                                val delta = JSONObject(s).optJSONArray("choices")
+                                    ?.optJSONObject(0)?.optJSONObject("delta")
+                                val r = delta?.optString("reasoning_content")
+                                if (!r.isNullOrEmpty()) reasoningBuf.append(r)
+                                val tc = delta?.optJSONArray("tool_calls")
+                                if (tc != null) {
+                                    for (idx in 0 until tc.length()) {
+                                        val tid = tc.optJSONObject(idx)?.optString("id").orEmpty()
+                                        if (tid.isNotEmpty()) toolIds.add(tid)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (ignored: Exception) {}
+
+                    // 先置位再回调：onLine 内部写了一半就抛异常，也算「已吐字」
+                    emit.emitted = true
+                    if (!onLine("$line\n\n")) break     // 客户端断开：正常结束，不重试
+                }
+
+                if (reasoningBuf.isNotEmpty()) {
+                    val fullR = reasoningBuf.toString()
+                    for (tid in toolIds) recordReasoning(tid, fullR)
+                }
+                return Outcome.Done
             }
+        } catch (e: UpstreamException) {
+            throw e
+        } catch (e: IOException) {
+            if (emit.emitted) throw e          // 已经吐过字：中途断流不能换端点/账号重放
+            Log.w(TAG, "network error @ $url: ${e.message}")
+            return Outcome.TryNext(e)
         }
+    }
 
-        lastErr?.let { throw it }
+    private fun buildChatRequest(
+        url: String, realm: String, base: String, uid: String, token: String, cId: String, body: String
+    ): Request {
+        val machineId = sha256Prefix("wb2a:machine:$uid")
+        val sessionId = sha256Prefix("wb2a:session:$uid")
+        val b = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $token")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("X-CodeBuddy-Request", "1")
+            .header("User-Agent", CLIENT_UA)
+            .header("Origin", base)
+            .header("Referer", "$base/")
+            .header("X-User-Id", uid)
+            .header("X-Product", "WorkBuddy")
+            .header("X-Agent-Purpose", "conversation")
+            .header("X-IDE-Name", "WorkBuddy")
+            .header("X-IDE-Type", "WorkBuddy")
+            .header("X-IDE-Version", "5.5.4")
+            .header("X-Machine-ID", machineId)
+            .header("X-Session-ID", sessionId)
+            .header("X-Conversation-ID", cId)
+            .header("X-Conversation-Request-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-Conversation-Message-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-Root-Request-ID", UUID.randomUUID().toString().replace("-", ""))
+            .header("X-Trace-ID", UUID.randomUUID().toString().replace("-", ""))
+        if (realm == "global") {
+            b.header("X-No-Enterprise-Id", "1")
+            b.header("X-Domain", "www.workbuddy.ai")
+        } else {
+            b.header("X-No-Enterprise-Id", "1")
+            b.header("X-No-Department-Info", "1")
+        }
+        return b.post(body.toRequestBody(jsonMedia)).build()
     }
 }

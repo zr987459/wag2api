@@ -20,6 +20,9 @@ class LocalGatewayServer(
 
     private var serverSocket: ServerSocket? = null
     @Volatile private var isRunning = false
+    /** 最近一次绑定失败原因，供面板展示（null 表示正常） */
+    @Volatile var bindError: String? = null
+        private set
 
     fun start() {
         if (isRunning) return
@@ -40,6 +43,11 @@ class LocalGatewayServer(
                         }
                     }
                 }
+            } catch (e: java.net.BindException) {
+                // 端口被占用：以前被静默吞掉，服务显示运行中但实际没在监听
+                bindError = "端口 $port 被占用: ${e.message}"
+                android.util.Log.e("LocalGatewayServer", bindError ?: "")
+                isRunning = false
             } catch (e: Exception) {
                 // server closed
             }
@@ -583,14 +591,18 @@ class LocalGatewayServer(
                     TencentGateway.streamChat(oaiReq, convId) { line ->
                         val trimmed = line.trim()
                         if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
-                            try {
-                                val chunk = JSONObject(trimmed.substring(6))
-                                val u = chunk.optJSONObject("usage")
-                                if (u != null) {
-                                    streamTokens = u.optInt("total_tokens", streamTokens)
+                            val chunk = try { JSONObject(trimmed.substring(6)) } catch (e: Exception) { null }
+                            if (chunk != null) {
+                                chunk.optJSONObject("usage")?.let {
+                                    streamTokens = it.optInt("total_tokens", streamTokens)
                                 }
-                                translator.onChunk(chunk)
-                            } catch (ignored: Exception) {}
+                                try {
+                                    translator.onChunk(chunk)
+                                } catch (e: java.io.IOException) {
+                                    // 客户端断开：告诉网关停止读上游（旧代码吞掉异常返回 true，会把整段流读完）
+                                    return@streamChat false
+                                } catch (ignored: Exception) {}
+                            }
                         }
                         true
                     }
