@@ -22,7 +22,7 @@ object AccountVault {
 
     /**
      * 读缓存：getAccounts() 在每次请求的 pick / touch / 401 刷新路径上都会被调用，
-     * 原实现每次都 listFiles + readText 全部 auths/*.json 并重解析，且全程持有对象锁。
+     * 原实现每次都 listFiles + readText 全部 auths 目录下的 json 并重解析，且全程持有对象锁。
      * 这里按「auths 目录指纹（文件名+mtime+size）+ prefs 写版本号」缓存合并结果，
      * 指纹不变就直接返回副本，外部（Node/网关）改了文件也能被指纹感知。
      */
