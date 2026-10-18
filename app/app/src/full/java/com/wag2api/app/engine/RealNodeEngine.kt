@@ -8,6 +8,8 @@ import android.os.IBinder
 import android.util.Log
 import com.wag2api.engine.INodeEngine
 import com.wag2api.engine.NodeService
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -19,7 +21,10 @@ import java.util.concurrent.atomic.AtomicInteger
  *  - :node 被系统杀掉时，BIND_AUTO_CREATE 会自动重建并再次回调 onServiceConnected，宿主不要手动 rebind
  *  - 宿主只做熔断：30s 内崩 3 次就 unbind 并标记 FAILED，防止一直重启耗电
  */
-class RealNodeEngine(private val ctx: Context) : NodeEngineApi {
+class RealNodeEngine(
+    private val ctx: Context,
+    private val tokenProvider: () -> String
+) : NodeEngineApi {
 
     companion object {
         private const val TAG = "RealNodeEngine"
@@ -48,8 +53,9 @@ class RealNodeEngine(private val ctx: Context) : NodeEngineApi {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 binder = INodeEngine.Stub.asInterface(service)
                 port = try { binder?.getPort() ?: 0 } catch (e: Exception) { 0 }
-                state = EngineState.READY
-                Log.i(TAG, "Node 引擎就绪，端口 $port")
+                // Binder 连通不代表 Node 已能服务，还要等 /health 返回 200
+                state = EngineState.STARTING
+                waitHealthy(port)
             }
 
             override fun onServiceDisconnected(name: ComponentName?) {
@@ -81,6 +87,44 @@ class RealNodeEngine(private val ctx: Context) : NodeEngineApi {
             state = EngineState.FAILED
             Log.e(TAG, "bindService 异常", e)
         }
+    }
+
+    /**
+     * 轮询内部 /health，确认 Node 真正能服务后才标记 READY。
+     * 避免冷启动 2~5 秒内的请求拿到 502。
+     */
+    private fun waitHealthy(p: Int) {
+        if (p <= 0) {
+            state = EngineState.FAILED
+            return
+        }
+        Thread({
+            val client = OkHttpClient.Builder()
+                .connectTimeout(2, TimeUnit.SECONDS)
+                .readTimeout(2, TimeUnit.SECONDS)
+                .build()
+            val deadline = System.currentTimeMillis() + 30_000
+            var ok = false
+            while (System.currentTimeMillis() < deadline) {
+                if (state == EngineState.STOPPING || state == EngineState.DRAINING) return@Thread
+                try {
+                    val req = Request.Builder()
+                        .url("http://127.0.0.1:$p/health")
+                        .header("X-Engine-Token", tokenProvider())
+                        .get().build()
+                    val code = client.newCall(req).execute().use { it.code }
+                    if (code == 200) { ok = true; break }
+                } catch (ignored: Exception) {}
+                Thread.sleep(250)
+            }
+            if (ok) {
+                state = EngineState.READY
+                Log.i(TAG, "Node 引擎就绪，端口 $p")
+            } else {
+                Log.e(TAG, "Node 引擎健康检查超时")
+                state = EngineState.FAILED
+            }
+        }, "node-health").start()
     }
 
     private fun onCrash() {

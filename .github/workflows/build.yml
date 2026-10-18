@@ -25,8 +25,7 @@ jobs:
 
       - name: Node 引擎测试
         working-directory: .
-        run: |
-          npm test || echo "::warning::Node 测试未通过，继续构建"
+        run: npm test
 
       - uses: actions/setup-java@v4
         with:
@@ -35,7 +34,9 @@ jobs:
 
       - name: 宿主路由单测
         working-directory: app
-        run: ./gradlew :app:testFullDebugUnitTest --no-daemon || echo "::warning::无单测或未通过"
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testFullDebugUnitTest --no-daemon
 
   # ─────────────────────────────────────────────
   # 2. APK：full + lite 一次出两个包
@@ -73,15 +74,7 @@ jobs:
                  app/engine-node/libnode/bin/x86 \
                  app/engine-node/libnode/bin/x86_64
 
-      # 把 Node 核心同步进 assets（gradle 的 preBuild 也做，这里兜底）
-      - name: 同步 Node 核心到 assets
-        run: |
-          set -e
-          DEST=app/app/src/full/assets/gateway
-          rm -rf "$DEST"
-          mkdir -p "$DEST"
-          cp -r src "$DEST/"
-          cp package.json "$DEST/" 2>/dev/null || true
+      # Node 核心由 Gradle 的 syncNodeCore（preBuild）自动同步，这里不再重复 cp
 
       # keystore：有 Secret 就用正式签名，没有就退回 debug
       - name: 解密 keystore
@@ -101,7 +94,12 @@ jobs:
           KS_PW: ${{ secrets.KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
         run: |
+          set -e
           chmod +x gradlew
+          if [ -n "$KS_PW" ] && [ -z "$KS_ALIAS" ]; then
+            echo "::error::配置了 KEYSTORE_PASSWORD 但缺少 KEYSTORE_ALIAS"
+            exit 1
+          fi
           ./gradlew assembleFullRelease assembleLiteRelease --no-daemon --stacktrace
 
       # 签名硬校验：证书指纹必须与仓库变量一致，否则失败
@@ -183,13 +181,30 @@ jobs:
           mkdir -p dist
           tar czf dist/wag2api-node.tar.gz src package.json LICENSE
 
+      # 单文件版没有 --version/--help，直接启动后探活再杀掉
       - name: 冒烟测试
         working-directory: .
         run: |
-          set -e
-          ./dist/wag2api-linux-x64 --version 2>/dev/null || \
-            timeout 10 ./dist/wag2api-linux-x64 --help 2>/dev/null || \
-            echo "::warning::单文件版冒烟测试跳过"
+          set +e
+          chmod +x dist/wag2api-linux-x64
+          DATA_DIR=/tmp/smoke PORT=18799 HOST=127.0.0.1 NO_AUTH=1 \
+            ./dist/wag2api-linux-x64 > /tmp/smoke.log 2>&1 &
+          APP_PID=$!
+          OK=0
+          for i in $(seq 1 20); do
+            sleep 1
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18799/v1/models)
+            if [ "$CODE" = "200" ]; then OK=1; break; fi
+          done
+          kill $APP_PID 2>/dev/null
+          wait $APP_PID 2>/dev/null
+          cat /tmp/smoke.log
+          if [ "$OK" = "1" ]; then
+            echo "✅ 单文件版冒烟测试通过"
+          else
+            echo "::warning::单文件版冒烟测试未通过（不阻塞发布）"
+          fi
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:

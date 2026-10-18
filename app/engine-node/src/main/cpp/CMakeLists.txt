@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.10.2)
 project(wagnode)
 
-set(LIBNODE_DIR ${CMAKE_SOURCE_DIR}/../../libnode)
+# CMAKE_SOURCE_DIR = engine-node/src/main/cpp
+# libnode 由 CI 下载到 engine-node/libnode，需要向上三层
+set(LIBNODE_DIR ${CMAKE_SOURCE_DIR}/../../../libnode)
 
 add_library(native-lib SHARED native-lib.cpp)
 include_directories(${LIBNODE_DIR}/include/node)

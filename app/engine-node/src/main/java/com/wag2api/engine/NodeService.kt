@@ -66,8 +66,11 @@ class NodeService : Service() {
         started = true
 
         val root = File(filesDir, "gateway")
-        val versionTag = "${BuildConfig.VERSION_CODE}-" +
-                packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+        // 库模块的 BuildConfig 没有 VERSION_CODE/VERSION_NAME，从 PackageInfo 取
+        val pi = try { packageManager.getPackageInfo(packageName, 0) } catch (e: Exception) { null }
+        val longVer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+            pi?.longVersionCode ?: 0L else (pi?.versionCode ?: 0).toLong()
+        val versionTag = "$longVer-${pi?.lastUpdateTime ?: 0L}"
         AssetCopier.sync(applicationContext, root, versionTag)
 
         // 随机端口：绑定 0 号端口拿到系统分配值后立即释放，再交给 Node
@@ -88,13 +91,14 @@ class NodeService : Service() {
             "HOME=${filesDir.absolutePath}",
             "TMPDIR=${cacheDir.absolutePath}",
             "NODE_ENV=production",
-            "APP_VERSION=${BuildConfig.VERSION_NAME}"
+            "APP_VERSION=${pi?.versionName ?: "0"}"
         )
 
-        thread = Thread(name = "node-engine") {
+        thread = Thread({
             try {
                 nodePid = android.os.Process.myPid()
-                ready = true
+                // 注意：此处不设 ready=true。Node 冷启动需要 2~5 秒，
+                // 由宿主轮询 /health 确认后才算就绪（见 RealNodeEngine）
                 Log.i(TAG, "Node 引擎启动于 127.0.0.1:$boundPort")
                 startNode(emptyArray(), env, root.absolutePath)
             } catch (t: Throwable) {
@@ -103,7 +107,7 @@ class NodeService : Service() {
                 ready = false
                 started = false
             }
-        }.also { it.start() }
+        }, "node-engine").also { it.start() }
     }
 
     override fun onDestroy() {

@@ -41,7 +41,7 @@ android {
     }
 
     buildFeatures {
-        buildConfig = true
+        buildConfig = false
         aidl = true
     }
 

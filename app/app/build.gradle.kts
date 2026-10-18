@@ -107,18 +107,17 @@ dependencies {
 // ───────────────────────────────────────────────────────────
 // full 包构建前，把仓库根目录的 Node 核心同步进 assets/gateway
 // 保证 Linux 版、Docker、Android 共用同一份 src/，不出现两套代码各改各的
+// 用 Sync 而非 Copy：删掉的源文件不会残留在目标目录
 // ───────────────────────────────────────────────────────────
-val syncNodeCore by tasks.registering(Copy::class) {
-    val srcDir = rootProject.file("../src")
-    val pkgJson = rootProject.file("../package.json")
-    from(srcDir) { into("gateway/src") }
-    if (pkgJson.exists()) from(pkgJson) { into("gateway") }
+val syncNodeCore by tasks.registering(Sync::class) {
+    from(rootProject.file("../src")) { into("gateway/src") }
+    from(rootProject.file("../package.json")) { into("gateway") }
     into(layout.buildDirectory.dir("generated/nodeAssets"))
 }
 
-tasks.matching { it.name == "preFullBuild" }.configureEach {
-    dependsOn(syncNodeCore)
-}
+// AGP 只生成按变体命名的任务（preFullDebugBuild / preFullReleaseBuild），
+// 挂到全局 preBuild 上最稳，每个变体的 pre 任务都会依赖它
+tasks.named("preBuild") { dependsOn(syncNodeCore) }
 
 android.sourceSets.getByName("full") {
     assets.srcDir(layout.buildDirectory.dir("generated/nodeAssets"))

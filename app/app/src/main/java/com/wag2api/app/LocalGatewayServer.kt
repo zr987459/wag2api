@@ -148,7 +148,9 @@ class LocalGatewayServer(
                         query = query,
                         headers = headers,
                         body = body,
-                        out = output
+                        out = output,
+                        // 只有推理路径需要剥掉 ag: 前缀，控制台路径不动
+                        stripModelPrefix = if (d.path.startsWith("/v1/")) "ag:" else null
                     )
                     output.flush()
                     client.close()
