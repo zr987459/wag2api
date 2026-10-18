@@ -338,7 +338,7 @@ class LocalGatewayServer(
                 val json = JSONObject().apply {
                     put("ok", true)
                     put("accounts", AccountScheduler.poolStatus())
-                    put("selected_uid", AccountScheduler.getSelectedUid(context))
+                    put("selected_uid", AccountScheduler.effectiveSelectedUid(context))
                 }
                 sendJsonResponse(output, 200, json.toString())
             }
@@ -348,6 +348,8 @@ class LocalGatewayServer(
                 val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
                 if (uid.isEmpty()) {
                     sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "uid 不能为空").toString())
+                } else if (AccountScheduler.isDisabled(uid)) {
+                    sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "该账号已暂停，请先启用").toString())
                 } else {
                     AccountScheduler.setSelectedUid(context, uid)
                     sendJsonResponse(output, 200, JSONObject().put("ok", true).put("uid", uid).toString())
@@ -365,7 +367,11 @@ class LocalGatewayServer(
                 val j = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
                 val uid = j.optString("uid")
                 val disabled = j.optBoolean("disabled", false)
-                if (uid.isNotEmpty()) AccountVault.setDisabled(uid, disabled)
+                if (uid.isNotEmpty()) {
+                    AccountVault.setDisabled(uid, disabled)
+                    // 暂停的正是手动选中的账号：回到「自动」，避免界面还显示它是「当前」
+                    if (disabled && AccountScheduler.getSelectedUid(context) == uid) AccountScheduler.setSelectedUid(context, "")
+                }
                 sendJsonResponse(output, 200, JSONObject().put("ok", uid.isNotEmpty()).toString())
             }
 
@@ -543,11 +549,12 @@ class LocalGatewayServer(
             val isStream = json.optBoolean("stream", false)
             model = json.optString("model", "deepseek-v4.1-flash-1017")
             val convId = ConversationIds.resolve(reqHeaders, json)
+            val used = UsedAccount()
 
             if (!isStream) {
                 // 非流式响应：上游透传，完整包含 reasoning_content 与 tool_calls
                 try {
-                    val res = TencentGateway.chatSync(json, convId)
+                    val res = TencentGateway.chatSync(json, convId, used)
                     val reply = res.optString("content")
                     val reasoning = res.optString("reasoning_content")
                     val toolCalls = res.optJSONArray("tool_calls")
@@ -582,11 +589,11 @@ class LocalGatewayServer(
                             put("total_tokens", totalTokens)
                         })
                     }
-                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "sync", 200, syncUsage(res), System.currentTimeMillis() - startTime)
+                    finishWb("/v1/chat/completions", model, "sync", 200, syncUsage(res), System.currentTimeMillis() - startTime, null, null, used)
                     sendJsonResponse(output, 200, oaiResp.toString())
                 } catch (e: Exception) {
                     val (st, body) = errorPayload(e)
-                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "sync", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    finishWb("/v1/chat/completions", model, "sync", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
                     sendJsonResponse(output, st, body.toString())
                 }
             } else {
@@ -604,7 +611,7 @@ class LocalGatewayServer(
                 var streamUsage: JSONObject? = null
                 var ttft: Long? = null
                 try {
-                    TencentGateway.streamChat(json, convId) { line ->
+                    TencentGateway.streamChat(json, convId, used) { line ->
                         try {
                             if (line.startsWith("data: ")) {
                                 val s = line.substring(6).trim()
@@ -620,11 +627,11 @@ class LocalGatewayServer(
                             false
                         }
                     }
-                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", 200,
-                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft)
+                    finishWb("/v1/chat/completions", model, "stream", 200,
+                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft, null, used)
                 } catch (e: Exception) {
                     val (st, payload) = errorPayload(e)
-                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    finishWb("/v1/chat/completions", model, "stream", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
                     writeChunk(output, "data: $payload\n\n")
                     writeChunk(output, "data: [DONE]\n\n")
                 } finally {
@@ -649,11 +656,12 @@ class LocalGatewayServer(
             // 采用 Hark 工业级转换器：完美解决 tool_use / tool_result 配对、图片、多轮会话锚点
             val convId = ConversationIds.resolve(reqHeaders, json)
             val oaiReq = AnthropicToOpenAI.convertRequest(json)
+            val used = UsedAccount()
 
             if (!isStream) {
                 // 1. 非流式响应
                 try {
-                    val oaiResp = TencentGateway.chatSync(oaiReq, convId)
+                    val oaiResp = TencentGateway.chatSync(oaiReq, convId, used)
                     // chatSync 返回扁平结构（content / tool_calls / prompt_tokens），先补成 OpenAI 响应再转换
                     val anthropicResp = AnthropicToOpenAI.convertResponse(toOpenAiResponse(oaiResp), modelRaw)
                     val reasoning = oaiResp.optString("reasoning_content", "")
@@ -664,11 +672,11 @@ class LocalGatewayServer(
                         for (k in 0 until old.length()) withThinking.put(old.get(k))
                         anthropicResp.put("content", withThinking)
                     }
-                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", 200, syncUsage(oaiResp), System.currentTimeMillis() - startTime)
+                    finishWb("/v1/messages", modelRaw, "sync", 200, syncUsage(oaiResp), System.currentTimeMillis() - startTime, null, null, used)
                     sendJsonResponse(output, 200, anthropicResp.toString())
                 } catch (e: Exception) {
                     val (st, body) = errorPayload(e)
-                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    finishWb("/v1/messages", modelRaw, "sync", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
                     sendJsonResponse(output, st, body.toString())
                 }
             } else {
@@ -690,7 +698,7 @@ class LocalGatewayServer(
                 var streamUsage: JSONObject? = null
                 var ttft: Long? = null
                 try {
-                    TencentGateway.streamChat(oaiReq, convId) { line ->
+                    TencentGateway.streamChat(oaiReq, convId, used) { line ->
                         val trimmed = line.trim()
                         if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
                             try {
@@ -703,11 +711,11 @@ class LocalGatewayServer(
                         true
                     }
                     translator.finish()
-                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", 200,
-                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft)
+                    finishWb("/v1/messages", modelRaw, "stream", 200,
+                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft, null, used)
                 } catch (e: Exception) {
                     val (st, body) = errorPayload(e)
-                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    finishWb("/v1/messages", modelRaw, "stream", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
                     try {
                         translator.abort(body)
                     } catch (ignored: Exception) {}
@@ -719,6 +727,20 @@ class LocalGatewayServer(
             val (st, body) = errorPayload(e)
             GatewayMetrics.record("POST", "/v1/messages", modelRaw, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
             sendJsonResponse(output, st, body.toString())
+        }
+    }
+
+    /**
+     * 一次 WB 请求结束：写日志 / 统计（带上最终账号），并给该账号累加请求数与 Token。
+     * used 由 TencentGateway 在每次选号时覆盖，重试换号只记在最后一个账号上。与 src/wb/index.mjs finish 一致。
+     */
+    private fun finishWb(
+        path: String, model: String, endpoint: String, status: Int,
+        usage: GatewayMetrics.Usage?, latencyMs: Long, ttftMs: Long?, note: String?, used: UsedAccount
+    ) {
+        GatewayMetrics.record("POST", path, model, endpoint, status, usage, latencyMs, ttftMs, note, used.uid, used.nickname)
+        if (used.uid.isNotEmpty()) {
+            try { AccountScheduler.recordUsage(used.uid, (usage?.total ?: 0).toLong()) } catch (ignored: Exception) {}
         }
     }
 

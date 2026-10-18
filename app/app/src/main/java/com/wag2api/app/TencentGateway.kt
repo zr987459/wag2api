@@ -20,6 +20,15 @@ class UpstreamException(
     val snippet: String
 ) : IOException("upstream HTTP $status code=$code @ $endpoint: $snippet")
 
+/**
+ * 这次请求最终实际使用的账号。每次选号都会覆盖，请求结束时即最后一个账号（重试换号只留最后一个）。
+ * 由前门（LocalGatewayServer）创建并读取，用于日志的账号字段和账号用量累计。
+ */
+class UsedAccount {
+    @Volatile var uid: String = ""
+    @Volatile var nickname: String = ""
+}
+
 object TencentGateway {
 
     private const val TAG = "TencentGateway"
@@ -254,7 +263,7 @@ object TencentGateway {
         }
     }
 
-    fun chatSync(payload: JSONObject, convId: String? = null): JSONObject {
+    fun chatSync(payload: JSONObject, convId: String? = null, used: UsedAccount? = null): JSONObject {
         val modelRaw = payload.optString("model", "deepseek-v4.1-flash-1017")
         val modelLower = modelRaw.lowercase()
         val realm = if (modelLower.startsWith("cn:")) "cn" else "global"
@@ -266,7 +275,7 @@ object TencentGateway {
         var upstreamError: String? = null
         val toolCallsMap = HashMap<Int, JSONObject>()
 
-        streamChat(payload, convId) { line ->
+        streamChat(payload, convId, used) { line ->
             val trimmed = line.trim()
             if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
                 try {
@@ -375,8 +384,9 @@ object TencentGateway {
     fun streamChat(
         payload: JSONObject,
         convId: String? = null,
+        used: UsedAccount? = null,
         onLine: (String) -> Boolean
-    ) = streamChatImpl(payload, convId, allowFinalBackoff = true, onLine = onLine)
+    ) = streamChatImpl(payload, convId, allowFinalBackoff = true, used = used, onLine = onLine)
 
     /**
      * @param allowFinalBackoff 只有最外层调用做「全部繁忙」退避；退避轮内的重试传 false，
@@ -386,6 +396,7 @@ object TencentGateway {
         payload: JSONObject,
         convId: String?,
         allowFinalBackoff: Boolean,
+        used: UsedAccount?,
         onLine: (String) -> Boolean
     ) {
         val modelRaw = payload.optString("model", "deepseek-v4.1-flash-1017")
@@ -488,6 +499,10 @@ object TencentGateway {
 
             val uid = acc.optString("uid", "user_default")
             triedUids.add(uid)
+            used?.let {
+                it.uid = acc.optString("uid", "")
+                it.nickname = acc.optString("nickname", "")
+            }
 
             val machineId = sha256Prefix("wb2a:machine:$uid")
             val sessionId = sha256Prefix("wb2a:session:$uid")
@@ -686,7 +701,7 @@ object TencentGateway {
             var innerEmitted = false
             try {
                 AccountScheduler.clearAllCooldowns()
-                streamChatImpl(payload, convId, allowFinalBackoff = false) { l ->
+                streamChatImpl(payload, convId, allowFinalBackoff = false, used = used) { l ->
                     innerEmitted = true
                     onLine(l)
                 }

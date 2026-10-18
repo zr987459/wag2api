@@ -161,13 +161,15 @@ object GatewayMetrics {
     /** 旧调用方式：只有总数时按输出计 */
     fun record(
         method: String, path: String, model: String, endpoint: String,
-        status: Int, tokens: Int, latencyMs: Long, note: String? = null
-    ) = record(method, path, model, endpoint, status, Usage(output = maxOf(0, tokens)), latencyMs, null, note)
+        status: Int, tokens: Int, latencyMs: Long, note: String? = null,
+        uid: String = "", nickname: String = ""
+    ) = record(method, path, model, endpoint, status, Usage(output = maxOf(0, tokens)), latencyMs, null, note, uid, nickname)
 
     @Synchronized
     fun record(
         method: String, path: String, model: String, endpoint: String,
-        status: Int, usage: Usage?, latencyMs: Long, ttftMs: Long? = null, note: String? = null
+        status: Int, usage: Usage?, latencyMs: Long, ttftMs: Long? = null, note: String? = null,
+        uid: String = "", nickname: String = ""
     ) {
         checkDateRollover()
         val u = usage ?: Usage()
@@ -202,6 +204,9 @@ object GatewayMetrics {
             put("method", method)
             put("path", path)
             put("model", model)
+            // 最终实际处理这次请求的账号（没选到账号时为空字符串）
+            put("uid", uid)
+            put("nickname", nickname)
             put("endpoint", endpoint)
             put("is_stream", endpoint == "stream")
             put("status", status)

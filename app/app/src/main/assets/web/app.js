@@ -382,7 +382,9 @@ async function loadWbAccounts() {
     const accounts = ov.accounts || [];
     const poolMap = {};
     (pool.accounts || []).forEach(x => { poolMap[x.uid] = x; });
-    const selected = pool.selected_uid || '';
+    const isOff = uid => !!(poolMap[uid] && poolMap[uid].disabled) || accounts.some(a => a.uid === uid && a.disabled);
+    // 已暂停的账号不算「当前」（后端暂停时会清空选中，这里再兜一层）
+    const selected = pool.selected_uid && !isOff(pool.selected_uid) ? pool.selected_uid : '';
     $('accountCount').textContent = accounts.length;
 
     sch.innerHTML = `
@@ -395,7 +397,7 @@ async function loadWbAccounts() {
         <span style="font-size: 13px;">当前使用</span>
         <select class="input-field" style="margin-bottom: 0; max-width: 62%;" onchange="wbSelect(this.value)">
           <option value="">自动轮询</option>
-          ${(pool.accounts || []).map(a => `<option value="${escapeHtml(a.uid)}" ${a.uid === selected ? 'selected' : ''}>${escapeHtml(a.nickname || a.uid.slice(0, 8))}</option>`).join('')}
+          ${(pool.accounts || []).filter(a => !isOff(a.uid)).map(a => `<option value="${escapeHtml(a.uid)}" ${a.uid === selected ? 'selected' : ''}>${escapeHtml(a.nickname || a.uid.slice(0, 8))}</option>`).join('')}
         </select>
       </div>
       <div style="display: flex; gap: 8px; margin-top: 10px;">
@@ -437,7 +439,7 @@ async function loadWbAccounts() {
             <div class="account-actions-row">
               <button class="btn btn-outline btn-sm" onclick="wbTest('${uid}', this)">⚡ 测试</button>
               <button class="btn btn-outline btn-sm" onclick="wbExportOne('${uid}')">📤 导出</button>
-              <button class="btn btn-outline btn-sm" onclick="wbSelect('${uid}')">🌟 使用</button>
+              <button class="btn btn-outline btn-sm" onclick="wbSelect('${uid}', ${disabled})">🌟 使用</button>
             </div>
             <div class="account-actions-row">
               <button class="btn btn-outline btn-sm" onclick="wbToggle('${uid}', ${!disabled})">${disabled ? '▶ 启用' : '⏸ 暂停'}</button>
@@ -451,7 +453,13 @@ async function loadWbAccounts() {
   }
 }
 
-async function wbSelect(uid) { await postJson('/panel/api/pool/select', { uid }); showToast(uid ? '已设为当前账号' : '已改为自动轮询', 'success'); loadWbAccounts(); }
+async function wbSelect(uid, disabled = false) {
+  if (uid && disabled) { showToast('该账号已暂停，请先启用', 'warn'); return; }
+  const r = await postJson('/panel/api/pool/select', { uid });
+  if (r && r.ok === false && uid) { showToast(r.msg || '设置失败', 'warn'); loadWbAccounts(); return; }
+  showToast(uid ? '已设为当前账号' : '已改为自动轮询', 'success');
+  loadWbAccounts();
+}
 async function wbClearCooldowns() { await postJson('/panel/api/pool/clear-cooldown'); showToast('冷却已清除', 'success'); loadWbAccounts(); }
 async function wbRefreshTokens() { const r = await postJson('/panel/api/tokens/refresh'); showToast(r.msg || '已在后台刷新', 'success'); }
 async function wbToggle(uid, disabled) { await postJson('/panel/api/pool/toggle', { uid, disabled }); loadWbAccounts(); }
@@ -980,7 +988,7 @@ async function loadLogs() {
       logs = ((await getJson('/panel/api/logs')).logs || []).map(l => ({
         status: l.status, path: `${l.method || 'POST'} ${l.path || ''}`, model: l.model, ms: l.latency_ms, ttft: l.ttft_ms,
         u: l.usage || { total: l.tokens || 0 }, hit: l.cache_hit_rate, time: l.timestamp ? new Date(l.timestamp) : null, timeText: l.time,
-        stream: l.endpoint === 'stream', note: l.note, who: '',
+        stream: l.endpoint === 'stream', note: l.note, who: l.nickname || l.uid || '',
       }));
     } else {
       const raw = await getJson('/api/logs');

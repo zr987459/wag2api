@@ -47,12 +47,32 @@ export class AccountScheduler {
     return candidates.reduce((m, a) => (this.cooldownRemainSec(a.uid) < this.cooldownRemainSec(m.uid) ? a : m));
   }
 
+  /** 成功出流后记最近使用（易变字段，不触发云端同步） */
   touch(uid) {
+    this.vault.updateAccount(uid, a => { a.last_used = Date.now(); }, { quiet: true });
+  }
+
+  /**
+   * 一次 WB 请求结束（成功或失败）后，记到最终实际使用的账号上：请求数 +1，Token 累加本次合计。
+   * 与 touch 一样只改易变字段，不触发云端同步（persist 推送时也会剥掉 token_usage）。
+   */
+  recordUsage(uid, tokens = 0) {
+    if (!uid) return;
     this.vault.updateAccount(uid, a => {
-      a.last_used = Date.now();
-      a.token_usage = a.token_usage || { request_count: 0, total_tokens: 0 };
-      a.token_usage.request_count = (a.token_usage.request_count || 0) + 1;
+      const u = a.token_usage && typeof a.token_usage === 'object' ? a.token_usage : {};
+      u.request_count = (Number(u.request_count) || 0) + 1;
+      u.total_tokens = (Number(u.total_tokens) || 0) + Math.max(0, Number(tokens) || 0);
+      a.token_usage = u;
     }, { quiet: true });
+  }
+
+  /** 手动选中的账号已被暂停时视为「自动」，并顺手清掉（兼容修复前遗留的状态） */
+  effectiveSelectedUid() {
+    const sel = this.getSelectedUid();
+    if (!sel) return '';
+    const a = this.vault.find(sel);
+    if (a && a.disabled) { this.setSelectedUid(''); return ''; }
+    return sel;
   }
 
   poolStatus() {

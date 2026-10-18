@@ -245,12 +245,13 @@ export class TencentGateway {
   /**
    * 流式调用。onLine(lineWithBlankLine) 返回 false 表示客户端已断开。
    * @param opts.signal 客户端断开时中止上游
+   * @param opts.used  可选 {uid,nickname}：每次选号都会覆盖，结束时即最终实际使用的账号（重试换号只留最后一个）
    */
   async streamChat(payload, convId, onLine, opts = {}) {
     const { realm, clean } = resolveModel(payload.model);
     const base = realm === 'global' ? UPSTREAM_GLOBAL : UPSTREAM_CN;
     const up = buildUpstreamPayload(payload, clean, id => this.getReasoningByToolId(id));
-    const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, signal: opts.signal, emittedAny: false };
+    const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, signal: opts.signal, used: opts.used, emittedAny: false };
 
     try {
       return await this._rotate(ctx, new Set());
@@ -285,6 +286,7 @@ export class TencentGateway {
       if (!acc) throw new Error('未登录账号，请先在面板添加账号');
       const uid = acc.uid || 'user_default';
       triedUids.add(uid);
+      if (ctx.used) { ctx.used.uid = acc.uid || ''; ctx.used.nickname = acc.nickname || ''; }
       let rateLimited = false;
 
       for (let i = 0; i < endpoints.length; i++) {

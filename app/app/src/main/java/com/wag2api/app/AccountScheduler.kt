@@ -107,6 +107,41 @@ object AccountScheduler {
         AccountVault.updateAccount(uid) { it.put("last_used", System.currentTimeMillis()) }
     }
 
+    /**
+     * 一次 WB 请求结束（成功或失败）后，记到最终实际使用的账号上：请求数 +1，Token 累加本次合计。
+     * 与 src/wb/scheduler.mjs recordUsage 行为一致。
+     */
+    fun recordUsage(uid: String, tokens: Long) {
+        if (uid.isEmpty()) return
+        AccountVault.updateAccount(uid) { a ->
+            val u = a.optJSONObject("token_usage") ?: JSONObject()
+            u.put("request_count", u.optLong("request_count", 0L) + 1)
+            u.put("total_tokens", u.optLong("total_tokens", 0L) + maxOf(0L, tokens))
+            a.put("token_usage", u)
+        }
+    }
+
+    /** 账号是否已暂停（找不到账号视为未暂停） */
+    fun isDisabled(uid: String): Boolean {
+        val all = AccountVault.getAccounts()
+        for (i in 0 until all.length()) {
+            val a = all.optJSONObject(i) ?: continue
+            if (a.optString("uid") == uid) return a.optBoolean("disabled", false)
+        }
+        return false
+    }
+
+    /** 手动选中的账号已被暂停时视为「自动」，并顺手清掉（兼容修复前遗留的状态） */
+    fun effectiveSelectedUid(ctx: Context): String {
+        val sel = getSelectedUid(ctx)
+        if (sel.isEmpty()) return ""
+        if (isDisabled(sel)) {
+            setSelectedUid(ctx, "")
+            return ""
+        }
+        return sel
+    }
+
     /** 账号池状态，供前端展示 */
     fun poolStatus(): JSONArray {
         val out = JSONArray()

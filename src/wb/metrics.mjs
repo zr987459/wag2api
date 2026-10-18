@@ -29,7 +29,7 @@ export function usageFromOpenAi(u) {
   return { input: p - c, cached: c, output: Math.max(0, comp), thoughts: Math.max(0, thoughts) };
 }
 
-const usageTotal = u => u.input + u.cached + u.output;
+export const usageTotal = u => u.input + u.cached + u.output;
 
 class Bucket {
   constructor(j) {
@@ -82,8 +82,9 @@ export class GatewayMetrics {
 
   /**
    * @param usage {input,cached,output,thoughts} | number（旧调用：只有总数时按输出计）| null
+   * @param account {uid,nickname} 最终实际处理这次请求的账号（没选到账号时为空）
    */
-  record(method, pth, model, endpoint, status, usage, latencyMs, ttftMs = null, note = null) {
+  record(method, pth, model, endpoint, status, usage, latencyMs, ttftMs = null, note = null, account = null) {
     this.checkDateRollover();
     const u = typeof usage === 'number' ? { input: 0, cached: 0, output: Math.max(0, usage), thoughts: 0 }
       : (usage || { input: 0, cached: 0, output: 0, thoughts: 0 });
@@ -104,7 +105,10 @@ export class GatewayMetrics {
       id: `log_${nowMs}_${crypto.randomUUID().slice(0, 6)}`,
       time: localTime(new Date(nowMs)),
       timestamp: nowMs,
-      method, path: pth, model, endpoint,
+      method, path: pth, model,
+      uid: (account && account.uid) || '',
+      nickname: (account && account.nickname) || '',
+      endpoint,
       is_stream: endpoint === 'stream',
       status,
       tokens: usageTotal(u),

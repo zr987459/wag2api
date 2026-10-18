@@ -11,7 +11,7 @@ import path from 'path';
 import { AccountVault } from './vault.mjs';
 import { AccountScheduler } from './scheduler.mjs';
 import { TokenKeeper } from './token-keeper.mjs';
-import { GatewayMetrics, usageFromOpenAi } from './metrics.mjs';
+import { GatewayMetrics, usageFromOpenAi, usageTotal } from './metrics.mjs';
 import { TencentGateway, UpstreamError } from './gateway.mjs';
 import { runConnectivityTest } from './connectivity.mjs';
 import { Settings } from './store.mjs';
@@ -85,6 +85,19 @@ export function createWbEngine({
   const metrics = new GatewayMetrics(dir);
   const gateway = new TencentGateway({ vault, scheduler, tokenKeeper, fetchImpl, log, ...(backoffMs !== undefined ? { backoffMs } : {}) });
 
+  /**
+   * 一次 WB 请求结束：写日志 / 统计（带上最终账号），并给该账号累加请求数与 Token。
+   * used 由 gateway 在每次选号时覆盖，重试换号只记在最后一个账号上。
+   */
+  const finish = (pth, model, endpoint, status, usage, latencyMs, ttftMs, note, used) => {
+    metrics.record('POST', pth, model, endpoint, status, usage, latencyMs, ttftMs, note, used);
+    if (used && used.uid) {
+      const tokens = typeof usage === 'number' ? usage : usage ? usageTotal(usage) : 0;
+      scheduler.recordUsage(used.uid, tokens);
+    }
+  };
+  const newUsed = () => ({ uid: '', nickname: '' });
+
   const clientSignal = (req, res) => {
     const ctl = new AbortController();
     res.on('close', () => { if (!res.writableFinished) ctl.abort(); });
@@ -96,14 +109,15 @@ export function createWbEngine({
     const model = json.model || DEFAULT_MODEL;
     const convId = conversationId(req.headers, json);
     const signal = clientSignal(req, res);
+    const used = newUsed();
     if (!json.stream) {
       try {
-        const r = await gateway.chatSync(json, convId, { signal });
+        const r = await gateway.chatSync(json, convId, { signal, used });
         const pt = r.prompt_tokens ?? 20, ct = r.completion_tokens ?? 20;
         const message = { role: 'assistant', content: r.content };
         if (r.reasoning_content) message.reasoning_content = r.reasoning_content;
         if (r.tool_calls) message.tool_calls = r.tool_calls;
-        metrics.record('POST', '/v1/chat/completions', model, 'sync', 200, syncUsage(r), Date.now() - start);
+        finish('/v1/chat/completions', model, 'sync', 200, syncUsage(r), Date.now() - start, null, null, used);
         sendJson(res, 200, {
           id: `chatcmpl_${Date.now()}`, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
           choices: [{ index: 0, message, finish_reason: r.tool_calls ? 'tool_calls' : 'stop' }],
@@ -111,7 +125,7 @@ export function createWbEngine({
         });
       } catch (e) {
         const [st, body] = errorPayload(e);
-        metrics.record('POST', '/v1/chat/completions', model, 'sync', st, 0, Date.now() - start, null, e.message);
+        finish('/v1/chat/completions', model, 'sync', st, 0, Date.now() - start, null, e.message, used);
         sendJson(res, st, body);
       }
       return;
@@ -133,11 +147,11 @@ export function createWbEngine({
         }
         res.write(line);
         return true;
-      }, { signal });
-      metrics.record('POST', '/v1/chat/completions', model, 'stream', 200, usageFromOpenAi(usage), Date.now() - start, ttft);
+      }, { signal, used });
+      finish('/v1/chat/completions', model, 'stream', 200, usageFromOpenAi(usage), Date.now() - start, ttft, null, used);
     } catch (e) {
       const [st, payload] = errorPayload(e);
-      metrics.record('POST', '/v1/chat/completions', model, 'stream', st, 0, Date.now() - start, null, e.message);
+      finish('/v1/chat/completions', model, 'stream', st, 0, Date.now() - start, null, e.message, used);
       if (!res.destroyed) { res.write(`data: ${JSON.stringify(payload)}\n\n`); res.write('data: [DONE]\n\n'); }
     } finally {
       if (!res.writableEnded) res.end();
@@ -158,9 +172,10 @@ export function createWbEngine({
       return;
     }
     const signal = clientSignal(req, res);
+    const used = newUsed();
     if (!json.stream) {
       try {
-        const r = await gateway.chatSync(oaiReq, convId, { signal });
+        const r = await gateway.chatSync(oaiReq, convId, { signal, used });
         // chatSync 返回扁平结构，这里补成 OpenAI 响应再转换（安卓版此处会因缺 choices 报错）
         const message = { role: 'assistant', content: r.content };
         if (r.tool_calls) message.tool_calls = r.tool_calls;
@@ -170,11 +185,11 @@ export function createWbEngine({
         };
         const out = convertResponse(oai, modelRaw);
         if (r.reasoning_content) out.content.unshift({ type: 'thinking', thinking: r.reasoning_content, signature: '' });
-        metrics.record('POST', '/v1/messages', modelRaw, 'sync', 200, syncUsage(r), Date.now() - start);
+        finish('/v1/messages', modelRaw, 'sync', 200, syncUsage(r), Date.now() - start, null, null, used);
         sendJson(res, 200, out);
       } catch (e) {
         const [st, body] = errorPayload(e);
-        metrics.record('POST', '/v1/messages', modelRaw, 'sync', st, 0, Date.now() - start, null, e.message);
+        finish('/v1/messages', modelRaw, 'sync', st, 0, Date.now() - start, null, e.message, used);
         sendJson(res, st, body);
       }
       return;
@@ -197,12 +212,12 @@ export function createWbEngine({
           } catch (e) { /* 非 JSON 帧忽略 */ }
         }
         return true;
-      }, { signal });
+      }, { signal, used });
       translator.finish();
-      metrics.record('POST', '/v1/messages', modelRaw, 'stream', 200, usageFromOpenAi(usage), Date.now() - start, ttft);
+      finish('/v1/messages', modelRaw, 'stream', 200, usageFromOpenAi(usage), Date.now() - start, ttft, null, used);
     } catch (e) {
       const [st, body] = errorPayload(e);
-      metrics.record('POST', '/v1/messages', modelRaw, 'stream', st, 0, Date.now() - start, null, e.message);
+      finish('/v1/messages', modelRaw, 'stream', st, 0, Date.now() - start, null, e.message, used);
       try { translator.abort(body); } catch (e2) { /* ignore */ }
     } finally {
       if (!res.writableEnded) res.end();
@@ -250,17 +265,23 @@ export function createWbEngine({
       settings.set('default_engine', e);
       return { ok: true, engine: body.engine === undefined ? 'wb' : body.engine };
     },
-    pool: () => ({ ok: true, accounts: scheduler.poolStatus(), selected_uid: scheduler.getSelectedUid() }),
+    pool: () => ({ ok: true, accounts: scheduler.poolStatus(), selected_uid: scheduler.effectiveSelectedUid() }),
     'pool/select': ({ body }) => {
       const uid = body.uid ? String(body.uid) : '';
       if (!uid) return { ok: false, msg: 'uid 不能为空' };
+      const acc = vault.find(uid);
+      if (acc && acc.disabled) return { ok: false, msg: '该账号已暂停，请先启用' };
       scheduler.setSelectedUid(uid);
       return { ok: true, uid };
     },
     'pool/clear-cooldown': () => { scheduler.clearAllCooldowns(); return { ok: true }; },
     'pool/toggle': ({ body }) => {
       const uid = body.uid ? String(body.uid) : '';
-      if (uid) vault.setDisabled(uid, body.disabled === true);
+      if (uid) {
+        vault.setDisabled(uid, body.disabled === true);
+        // 暂停的正是手动选中的账号：回到「自动」，避免界面还显示它是「当前」
+        if (body.disabled === true && scheduler.getSelectedUid() === uid) scheduler.setSelectedUid('');
+      }
       return { ok: Boolean(uid) };
     },
     'tokens/refresh': () => {

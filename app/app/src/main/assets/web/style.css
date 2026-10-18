@@ -159,7 +159,11 @@ body.theme-ag .brand-icon {
   user-select: none;
   position: relative;
   z-index: 2;
+  min-width: 0;
+  white-space: nowrap;
 }
+
+.engine-tab > span { white-space: nowrap; flex-shrink: 0; }
 
 .engine-tab.active {
   color: #fff;
@@ -180,6 +184,15 @@ body.theme-ag .brand-icon {
   padding: 1px 6px;
   border-radius: 10px;
   background: rgba(0, 0, 0, 0.25);
+}
+
+/* 窄屏：引擎切换文字不换行，先收紧间距和字号，再窄就隐藏「腾讯 / Google」小标签 */
+@media (max-width: 420px) {
+  .engine-tab { gap: 5px; padding: 7px 8px; font-size: 12px; }
+  .engine-badge-mini { padding: 1px 5px; }
+}
+@media (max-width: 340px) {
+  .engine-badge-mini { display: none; }
 }
 
 /* Tab 主内容区域 */
