@@ -24,6 +24,7 @@ class LocalGatewayServer(
     fun start() {
         if (isRunning) return
         isRunning = true
+        bindError = null
         thread(name = "LocalGatewayServer") {
             try {
                 serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
@@ -41,10 +42,19 @@ class LocalGatewayServer(
                     }
                 }
             } catch (e: Exception) {
-                // server closed
+                // stop() 关闭 socket 时也会走到这里；只有还在运行时才是真正的启动/监听失败（常见：端口被占用）
+                if (isRunning) {
+                    bindError = "${port}: ${e.message}"
+                    android.util.Log.e("LocalGatewayServer", "监听 127.0.0.1:$port 失败: ${e.message}")
+                    isRunning = false
+                }
             }
         }
     }
+
+    /** 最近一次监听失败原因（null 表示正常），供设置接口展示 */
+    @Volatile var bindError: String? = null
+        private set
 
     fun stop() {
         isRunning = false
@@ -344,7 +354,9 @@ class LocalGatewayServer(
                     val json = JSONObject().apply {
                         put("ok", true)
                         put("port", GatewayService.getPort(context))
+                        put("listening_port", port)
                         put("default_port", GatewayService.DEFAULT_PORT)
+                        bindError?.let { put("bind_error", it) }
                     }
                     sendJsonResponse(output, 200, json.toString())
                 }
@@ -574,8 +586,17 @@ class LocalGatewayServer(
                 output.write(sseHeader.toByteArray(Charsets.US_ASCII))
                 output.flush()
 
+                // 客户端断开检测：translator.onChunk 外层吞掉了所有异常，原实现 onLine 恒为 true，
+                // 客户端走了也会把上游整段读完（白耗额度、占线程）
+                var clientGone = false
                 val translator = AnthropicStreamTranslator(modelRaw) { event, data ->
-                    writeChunk(output, "event: $event\ndata: $data\n\n")
+                    if (!clientGone) {
+                        try {
+                            writeChunk(output, "event: $event\ndata: $data\n\n")
+                        } catch (e: IOException) {
+                            clientGone = true
+                        }
+                    }
                 }
 
                 var streamTokens = 0
@@ -592,7 +613,7 @@ class LocalGatewayServer(
                                 translator.onChunk(chunk)
                             } catch (ignored: Exception) {}
                         }
-                        true
+                        !clientGone
                     }
                     translator.finish()
                     if (streamTokens == 0) streamTokens = 35
