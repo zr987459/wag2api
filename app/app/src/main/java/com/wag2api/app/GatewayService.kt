@@ -47,6 +47,13 @@ class GatewayService : Service() {
             return true
         }
 
+        /** 当前真正在监听的端口（0 = 未监听）。UI / WebView 必须用它，而不是用户刚保存的 getPort() */
+        @Volatile var activePort = 0
+            private set
+
+        /** WebView 等内部访问用：优先真实监听端口，未就绪时退回配置值 */
+        fun currentPort(ctx: Context): Int = if (activePort > 0) activePort else getPort(ctx)
+
         @Volatile var isRunning = false
         @Volatile private var instance: GatewayService? = null
 
@@ -108,7 +115,8 @@ class GatewayService : Service() {
         server = LocalGatewayServer(
             applicationContext, listenPort, engine,
             onBusy = ::onRequestStart,
-            onIdle = ::onRequestEnd
+            onIdle = ::onRequestEnd,
+            onBound = { p -> activePort = p; updateNotification() }
         )
         server?.start()
         isRunning = true
@@ -169,7 +177,7 @@ class GatewayService : Service() {
 
     private fun updateNotification() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :${getPort(this)}"
+        val text = "WB ✓ · ${nodeStateLabel()} · 本地端口 :${currentPort(this)}"
         nm.notify(NOTIF_ID, buildNotification(text))
     }
 
@@ -191,7 +199,7 @@ class GatewayService : Service() {
     }
 
     private fun startForegroundServiceNotification() {
-        val notification = buildNotification("WB ✓ · AG 启动中 · 本地端口 :${getPort(this)}")
+        val notification = buildNotification("WB ✓ · AG 启动中 · 本地端口 :${currentPort(this)}")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // Android 14+ 要求显式声明 specialUse，否则后台启动会被拒
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -207,6 +215,7 @@ class GatewayService : Service() {
         TokenKeeper.stop()
         try { engine.stop() } catch (ignored: Exception) {}
         server?.stop()
+        activePort = 0
         isRunning = false
         instance = null
         try {

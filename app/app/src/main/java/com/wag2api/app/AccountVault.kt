@@ -25,14 +25,25 @@ object AccountVault {
         val result = JSONArray()
         val seenUids = mutableSetOf<String>()
 
-        // 1. 优先扫描本地 auths/ 目录下的官方与网关落盘凭证文件
+        // 0. 先读 SharedPreferences：它承载 disabled / in_pool / token_usage 等元数据
+        val prefByUid = LinkedHashMap<String, JSONObject>()
+        try {
+            val prefArr = JSONArray(prefs.getString(KEY_ACCOUNTS, "[]") ?: "[]")
+            for (i in 0 until prefArr.length()) {
+                val a = prefArr.optJSONObject(i) ?: continue
+                val uid = a.optString("uid")
+                if (uid.isNotEmpty() && !prefByUid.containsKey(uid)) prefByUid[uid] = a
+            }
+        } catch (ignored: Exception) {}
+
+        // 1. auths/ 目录是 token 的权威来源（官方客户端 / 网关落盘），
+        //    但元数据必须叠加 prefs，否则 setDisabled / updateAccount 的写入会被文件版本遮蔽
         val authsDir = File(appContext.filesDir, "auths")
         if (authsDir.exists() && authsDir.isDirectory) {
-            authsDir.listFiles()?.forEach { file ->
-                if (file.isFile && file.name.endsWith(".json") && !file.name.endsWith(".disabled")) {
+            authsDir.listFiles()?.sortedBy { it.name }?.forEach { file ->
+                if (file.isFile && file.name.endsWith(".json")) {
                     try {
-                        val content = file.readText()
-                        val obj = JSONObject(content)
+                        val obj = JSONObject(file.readText())
                         val acct = obj.optJSONObject("account") ?: JSONObject()
                         val auth = obj.optJSONObject("auth") ?: JSONObject()
                         val uid = acct.optString("uid", obj.optString("uid"))
@@ -40,43 +51,37 @@ object AccountVault {
 
                         if (uid.isNotEmpty() && token.isNotEmpty() && !seenUids.contains(uid)) {
                             seenUids.add(uid)
-                            val nickname = acct.optString("nickname", obj.optString("nickname", "WorkBuddy用户"))
-                            val realm = auth.optString("realm", obj.optString("realm", "global"))
-
-                            result.put(JSONObject().apply {
-                                put("uid", uid)
-                                put("nickname", nickname)
-                                put("realm", realm)
-                                put("accessToken", token)
-                                put("refreshToken", auth.optString("refreshToken", obj.optString("refreshToken", "")))
+                            val meta = prefByUid[uid]
+                            val merged = if (meta != null) JSONObject(meta.toString()) else JSONObject().apply {
                                 put("in_pool", true)
                                 put("disabled", false)
-                                put("cooling", false)
                                 put("credits", obj.optInt("credits", 350))
                                 put("token_usage", JSONObject().apply {
                                     put("request_count", 0)
                                     put("total_tokens", 0)
                                 })
-                            })
+                            }
+                            merged.put("uid", uid)
+                            merged.put("nickname", acct.optString("nickname",
+                                obj.optString("nickname", merged.optString("nickname", "WorkBuddy用户"))))
+                            merged.put("realm", auth.optString("realm", obj.optString("realm", merged.optString("realm", "global"))))
+                            merged.put("accessToken", token)
+                            val fileRefresh = auth.optString("refreshToken", obj.optString("refreshToken", ""))
+                            if (fileRefresh.isNotEmpty() || !merged.has("refreshToken")) merged.put("refreshToken", fileRefresh)
+                            result.put(merged)
                         }
                     } catch (ignored: Exception) {}
                 }
             }
         }
 
-        // 2. 补充扫描 SharedPreferences 中的记录
-        val raw = prefs.getString(KEY_ACCOUNTS, "[]") ?: "[]"
-        try {
-            val prefArr = JSONArray(raw)
-            for (i in 0 until prefArr.length()) {
-                val a = prefArr.getJSONObject(i)
-                val uid = a.optString("uid")
-                if (uid.isNotEmpty() && !seenUids.contains(uid)) {
-                    seenUids.add(uid)
-                    result.put(a)
-                }
+        // 2. 只存在于 prefs 的账号
+        for ((uid, a) in prefByUid) {
+            if (!seenUids.contains(uid)) {
+                seenUids.add(uid)
+                result.put(a)
             }
-        } catch (ignored: Exception) {}
+        }
 
         return result
     }
@@ -242,7 +247,10 @@ object AccountVault {
                 return a
             }
         }
-        if (list.length() > 0) return list.getJSONObject(0)
+        for (i in 0 until list.length()) {
+            val a = list.getJSONObject(i)
+            if (!a.optBoolean("disabled", false)) return a
+        }
         return null
     }
 
@@ -265,6 +273,7 @@ object AccountVault {
         val list = getAccounts()
         var nickname = ""
         var realm = "global"
+        var keptRefresh = ""
         val next = JSONArray()
         for (i in 0 until list.length()) {
             val a = list.getJSONObject(i)
@@ -273,6 +282,7 @@ object AccountVault {
                 if (!refreshToken.isNullOrEmpty()) a.put("refreshToken", refreshToken)
                 nickname = a.optString("nickname")
                 realm = a.optString("realm", "global")
+                keptRefresh = a.optString("refreshToken")
             }
             next.put(a)
         }
@@ -289,7 +299,8 @@ object AccountVault {
                 })
                 put("auth", JSONObject().apply {
                     put("accessToken", accessToken)
-                    if (!refreshToken.isNullOrEmpty()) put("refreshToken", refreshToken)
+                    // 上游没回新 refreshToken 时沿用旧的，否则文件里的 refreshToken 会被抹掉
+                    put("refreshToken", keptRefresh)
                     put("realm", realm)
                 })
             }

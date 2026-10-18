@@ -76,8 +76,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun waitForServerAndLoad() {
         Thread {
-            val port = GatewayService.getPort(applicationContext)
+            var port = GatewayService.currentPort(applicationContext)
             for (i in 1..40) {
+                // 用真实监听端口：改了端口但还没重启网关时，getPort() 指向一个没人监听的端口
+                port = GatewayService.currentPort(applicationContext)
                 try {
                     Socket("127.0.0.1", port).close()
                     break

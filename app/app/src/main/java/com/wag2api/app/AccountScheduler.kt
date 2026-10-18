@@ -4,26 +4,34 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 账号调度器：多账号轮询 + 429 冷却 + 自动重试。
+ * 账号调度器：多账号轮询 + 429 冷却 + 并发租约。
  *
  * 设计要点：
- *  - 429 / 14003（模型繁忙）属于**上游限流**，不是账号问题，但它也会挑账号，
- *    所以命中后先给该账号打一个短冷却，换下一个账号立刻重试，用户无感。
+ *  - 429 / 14003（模型繁忙）命中后给该账号打短冷却，换下一个账号立刻重试。
  *  - 冷却按 uid 记录，到期自动恢复，不做永久淘汰（腾讯的限流是波动的）。
- *  - 优先用「当前选中账号」，其次按最近使用时间轮询（Round-Robin）。
+ *  - acquire() 在锁内「选 + 占」一步完成：选中即刻写 lastUsed 并 inFlight+1，
+ *    并发请求不会扎堆到同一个账号；调用方必须在 finally 里 release(uid)。
+ *  - lastUsed / inFlight 只放内存，不再每个请求重写 SharedPreferences。
  */
 object AccountScheduler {
 
     private const val PREF = "wag2api_scheduler"
     private const val KEY_SELECTED = "selected_uid"
 
-    /** uid -> 冷却到期时间戳 */
-    private val cooldownUntil = ConcurrentHashMap<String, Long>()
-
     /** 429 默认冷却时长：模型繁忙通常是瞬时的，8 秒足够躲过一波 */
     private const val DEFAULT_COOLDOWN_MS = 8_000L
+
+    /** uid -> 冷却到期时间戳 */
+    private val cooldownUntil = ConcurrentHashMap<String, Long>()
+    /** uid -> 最近一次被分配的时间（内存，进程重启归零即可） */
+    private val lastUsed = ConcurrentHashMap<String, Long>()
+    /** uid -> 正在进行中的请求数 */
+    private val inFlight = ConcurrentHashMap<String, AtomicInteger>()
+
+    private val lock = Any()
 
     fun init(ctx: Context) {
         // 预留：未来可从磁盘恢复冷却状态，目前内存即可
@@ -39,7 +47,6 @@ object AccountScheduler {
             .edit().putString(KEY_SELECTED, uid).apply()
     }
 
-    /** 给某个账号打冷却 */
     fun markCooling(uid: String, ms: Long = DEFAULT_COOLDOWN_MS) {
         cooldownUntil[uid] = System.currentTimeMillis() + ms
     }
@@ -47,64 +54,61 @@ object AccountScheduler {
     fun isCooling(uid: String): Boolean {
         val until = cooldownUntil[uid] ?: return false
         if (System.currentTimeMillis() >= until) {
-            cooldownUntil.remove(uid)
+            cooldownUntil.remove(uid, until)
             return false
         }
         return true
     }
 
-    fun cooldownRemainSec(uid: String): Int {
-        val until = cooldownUntil[uid] ?: return 0
-        val left = until - System.currentTimeMillis()
-        return if (left > 0) ((left + 999) / 1000).toInt() else 0
+    fun cooldownRemainMs(uid: String): Long {
+        val until = cooldownUntil[uid] ?: return 0L
+        return (until - System.currentTimeMillis()).coerceAtLeast(0L)
     }
 
+    fun cooldownRemainSec(uid: String): Int = ((cooldownRemainMs(uid) + 999) / 1000).toInt()
+
+    private fun inFlightOf(uid: String): Int = inFlight[uid]?.get() ?: 0
+
     /**
-     * 取一个可用账号，按 exclude 排除已试过的。
-     * 优先级：手动选中 → 非冷却账号（按最近使用轮询）→ 全冷却时取冷却最快结束的
+     * 选一个账号并占用它（lastUsed=now, inFlight+1）。
+     * 优先级：手动选中 → 非冷却账号（inFlight 少者优先，其次最久未用）→ 全冷却时取最快解冻的。
+     * 返回 null 表示 exclude 之外已无可用账号。
      */
-    fun pick(ctx: Context, realm: String, exclude: Set<String> = emptySet()): JSONObject? {
-        val all = AccountVault.getAccounts()
-        val candidates = ArrayList<JSONObject>()
-        for (i in 0 until all.length()) {
-            val a = all.optJSONObject(i) ?: continue
-            if (a.optBoolean("disabled", false)) continue
-            if (a.optString("realm") != realm) continue
-            val uid = a.optString("uid")
-            if (uid.isEmpty() || uid in exclude) continue
-            candidates.add(a)
-        }
-        if (candidates.isEmpty()) {
-            // 该 realm 没账号了，退回全部未禁用的（兼容 realm 字段缺失的老数据）
+    fun acquire(ctx: Context, realm: String, exclude: Set<String> = emptySet()): JSONObject? {
+        val all = AccountVault.getAccounts()   // 锁外读盘，避免把文件 IO 串进调度锁
+        val selected = getSelectedUid(ctx)
+        synchronized(lock) {
+            val candidates = ArrayList<JSONObject>()
             for (i in 0 until all.length()) {
                 val a = all.optJSONObject(i) ?: continue
                 if (a.optBoolean("disabled", false)) continue
                 val uid = a.optString("uid")
                 if (uid.isEmpty() || uid in exclude) continue
+                val r = a.optString("realm")
+                // realm 缺失的老数据视为通配；绝不把 cn 的 token 发去 global（反之亦然）
+                if (r.isNotEmpty() && r != realm) continue
                 candidates.add(a)
             }
-        }
-        if (candidates.isEmpty()) return null
+            if (candidates.isEmpty()) return null
 
-        // 1. 手动选中优先（且不在冷却）
-        val selected = getSelectedUid(ctx)
-        if (selected.isNotEmpty()) {
-            candidates.firstOrNull { it.optString("uid") == selected && !isCooling(selected) }
-                ?.let { return it }
-        }
+            val chosen =
+                candidates.firstOrNull { selected.isNotEmpty() && it.optString("uid") == selected && !isCooling(selected) }
+                    ?: candidates.filter { !isCooling(it.optString("uid")) }
+                        .minWithOrNull(compareBy<JSONObject>({ inFlightOf(it.optString("uid")) },
+                            { lastUsed[it.optString("uid")] ?: 0L }))
+                    ?: candidates.minByOrNull { cooldownRemainMs(it.optString("uid")) }
+                    ?: return null
 
-        // 2. 非冷却账号里，按 last_used 升序（最久没用的先用）
-        val healthy = candidates.filter { !isCooling(it.optString("uid")) }
-        if (healthy.isNotEmpty()) {
-            return healthy.minByOrNull { it.optLong("last_used", 0L) }
+            val uid = chosen.optString("uid")
+            lastUsed[uid] = System.currentTimeMillis()
+            inFlight.getOrPut(uid) { AtomicInteger(0) }.incrementAndGet()
+            return chosen
         }
-
-        // 3. 全在冷却：取冷却最快结束的，尽量别让用户干等
-        return candidates.minByOrNull { cooldownRemainSec(it.optString("uid")) }
     }
 
-    fun touch(uid: String) {
-        AccountVault.updateAccount(uid) { it.put("last_used", System.currentTimeMillis()) }
+    /** 与 acquire 配对，必须在 finally 中调用 */
+    fun release(uid: String) {
+        inFlight[uid]?.let { c -> if (c.decrementAndGet() < 0) c.set(0) }
     }
 
     /** 账号池状态，供前端展示 */
@@ -121,7 +125,8 @@ object AccountScheduler {
                 put("disabled", a.optBoolean("disabled", false))
                 put("cooling", isCooling(uid))
                 put("cooldown_sec", cooldownRemainSec(uid))
-                put("last_used", a.optLong("last_used", 0L))
+                put("in_flight", inFlightOf(uid))
+                put("last_used", lastUsed[uid] ?: 0L)
                 put("request_count", a.optJSONObject("token_usage")?.optInt("request_count", 0) ?: 0)
             })
         }

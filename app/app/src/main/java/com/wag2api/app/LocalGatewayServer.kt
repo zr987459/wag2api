@@ -15,7 +15,9 @@ class LocalGatewayServer(
     private val port: Int = 8800,
     private val engine: com.wag2api.app.engine.NodeEngineApi,
     private val onBusy: () -> Unit = {},
-    private val onIdle: () -> Unit = {}
+    private val onIdle: () -> Unit = {},
+    /** 真正 bind 成功后的端口回调（失败回退默认端口时也会报真实值；0 表示彻底失败） */
+    private val onBound: (Int) -> Unit = {}
 ) {
 
     private var serverSocket: ServerSocket? = null
@@ -26,7 +28,15 @@ class LocalGatewayServer(
         isRunning = true
         thread(name = "LocalGatewayServer") {
             try {
-                serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
+                val loopback = InetAddress.getByName("127.0.0.1")
+                serverSocket = try {
+                    ServerSocket(port, 50, loopback)
+                } catch (e: java.net.BindException) {
+                    // 自定义端口被占用：回退默认端口，避免「服务在跑但没人监听」
+                    if (port == GatewayService.DEFAULT_PORT) throw e
+                    ServerSocket(GatewayService.DEFAULT_PORT, 50, loopback)
+                }
+                onBound(serverSocket?.localPort ?: 0)
                 while (isRunning) {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true // 减少小包网络延迟
@@ -41,7 +51,8 @@ class LocalGatewayServer(
                     }
                 }
             } catch (e: Exception) {
-                // server closed
+                // server closed / bind 失败
+                if (serverSocket?.isBound != true) onBound(0)
             }
         }
     }
@@ -336,6 +347,7 @@ class LocalGatewayServer(
                     val res = JSONObject().apply {
                         put("ok", ok)
                         put("port", GatewayService.getPort(context))
+                        put("active_port", GatewayService.activePort)
                         if (ok) put("msg", "端口已保存，重启网关后生效")
                         else put("msg", "端口需在 1024~65535 之间")
                     }
@@ -344,6 +356,8 @@ class LocalGatewayServer(
                     val json = JSONObject().apply {
                         put("ok", true)
                         put("port", GatewayService.getPort(context))
+                        put("active_port", GatewayService.activePort)
+                        put("restart_required", GatewayService.activePort != 0 && GatewayService.activePort != GatewayService.getPort(context))
                         put("default_port", GatewayService.DEFAULT_PORT)
                     }
                     sendJsonResponse(output, 200, json.toString())
@@ -423,6 +437,7 @@ class LocalGatewayServer(
 
     private fun errorPayload(e: Exception): Pair<Int, JSONObject> {
         val (status, type) = when {
+            e is UpstreamException && (e.status == 429 || e.code == 14003) -> 429 to "rate_limit_error"
             e is UpstreamException && e.code == 11128 -> 403 to "upstream_channel_rejected"
             e is UpstreamException && e.status == 403 -> 403 to "upstream_forbidden"
             e is UpstreamException -> 502 to "upstream_error"
@@ -574,8 +589,16 @@ class LocalGatewayServer(
                 output.write(sseHeader.toByteArray(Charsets.US_ASCII))
                 output.flush()
 
+                // 写客户端失败 = 客户端已断开；必须让 onLine 返回 false 停掉上游，否则会白白跑完整个回答
+                var clientGone = false
                 val translator = AnthropicStreamTranslator(modelRaw) { event, data ->
-                    writeChunk(output, "event: $event\ndata: $data\n\n")
+                    if (!clientGone) {
+                        try {
+                            writeChunk(output, "event: $event\ndata: $data\n\n")
+                        } catch (e: IOException) {
+                            clientGone = true
+                        }
+                    }
                 }
 
                 var streamTokens = 0
@@ -592,7 +615,7 @@ class LocalGatewayServer(
                                 translator.onChunk(chunk)
                             } catch (ignored: Exception) {}
                         }
-                        true
+                        !clientGone
                     }
                     translator.finish()
                     if (streamTokens == 0) streamTokens = 35
