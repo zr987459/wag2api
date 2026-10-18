@@ -184,6 +184,9 @@ export class OAuthFlowManager {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
+      signal: AbortSignal.timeout(20000),
+    }).catch(e => {
+      throw new Error(e.name === 'TimeoutError' ? '连接 Google 超时（20 秒），请检查手机代理是否对本应用生效' : `连接 Google 失败：${e.message}`);
     });
 
     if (!res.ok) {
@@ -199,6 +202,7 @@ export class OAuthFlowManager {
     try {
       const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { 'Authorization': `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15000),
       });
       if (userRes.ok) {
         const u = await userRes.json();
