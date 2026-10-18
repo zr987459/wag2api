@@ -102,7 +102,7 @@ export function migrateBucket(b) {
 }
 
 // PR2 分段打点字段（相对请求开始的毫秒数）
-export const TIMING_MS_FIELDS = ['t_token', 't_payload', 't_headers', 't_first_thought', 't_first_text'];
+export const TIMING_MS_FIELDS = ['t_token', 't_payload', 't_tls', 't_headers', 't_first_thought', 't_first_text'];
 
 function cleanTiming(t) {
   const o = {};
@@ -111,6 +111,7 @@ function cleanTiming(t) {
   o.attempts = Math.max(0, Math.round(num(t.attempts)));
   o.switched_account = Boolean(t.switched_account);
   o.switched_host = Boolean(t.switched_host);
+  o.conn_reused = t.conn_reused === true ? true : t.conn_reused === false ? false : null;
   return o;
 }
 
@@ -437,6 +438,8 @@ export class StatsTracker {
     for (const l of logs) if (l.timing.host) out.hosts[l.timing.host] = (out.hosts[l.timing.host] || 0) + 1;
     out.switched_account = logs.filter(l => l.timing.switched_account).length;
     out.switched_host = logs.filter(l => l.timing.switched_host).length;
+    out.conn_reused = logs.filter(l => l.timing.conn_reused === true).length;
+    out.conn_new = logs.filter(l => l.timing.conn_reused === false).length;
     return out;
   }
 

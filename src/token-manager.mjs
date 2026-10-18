@@ -185,12 +185,37 @@ export class TokenManager {
     }
   }
 
+  /**
+   * PR4：按 expiresAt 倒推，到期前 10 分钟刷新（原来固定每 45 分钟，可能落在到期后的空窗里，
+   * 让请求自己去刷 token）。刷新失败 1 分钟后重试；每次刷新后按新的 expiresAt 重新排期。
+   */
+  nextRefreshDelay(now = Date.now()) {
+    const LEAD_MS = 10 * 60 * 1000;
+    const MIN_MS = 30 * 1000;
+    const exp = Number(this.tokenData.expiresAt) || 0;
+    if (!exp) return MIN_MS;
+    return Math.max(MIN_MS, exp - LEAD_MS - now);
+  }
+
   startKeepAlive() {
-    setInterval(async () => {
-      if (this.tokenData.refreshToken) {
-        await this.refreshAccessToken();
-      }
-    }, 45 * 60 * 1000);
+    if (this._keepAliveTimer) clearTimeout(this._keepAliveTimer);
+    const schedule = (delay) => {
+      this._keepAliveTimer = setTimeout(async () => {
+        if (!this.tokenData.refreshToken) { schedule(5 * 60 * 1000); return; }
+        let ok = false;
+        try { ok = Boolean(await this.refreshAccessToken()); } catch (e) {}
+        // 失败退避：1、2、4… 分钟，最长 30 分钟（refresh token 失效时不至于每分钟刷屏）
+        this._refreshFails = ok ? 0 : (this._refreshFails || 0) + 1;
+        schedule(ok ? this.nextRefreshDelay() : Math.min(30, 2 ** (this._refreshFails - 1)) * 60 * 1000);
+      }, delay);
+      this._keepAliveTimer.unref?.();
+    };
+    schedule(this.nextRefreshDelay());
+  }
+
+  stopKeepAlive() {
+    if (this._keepAliveTimer) clearTimeout(this._keepAliveTimer);
+    this._keepAliveTimer = null;
   }
 
   getStatus() {

@@ -11,6 +11,7 @@
 import { buildAntigravityHeaders, buildCloudCodePayload } from './cloudcode.mjs';
 import { ANTIGRAVITY_ENDPOINTS } from './constants.mjs';
 import { normalizeGeminiUsage, mergeRawUsage } from './usage.mjs';
+import { upstreamFetch } from './upstream-fetch.mjs';
 
 const TOPICS = ['城市里的夜跑', '一座老火车站', '雨季的菜市场', '深夜的便利店', '山里的气象站', '旧书店的猫'];
 const PER_REQUEST_TIMEOUT_MS = 120000;
@@ -32,7 +33,7 @@ const median = (arr) => {
 };
 
 /** 单次流式请求测量（fetchImpl 可注入，便于测试） */
-export async function measureOnce({ host, payload, accessToken, fetchImpl = fetch, timeoutMs = PER_REQUEST_TIMEOUT_MS }) {
+export async function measureOnce({ host, payload, accessToken, fetchImpl = upstreamFetch, timeoutMs = PER_REQUEST_TIMEOUT_MS }) {
   const url = `${host}/v1internal:streamGenerateContent?alt=sse`;
   const t0 = Date.now();
   const out = { host: hostLabel(host), ok: false, status: null, t_headers: null, t_first_chunk: null, t_first_thought: null, t_first_text: null, total_ms: null, output_tokens: 0, thoughts_tokens: 0, text_tokens: 0, gen_tps: null, text_tps: null, error: null };
@@ -126,7 +127,7 @@ class HostBench {
   status() { return { ...this.state, runs: this.state.runs.slice(), summary: summarize(this.state.runs) }; }
 
   /** 启动后台测速；已有任务在跑时返回 false */
-  start(mgr, { rounds = 2, model = 'gemini-3.8-flash-high', hosts = ANTIGRAVITY_ENDPOINTS, fetchImpl = fetch } = {}) {
+  start(mgr, { rounds = 2, model = 'gemini-3.8-flash-high', hosts = ANTIGRAVITY_ENDPOINTS, fetchImpl = upstreamFetch } = {}) {
     if (this.state.running) return false;
     rounds = Math.max(1, Math.min(3, Number(rounds) || 2));
     this.state = { running: true, started_at: Date.now(), finished_at: null, account: mgr?.tokenData?.email || null, model, rounds, progress: '准备中', runs: [], summary: [] };

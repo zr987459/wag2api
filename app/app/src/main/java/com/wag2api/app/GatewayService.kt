@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -19,6 +21,11 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.TimeUnit
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * 网关守护服务：**唯一的**前台通知、悬浮球与 WakeLock 持有者。
@@ -150,6 +157,50 @@ class GatewayService : Service() {
     }
     private lateinit var engine: NodeEngineApi
 
+    // PR4：网络恢复 / 切换时通知 Node 预热（token + projectId + 上游 TLS 连接），省掉下一次请求的握手
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastPrewarmAt = 0L
+    private val prewarmClient by lazy {
+        OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).build()
+    }
+
+    private fun triggerPrewarm(reason: String) {
+        if (!::engine.isInitialized || engine.state != EngineState.READY) return
+        val now = System.currentTimeMillis()
+        if (now - lastPrewarmAt < 3_000L) return
+        lastPrewarmAt = now
+        val p = engine.port
+        if (p <= 0) return
+        Thread {
+            try {
+                Thread.sleep(1_500L)   // 等新网络的路由 / DNS 稳定
+                val req = Request.Builder()
+                    .url("http://127.0.0.1:$p/api/prewarm")
+                    .header("X-Engine-Token", EngineTokenHolder.token)
+                    .post("{\"reason\":\"$reason\"}".toRequestBody("application/json".toMediaType()))
+                    .build()
+                prewarmClient.newCall(req).execute().close()
+            } catch (ignored: Exception) {}
+        }.start()
+    }
+
+    private fun registerNetworkPrewarm() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { triggerPrewarm("network") }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+        } catch (ignored: Exception) {}
+    }
+
+    private fun unregisterNetworkPrewarm() {
+        val cb = netCallback ?: return
+        try { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } catch (ignored: Exception) {}
+        netCallback = null
+    }
+
     /**
      * 只在「有请求在处理」时持有 WakeLock，空闲立即释放：
      * 熄屏后长思考/长输出不会被挂起，平时也不白白耗电。
@@ -223,6 +274,7 @@ class GatewayService : Service() {
                 updateNotification()
             }.start()
         }
+        registerNetworkPrewarm()
         updateNotification()
     }
 
@@ -297,6 +349,7 @@ class GatewayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         TokenKeeper.stop()
+        unregisterNetworkPrewarm()
         try { engine.stop() } catch (ignored: Exception) {}
         server?.stop()
         isRunning = false

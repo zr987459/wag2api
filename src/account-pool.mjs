@@ -53,6 +53,7 @@ export class AccountPool {
 
   removeAccount(email) {
     if (this.managers.has(email)) {
+      try { this.managers.get(email).stopKeepAlive?.(); } catch (e) {}
       this.managers.delete(email);
       const filename = `${email.replace(/[^a-zA-Z0-9]/g, '_')}.json`;
       const filePath = path.join(this.accountsDir, filename);
