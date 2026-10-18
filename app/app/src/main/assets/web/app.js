@@ -260,7 +260,32 @@ async function loadOverview() {
     }
   }
   renderStats(lastStats[engine]);
+  renderTiming(lastStats[engine]);
   renderTrend(lastStats[engine]);
+}
+
+// PR2 分段打点：仅 AG 引擎有；各值为相对请求开始的毫秒中位数
+function renderTiming(st) {
+  const card = $('timingCard');
+  if (!card) return;
+  const t = engine === 'ag' ? st?.timing_recent : null;
+  if (!t || !t.n) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const ms = v => (v === 0 ? '0ms' : fmtMs(v));
+  const cells = [
+    ['取 Token', ms(t.t_token)],
+    ['组包', ms(t.t_payload)],
+    ['响应头', ms(t.t_headers)],
+    ['首个思考', ms(t.t_first_thought)],
+    ['首个正文', ms(t.t_first_text)],
+    ['总耗时', ms(t.latency_ms)],
+    ['尝试次数', t.attempts ?? '--'],
+    ['缓存 / 未命中', `${fmtNum(t.cached_tokens)} / ${fmtNum(t.input_tokens)}`],
+    ['命中率', fmtPct(t.cache_hit_rate)],
+  ];
+  $('timingGrid').innerHTML = cells.map(([k, v]) => `<div class="stat-cell"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  const hosts = Object.entries(t.hosts || {}).map(([h, c]) => `${escapeHtml(h.split('.')[0])} ×${c}`).join('，');
+  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次`;
 }
 
 function renderStats(st) {
@@ -1037,7 +1062,7 @@ async function loadLogs() {
       logs = (Array.isArray(raw) ? raw : raw.logs || []).map(l => ({
         status: l.status, path: 'POST /v1/messages', model: l.model, ms: l.latency_ms, ttft: l.ttft_ms,
         u: l.tokens || {}, hit: l.cache_hit_rate, time: l.timestamp ? new Date(l.timestamp) : null,
-        stream: l.is_stream, note: l.error, who: l.email,
+        stream: l.is_stream, note: l.error, who: l.email, timing: l.timing,
       }));
     }
     $('logTitle').textContent = `请求日志 (${logs.length})`;
@@ -1069,6 +1094,10 @@ async function loadLogs() {
             <span class="log-metrics-text">${[fmtMs(l.ms), l.ttft ? '首字 ' + fmtMs(l.ttft) : ''].filter(x => x && x !== '--').join(' · ')}</span>
           </div>
           <div class="log-tokens">${tok}</div>
+          ${l.timing ? `<div class="muted mono" style="font-size:11px;">${[
+            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['头', l.timing.t_headers],
+            ['思考', l.timing.t_first_thought], ['正文', l.timing.t_first_text],
+          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
           ${l.who ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(l.who)}</div>` : ''}
           ${l.note ? `<div class="log-note-box">⚠️ ${escapeHtml(l.note)}</div>` : ''}
         </div>`;
