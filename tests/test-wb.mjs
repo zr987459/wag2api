@@ -185,7 +185,11 @@ test('调度：手动选中 → 最久未用 → 全冷却取最快恢复', () =
   assert.equal(s.pick('global').uid, 'b');
   assert.equal(s.pick('global', new Set(['a', 'b'])), null);
   s.touch('a');
-  assert.equal(s.poolStatus().find(p => p.uid === 'a').request_count, 1);
+  assert.ok(v.find('a').last_used > 9);
+  assert.equal(s.poolStatus().find(p => p.uid === 'a').request_count, 0); // touch 只记最近使用，计数在请求结束时记
+  s.recordUsage('a', 7); s.recordUsage('a', 0); s.recordUsage('', 5);
+  assert.equal(s.poolStatus().find(p => p.uid === 'a').request_count, 2);
+  assert.deepEqual(v.find('a').token_usage, { request_count: 2, total_tokens: 7 });
 });
 
 // ── gateway ────────────────────────────────────────────────
@@ -416,6 +420,99 @@ test('HTTP：/panel/api 返回格式与 LocalGatewayServer 一致', async () => 
     assert.deepEqual(Object.keys(await g('/panel/api/logs')), ['ok', 'logs', 'today_requests', 'today_tokens']);
     assert.deepEqual(await p('/panel/api/pool/clear-cooldown'), { ok: true });
     assert.equal((await p('/panel/api/tokens/refresh')).msg, '已在后台刷新');
+  });
+});
+
+test('账号用量：每次请求结束（成功或失败）记到最终账号；重试换号只记最后一个；不触发云端同步', async () => {
+  // a 永远 429，b 正常：每个请求都会先试 a 再换 b
+  const up = stubFetch((url, init) => (init.headers.Authorization === 'Bearer tok-a'
+    ? json(429, { code: 14003 })
+    : sse([chunk({ content: 'ok' }), 'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 2 } }), 'data: [DONE]'])));
+  const dir = tmp();
+  let changes = 0;
+  const wb = createWbEngine({ dataDir: dir, fetchImpl: up, log: quiet, backoffMs: 1, onChange: () => { changes++; } });
+  wb.vault.saveAccount('b', 'B', 'global', 'tok-b', '');
+  wb.vault.saveAccount('a', 'A', 'global', 'tok-a', '');
+  const srv = http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const chunks = []; for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString('utf-8');
+    if (await wb.handlePanel(req, res, url, raw)) return;
+    const body = JSON.parse(raw);
+    if (url.pathname === '/v1/messages') return wb.handleMessages(req, res, body);
+    return wb.handleChat(req, res, body);
+  });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const changesBefore = changes;
+    await (await post(base, '/v1/chat/completions', { model: 'hy3', stream: true, messages: [{ role: 'user', content: 'x' }] })).text();
+    await (await post(base, '/v1/chat/completions', { model: 'hy3', messages: [{ role: 'user', content: 'x' }] })).json();
+    await (await post(base, '/v1/messages', { model: 'hy3', stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'x' }] })).text();
+    await (await post(base, '/v1/messages', { model: 'hy3', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] })).json();
+    // 四种入口各一次，全部记在最终账号 b 上；a 只是被试过，不计
+    assert.deepEqual(wb.vault.find('b').token_usage, { request_count: 4, total_tokens: 28 });
+    assert.deepEqual(wb.vault.find('a').token_usage, { request_count: 0, total_tokens: 0 });
+    // 概览卡片与账号池读到同一个数
+    const ov = await (await fetch(base + '/panel/api/overview')).json();
+    assert.equal(ov.accounts.find(x => x.uid === 'b').token_usage.total_tokens, 28);
+    const pool = await (await fetch(base + '/panel/api/pool')).json();
+    assert.equal(pool.accounts.find(x => x.uid === 'b').request_count, 4);
+    // 失败也计数（Token 为 0），记在最后一次尝试的账号上
+    wb.vault.setDisabled('b', true);
+    const r = await post(base, '/v1/chat/completions', { model: 'hy3', messages: [{ role: 'user', content: 'x' }] });
+    assert.equal(r.status, 529);
+    assert.deepEqual(wb.vault.find('a').token_usage, { request_count: 1, total_tokens: 0 });
+    // 用量写入是 quiet 的：除了上面手动 setDisabled 那一次，不触发同步
+    assert.equal(changes, changesBefore + 1);
+    // 写盘了，重启后还在
+    const again = new AccountVault(path.join(dir, 'wb'));
+    assert.equal(again.find('b').token_usage.request_count, 4);
+  } finally { srv.close(); wb.flush(); }
+});
+
+test('请求日志带上最终账号 uid / nickname（成功与失败都有）', async () => {
+  let fail = false;
+  const up = stubFetch(() => (fail ? json(400, { code: 1, msg: 'bad' }) : sse([chunk({ content: 'ok' }), 'data: [DONE]'])));
+  await withEngine(up, async (base, wb) => {
+    await (await post(base, '/v1/chat/completions', { model: 'hy3', stream: true, messages: [{ role: 'user', content: 'x' }] })).text();
+    fail = true;
+    await (await post(base, '/v1/messages', { model: 'hy3', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] })).json();
+    const { logs } = await (await fetch(base + '/panel/api/logs')).json();
+    assert.equal(logs.length, 2);
+    for (const l of logs) { assert.equal(l.uid, 'a'); assert.equal(l.nickname, 'A'); }
+    assert.ok(logs[0].status >= 400 && logs[1].status === 200);
+    // 没选到账号（请求体无法解析）时字段仍在，为空字符串
+    wb.metrics.record('POST', '/v1/messages', 'm', 'error', 400, 0, 1, null, 'bad');
+    const first = (await (await fetch(base + '/panel/api/logs')).json()).logs[0];
+    assert.equal(first.uid, ''); assert.equal(first.nickname, '');
+  });
+});
+
+test('暂停当前选中账号：selected_uid 回到自动；已暂停账号不能设为当前', async () => {
+  await withEngine(stubFetch(() => sse([chunk({ content: 'ok' })])), async (base, wb) => {
+    wb.vault.saveAccount('b', 'B', 'global', 'tok-b', '');
+    const g = p => fetch(base + p).then(r => r.json());
+    const p = (u, b) => post(base, u, b || {}).then(r => r.json());
+    assert.deepEqual(await p('/panel/api/pool/select', { uid: 'a' }), { ok: true, uid: 'a' });
+    // 暂停别的账号不影响选中
+    assert.deepEqual(await p('/panel/api/pool/toggle', { uid: 'b', disabled: true }), { ok: true });
+    assert.equal((await g('/panel/api/pool')).selected_uid, 'a');
+    // 暂停选中的账号：回到自动
+    assert.deepEqual(await p('/panel/api/pool/toggle', { uid: 'a', disabled: true }), { ok: true });
+    assert.equal((await g('/panel/api/pool')).selected_uid, '');
+    assert.equal(wb.scheduler.getSelectedUid(), '');
+    // 已暂停的账号点「使用」被拒绝
+    assert.deepEqual(await p('/panel/api/pool/select', { uid: 'a' }), { ok: false, msg: '该账号已暂停，请先启用' });
+    assert.equal(wb.scheduler.getSelectedUid(), '');
+    // 重新启用后不会自动变回「当前」，可以再选
+    assert.deepEqual(await p('/panel/api/pool/toggle', { uid: 'a', disabled: false }), { ok: true });
+    assert.equal((await g('/panel/api/pool')).selected_uid, '');
+    assert.deepEqual(await p('/panel/api/pool/select', { uid: 'a' }), { ok: true, uid: 'a' });
+    // 修复前遗留的状态（选中的账号已是暂停）：读取账号池时视为自动并清掉
+    wb.vault.setDisabled('a', true);
+    assert.equal((await g('/panel/api/pool')).selected_uid, '');
+    assert.equal(wb.scheduler.getSelectedUid(), '');
   });
 });
 
