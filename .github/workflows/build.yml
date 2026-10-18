@@ -174,12 +174,15 @@ jobs:
         working-directory: .
         run: node scripts/build-linux.mjs x64 arm64
 
-      - name: 打包 Node 轻量包
+      - name: 压缩单文件 + 打包 Node 轻量包
         working-directory: .
         run: |
           set -e
-          mkdir -p dist
+          for a in x64 arm64; do
+            [ -f "dist/wag2api-linux-$a" ] && xz -9e -T0 -k "dist/wag2api-linux-$a"
+          done
           tar czf dist/wag2api-node.tar.gz src package.json LICENSE
+          ls -la dist
 
       # 单文件版没有 --version/--help，直接启动后探活再杀掉
       - name: 冒烟测试
