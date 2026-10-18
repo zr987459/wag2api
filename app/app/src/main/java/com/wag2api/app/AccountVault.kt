@@ -12,6 +12,9 @@ object AccountVault {
     private const val PREF_NAME = "workbuddy_vault"
     private const val KEY_ACCOUNTS = "accounts"
 
+    /** 只存在 prefs 里的运行时元数据字段（auths/ 文件不保存这些） */
+    private val META_KEYS = listOf("disabled", "last_used", "token_usage", "credits", "nickname_override")
+
     private lateinit var prefs: SharedPreferences
     private lateinit var appContext: Context
 
@@ -65,14 +68,29 @@ object AccountVault {
         }
 
         // 2. 补充扫描 SharedPreferences 中的记录
+        //    auths/ 文件只负责 token；disabled / last_used / token_usage / credits 等
+        //    运行时元数据只存在 prefs 里。旧实现遇到同 uid 直接跳过 prefs，导致
+        //    setDisabled()/touch() 对所有通过 saveAccount 落盘的账号完全无效。
+        val byUid = HashMap<String, JSONObject>()
+        for (i in 0 until result.length()) {
+            val a = result.getJSONObject(i)
+            byUid[a.optString("uid")] = a
+        }
         val raw = prefs.getString(KEY_ACCOUNTS, "[]") ?: "[]"
         try {
             val prefArr = JSONArray(raw)
             for (i in 0 until prefArr.length()) {
                 val a = prefArr.getJSONObject(i)
                 val uid = a.optString("uid")
-                if (uid.isNotEmpty() && !seenUids.contains(uid)) {
-                    seenUids.add(uid)
+                if (uid.isEmpty()) continue
+                val fileAcc = byUid[uid]
+                if (fileAcc != null) {
+                    for (k in META_KEYS) if (a.has(k)) fileAcc.put(k, a.get(k))
+                    // 文件里没有 refreshToken（被旧版 updateTokens 写丢）时，从 prefs 补回
+                    if (fileAcc.optString("refreshToken").isEmpty() && a.optString("refreshToken").isNotEmpty()) {
+                        fileAcc.put("refreshToken", a.optString("refreshToken"))
+                    }
+                } else if (seenUids.add(uid)) {
                     result.put(a)
                 }
             }
@@ -127,8 +145,18 @@ object AccountVault {
                     put("realm", realm)
                 })
             }
-            file.writeText(fullObj.toString(2))
+            writeAtomic(file, fullObj.toString(2))
         } catch (ignored: Exception) {}
+    }
+
+    /** 先写临时文件再 rename，避免进程被杀时留下半截 JSON（getAccounts 会静默丢掉该账号） */
+    private fun writeAtomic(file: File, text: String) {
+        val tmp = File(file.parentFile, file.name + ".tmp")
+        tmp.writeText(text)
+        if (!tmp.renameTo(file)) {
+            file.delete()
+            if (!tmp.renameTo(file)) throw java.io.IOException("rename failed: ${file.name}")
+        }
     }
 
     @Synchronized
@@ -242,7 +270,21 @@ object AccountVault {
                 return a
             }
         }
-        if (list.length() > 0) return list.getJSONObject(0)
+        // 旧实现在这里无条件返回 list[0]，会把已禁用账号拿去发请求
+        for (i in 0 until list.length()) {
+            val a = list.getJSONObject(i)
+            if (!a.optBoolean("disabled", false)) return a
+        }
+        return null
+    }
+
+    @Synchronized
+    fun getAccountByUid(uid: String): JSONObject? {
+        val list = getAccounts()
+        for (i in 0 until list.length()) {
+            val a = list.getJSONObject(i)
+            if (a.optString("uid") == uid) return a
+        }
         return null
     }
 
@@ -265,6 +307,7 @@ object AccountVault {
         val list = getAccounts()
         var nickname = ""
         var realm = "global"
+        var keptRefresh = refreshToken.orEmpty()
         val next = JSONArray()
         for (i in 0 until list.length()) {
             val a = list.getJSONObject(i)
@@ -273,6 +316,7 @@ object AccountVault {
                 if (!refreshToken.isNullOrEmpty()) a.put("refreshToken", refreshToken)
                 nickname = a.optString("nickname")
                 realm = a.optString("realm", "global")
+                keptRefresh = a.optString("refreshToken")
             }
             next.put(a)
         }
@@ -289,11 +333,13 @@ object AccountVault {
                 })
                 put("auth", JSONObject().apply {
                     put("accessToken", accessToken)
-                    if (!refreshToken.isNullOrEmpty()) put("refreshToken", refreshToken)
+                    // 上游未下发新 refreshToken 时必须保留旧值，否则下次 getAccounts()
+                    // 读到空 refreshToken，该账号从此再也刷新不了
+                    put("refreshToken", keptRefresh)
                     put("realm", realm)
                 })
             }
-            file.writeText(fullObj.toString(2))
+            writeAtomic(file, fullObj.toString(2))
         } catch (ignored: Exception) {}
     }
 

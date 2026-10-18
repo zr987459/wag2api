@@ -337,7 +337,7 @@ class LocalGatewayServer(
                         put("ok", ok)
                         put("port", GatewayService.getPort(context))
                         if (ok) put("msg", "端口已保存，重启网关后生效")
-                        else put("msg", "端口需在 1024~65535 之间")
+                        else put("msg", "端口需在 1024~65535 之间，且不能与 Node 引擎端口冲突或已被占用")
                     }
                     sendJsonResponse(output, 200, res.toString())
                 } else {
@@ -345,6 +345,7 @@ class LocalGatewayServer(
                         put("ok", true)
                         put("port", GatewayService.getPort(context))
                         put("default_port", GatewayService.DEFAULT_PORT)
+                        put("active_port", GatewayService.activePort)
                     }
                     sendJsonResponse(output, 200, json.toString())
                 }
@@ -574,8 +575,17 @@ class LocalGatewayServer(
                 output.write(sseHeader.toByteArray(Charsets.US_ASCII))
                 output.flush()
 
+                // translator 的写出异常原本被 onChunk 外层 catch(ignored) 吞掉，客户端断开后
+                // 仍会把整段上游流读完（继续烧额度）。这里显式记下断开，交给 onLine 返回 false。
+                var clientGone = false
                 val translator = AnthropicStreamTranslator(modelRaw) { event, data ->
-                    writeChunk(output, "event: $event\ndata: $data\n\n")
+                    if (!clientGone) {
+                        try {
+                            writeChunk(output, "event: $event\ndata: $data\n\n")
+                        } catch (e: IOException) {
+                            clientGone = true
+                        }
+                    }
                 }
 
                 var streamTokens = 0
@@ -592,7 +602,7 @@ class LocalGatewayServer(
                                 translator.onChunk(chunk)
                             } catch (ignored: Exception) {}
                         }
-                        true
+                        !clientGone
                     }
                     translator.finish()
                     if (streamTokens == 0) streamTokens = 35

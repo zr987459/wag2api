@@ -34,18 +34,34 @@ class GatewayService : Service() {
         private const val KEY_PORT = "listen_port"
 
         /** 读取用户自定义端口，非法值回退默认 */
+        /** Node 引擎内部端口（EngineRouter 转发到 127.0.0.1:18790），前门不能占用 */
+        private val RESERVED_PORTS = setOf(18790)
+
+        /** 当前前门实际监听的端口（绑定失败回退后可能与保存值不同），供面板展示 */
+        @Volatile var activePort: Int = 0
+            private set
+
         fun getPort(ctx: Context): Int {
-            val p = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-                .getInt(KEY_PORT, DEFAULT_PORT)
-            return if (p in 1024..65535) p else DEFAULT_PORT
+            val p = try {
+                ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getInt(KEY_PORT, DEFAULT_PORT)
+            } catch (e: ClassCastException) {
+                DEFAULT_PORT   // 旧版本 / 手工改过的 prefs 存成了字符串
+            }
+            return if (p in 1024..65535 && p !in RESERVED_PORTS) p else DEFAULT_PORT
         }
 
         fun setPort(ctx: Context, port: Int): Boolean {
-            if (port !in 1024..65535) return false
+            if (port !in 1024..65535 || port in RESERVED_PORTS) return false
+            // 新端口与当前监听端口不同时，先试绑一下，避免保存一个已被占用的端口导致重启后网关起不来
+            if (port != activePort && !isPortFree(port)) return false
             ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-                .edit().putInt(KEY_PORT, port).apply()
+                .edit().putInt(KEY_PORT, port).commit()
             return true
         }
+
+        private fun isPortFree(port: Int): Boolean = try {
+            java.net.ServerSocket(port, 1, java.net.InetAddress.getByName("127.0.0.1")).close(); true
+        } catch (e: Exception) { false }
 
         @Volatile var isRunning = false
         @Volatile private var instance: GatewayService? = null
@@ -104,7 +120,10 @@ class GatewayService : Service() {
         EngineFactory.injectToken(applicationContext)
 
         // 前门先起来，WB 毫秒级就绪
-        val listenPort = getPort(applicationContext)
+        // 自定义端口被占用时回退默认端口，而不是让前门静默起不来
+        var listenPort = getPort(applicationContext)
+        if (listenPort != DEFAULT_PORT && !isPortFree(listenPort)) listenPort = DEFAULT_PORT
+        activePort = listenPort
         server = LocalGatewayServer(
             applicationContext, listenPort, engine,
             onBusy = ::onRequestStart,
