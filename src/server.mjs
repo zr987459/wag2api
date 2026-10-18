@@ -90,8 +90,24 @@ function readBody(req) {
   });
 }
 
-const dashboardHtmlPath = path.join(__dirname, 'dashboard.html');
-const tokenHtmlPath = path.join(__dirname, 'token-page.html');
+// 控制台网页：与安卓共用 app/app/src/main/assets/web（单文件版打包进 EMBED.web）
+const WEB_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const WEB_DIR = [process.env.WEB_DIR, path.join(__dirname, 'web'), path.join(__dirname, '..', 'app', 'app', 'src', 'main', 'assets', 'web')]
+  .find(d => d && fs.existsSync(path.join(d, 'index.html')));
+
+function serveWeb(pathname, res) {
+  const name = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  if (!/^[A-Za-z0-9_.-]+$/.test(name)) return false;
+  const type = WEB_TYPES[path.extname(name)];
+  if (!type) return false;
+  let body = EMBED.web && EMBED.web[name];
+  if (body === undefined && WEB_DIR && fs.existsSync(path.join(WEB_DIR, name))) body = fs.readFileSync(path.join(WEB_DIR, name));
+  if (body === undefined) return false;
+  if (typeof body === 'string' && type.startsWith('image/png')) body = Buffer.from(body, 'base64');
+  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+  res.end(body);
+  return true;
+}
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -127,24 +143,20 @@ const server = http.createServer(async (req, res) => {
     url.pathname = p;
   }
 
-  // 1. 控制台主页
-  if (url.pathname === '/' || url.pathname === '/index.html') {
-    if (EMBED.dashboard || fs.existsSync(dashboardHtmlPath)) {
-      const html = EMBED.dashboard || fs.readFileSync(dashboardHtmlPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-      return;
-    }
+  // 1. 控制台（新版双引擎界面；独立运行时只有 AG）
+  if (req.method === 'GET' && (url.pathname === '/' || /^\/[A-Za-z0-9_.-]+\.(html|js|css|json|svg|png)$/.test(url.pathname)) && serveWeb(url.pathname, res)) {
+    return;
+  }
+  if (url.pathname === '/token' || url.pathname === '/get-token' || url.pathname === '/token.html') {
+    res.writeHead(302, { Location: '/' });
+    res.end();
+    return;
   }
 
-  // 1.1 Token 专属提取页面 (/token, /get-token)
-  if (url.pathname === '/token' || url.pathname === '/get-token' || url.pathname === '/token.html') {
-    if (EMBED.token || fs.existsSync(tokenHtmlPath)) {
-      const html = EMBED.token || fs.readFileSync(tokenHtmlPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-      return;
-    }
+  // 1.0.1 独立运行时（Linux / 源码）给新界面一个引擎状态，界面据此隐藏 WB
+  if (url.pathname === '/panel/api/engine/state') {
+    sendJson(res, 200, { supported: true, enabled: true, state: 'READY', port: PORT, default_engine: 'ag', standalone: true, auth: access.enabled });
+    return;
   }
 
   // 1.5 OAuth 回调

@@ -24,7 +24,7 @@
       </div>
     </div>
 
-    <div class="engine-switcher-bar">
+    <div class="engine-switcher-bar android-only">
       <div class="engine-tab active wb-active" id="tabSwitchWb" onclick="switchEngine('wb')">
         <span>◉ WB 引擎</span>
         <span class="engine-badge-mini" id="miniWb">腾讯</span>
@@ -66,12 +66,11 @@
         <label class="switch"><input type="checkbox" id="nodeEnabledToggle" onchange="toggleNodeEngine(this.checked)"><span class="slider"></span></label>
       </div>
       <div style="display:flex; gap:8px; margin-top:12px;">
-        <button class="btn btn-outline" style="flex:1;" onclick="restartAgEngine()">重启引擎</button>
-        <button class="btn btn-outline" style="flex:1;" onclick="openAgConsole()">旧版 AG 控制台</button>
+        <button class="btn btn-outline" style="flex:1;" onclick="restartAgEngine()">重启 AG 引擎</button>
       </div>
     </div>
 
-    <div class="card">
+    <div class="card ov-stats">
       <div class="section-title">
         <span>Token 明细</span>
         <div class="sub-tabs">
@@ -82,7 +81,7 @@
       <div class="stat-grid" id="statGrid"></div>
     </div>
 
-    <div class="card">
+    <div class="card ov-trend">
       <div class="section-title">
         <span>近 24 小时</span>
         <div class="sub-tabs">
@@ -96,7 +95,8 @@
     </div>
 
     <div class="card">
-      <div class="section-title">网关全局设置</div>
+      <div class="section-title"><span class="android-only">网关全局设置</span><span class="standalone-only">维护</span></div>
+      <div class="android-only">
       <div class="row-between" style="padding: 4px 0 10px; border-bottom: 1px solid rgba(255,255,255,0.06); margin-bottom: 10px;">
         <div>
           <div style="font-size: 14px; font-weight: 600;">网关总开关</div>
@@ -119,8 +119,9 @@
         <input type="number" id="portInput" class="input-field" style="margin-bottom: 0; flex: 1;" min="1024" max="65535" placeholder="8800" />
         <button class="btn btn-primary btn-sm" onclick="savePort()">保存</button>
       </div>
+      </div>
       <div style="display:flex; gap:8px; margin-top:12px;">
-        <button class="btn btn-outline" style="flex:1;" onclick="openBackupModal()">💾 双引擎备份</button>
+        <button class="btn btn-outline android-only" style="flex:1;" onclick="openBackupModal()">💾 双引擎备份</button>
         <button class="btn btn-outline" style="flex:1;" onclick="resetStats()">清零本引擎统计</button>
       </div>
     </div>
@@ -184,6 +185,7 @@
   </main>
 
   <nav class="bottom-nav">
+    <div class="nav-brand">wag2api<span id="navEngine"></span></div>
     <div class="nav-item active" data-tab="overview" onclick="switchTab('overview')"><div class="nav-icon">📊</div><div>概览</div></div>
     <div class="nav-item" data-tab="accounts" onclick="switchTab('accounts')"><div class="nav-icon">👤</div><div>账号</div></div>
     <div class="nav-item" data-tab="keys" onclick="switchTab('keys')"><div class="nav-icon">🔑</div><div>接入</div></div>

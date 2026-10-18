@@ -197,7 +197,9 @@ jobs:
           for a in x64 arm64; do
             [ -f "dist/wag2api-linux-$a" ] && xz -9e -T0 -k "dist/wag2api-linux-$a"
           done
+          cp -r app/app/src/main/assets/web src/web
           tar czf dist/wag2api-node.tar.gz src package.json LICENSE
+          rm -rf src/web
           ls -la dist
 
       # 单文件版没有 --version/--help，直接启动后探活再杀掉

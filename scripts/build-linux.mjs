@@ -11,10 +11,14 @@ fs.rmSync(path.join(root, 'build'), { recursive: true, force: true });
 fs.mkdirSync(build, { recursive: true });
 fs.mkdirSync(dist, { recursive: true });
 fs.cpSync(path.join(root, 'src'), build, { recursive: true });
-const embedded = {
-  dashboard: fs.readFileSync(path.join(root, 'src', 'dashboard.html'), 'utf-8'),
-  token: fs.readFileSync(path.join(root, 'src', 'token-page.html'), 'utf-8'),
-};
+// 控制台网页与安卓共用一份
+const webDir = path.join(root, 'app', 'app', 'src', 'main', 'assets', 'web');
+const web = {};
+for (const f of fs.readdirSync(webDir)) {
+  const buf = fs.readFileSync(path.join(webDir, f));
+  web[f] = f.endsWith('.png') ? buf.toString('base64') : buf.toString('utf-8');
+}
+const embedded = { web };
 fs.writeFileSync(path.join(build, 'embedded.mjs'), 'export default ' + JSON.stringify(embedded) + ';\n');
 
 const bun = process.env.BUN || 'bun';

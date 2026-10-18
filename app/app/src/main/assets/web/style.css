@@ -757,9 +757,9 @@ body.theme-ag .nav-item.active {
 .trend .bar.zero { background: rgba(255,255,255,0.08); }
 .trend-axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-dim); margin-top: 4px; font-family: var(--font-mono); }
 .quota-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px; }
-.quota-row { display: grid; grid-template-columns: 74px 1fr 46px; align-items: center; gap: 8px; font-size: 12px; }
+.quota-row { display: grid; grid-template-columns: 74px 1fr 64px; align-items: center; gap: 8px; font-size: 12px; }
 .quota-row .qn { color: var(--text-muted); }
-.quota-row .qp { text-align: right; font-family: var(--font-mono); font-weight: 700; }
+.quota-row .qp { text-align: right; white-space: nowrap; font-family: var(--font-mono); font-weight: 700; }
 .quota-row .qr { grid-column: 2 / 4; font-size: 11px; color: var(--text-dim); margin-top: -4px; }
 .qbar { height: 7px; border-radius: 4px; background: rgba(255,255,255,0.08); overflow: hidden; }
 .qbar > i { display: block; height: 100%; border-radius: 4px; background: var(--primary); }
@@ -780,3 +780,78 @@ body.theme-ag .nav-item.active {
 .engine-tab.disabled { opacity: 0.45; }
 .log-tokens { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--text-dim); font-family: var(--font-mono); margin-top: 6px; }
 .log-tokens b { color: var(--text-muted); font-weight: 600; }
+
+/* ── 独立运行（Linux / 源码版）：只有 AG ── */
+.standalone-only { display: none; }
+body.standalone .standalone-only { display: inline; }
+body.standalone .android-only { display: none !important; }
+.nav-brand { display: none; }
+
+/* ── 电脑端：左侧导航 + 宽内容区 ── */
+@media (min-width: 900px) {
+  body { padding-bottom: 0; padding-left: 232px; font-size: 14.5px; }
+
+  .bottom-nav {
+    top: 0; bottom: 0; left: 0; transform: none;
+    width: 232px; max-width: none; height: 100vh;
+    flex-direction: column; justify-content: flex-start; gap: 4px;
+    border-radius: 0; border: none; border-right: 1px solid var(--card-border);
+    padding: 0 14px 20px; box-shadow: none;
+    background: #0e141e;
+  }
+  .nav-brand {
+    display: flex; flex-direction: column; gap: 2px;
+    font-size: 20px; font-weight: 800; letter-spacing: 0.3px;
+    padding: 24px 12px 22px; margin-bottom: 6px;
+    border-bottom: 1px solid var(--card-border);
+  }
+  .nav-brand span { font-size: 12px; font-weight: 600; color: var(--primary); font-family: var(--font-mono); }
+  .nav-item {
+    flex: none; flex-direction: row; justify-content: flex-start; gap: 12px;
+    padding: 11px 14px; min-height: 0; border-radius: 10px; font-size: 14px;
+  }
+  .nav-item:hover:not(.active) { background: var(--surface-hover); color: var(--text-main); }
+  .nav-icon { font-size: 17px; margin-bottom: 0; width: 22px; text-align: center; }
+
+  .app-header {
+    flex-direction: row; align-items: center; justify-content: space-between;
+    padding: 14px 32px; gap: 20px;
+  }
+  .app-header .brand-wrap { display: none; }
+  .app-header .header-top { order: 2; }
+  .engine-switcher-bar { order: 1; width: 380px; margin: 0; }
+  body.standalone .app-header { justify-content: flex-end; }
+
+  .tab-content { max-width: 1240px; padding: 24px 32px 40px; }
+
+  /* 概览：指标一行四个，明细与趋势并排 */
+  #view-overview.active {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-content: start;
+  }
+  #view-overview > * { margin-bottom: 0; }
+  #view-overview .metric-grid { grid-column: 1 / -1; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  #view-overview .metric-card { padding: 18px 20px; }
+  #view-overview .metric-value { font-size: 26px; }
+  #agEngineCard, #view-overview > .card:last-child { grid-column: 1 / -1; }
+  .trend { height: 150px; }
+
+  /* 账号、日志：卡片网格 */
+  #accountList { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 16px; align-items: start; }
+  #accountList .account-card, #accountList > .card, #accountList > .empty { margin-bottom: 0; }
+  #accountList > .empty, #accountList > .card { grid-column: 1 / -1; }
+  #logList { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 12px; align-items: start; }
+  #logList .log-card { margin-bottom: 0; }
+  #logList > .empty { grid-column: 1 / -1; }
+
+  /* 接入、对话：限制阅读宽度 */
+  #view-keys.active { max-width: 900px; }
+  #view-chat.active { max-width: 1000px; }
+  .chat-container { height: calc(100vh - 150px); }
+  .chat-bubble { max-width: 72%; }
+
+  /* 弹窗居中 */
+  .modal-overlay { align-items: center; }
+  .modal-sheet { border-radius: var(--radius-lg); border-bottom: 1px solid var(--card-border); max-width: 560px; animation: fadeIn 0.2s ease; }
+  .sheet-handle { display: none; }
+  .toast-container { left: calc(50% + 116px); }
+}

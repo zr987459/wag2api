@@ -37,8 +37,19 @@ function fmtNum(n) {
 function fmtPct(r) { return r === null || r === undefined ? '--' : (r * 100).toFixed(1) + '%'; }
 function fmtMs(ms) { return ms === null || ms === undefined || ms === 0 ? '--' : ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
 
-async function getJson(url, opts) {
-  const res = await fetch(url, { cache: 'no-store', ...opts });
+// 独立运行（Linux / 源码版）只有 AG 引擎；设置了 ADMIN_KEY 时管理接口需带密钥
+const isStandalone = () => !!engineInfo.standalone;
+function authHeaders(h) {
+  const k = localStorage.getItem('wag2api_admin_key');
+  return k ? { ...(h || {}), 'x-admin-key': k } : (h || {});
+}
+
+async function getJson(url, opts, retried) {
+  const res = await fetch(url, { cache: 'no-store', ...opts, headers: authHeaders(opts && opts.headers) });
+  if (res.status === 401 && !retried && url.startsWith('/api/')) {
+    const k = prompt('此网关设置了管理密钥（ADMIN_KEY），请输入：', '');
+    if (k) { localStorage.setItem('wag2api_admin_key', k.trim()); return getJson(url, opts, true); }
+  }
   let data = null;
   try { data = await res.json(); } catch (e) { /* 非 JSON */ }
   if (!res.ok && !(data && typeof data === 'object')) throw new Error(`HTTP ${res.status}`);
@@ -105,6 +116,10 @@ async function refreshEngineInfo() {
   try {
     engineInfo = await getJson('/panel/api/engine/state');
   } catch (e) { /* 保持旧值 */ }
+  if (isStandalone()) {
+    document.body.classList.add('standalone');
+    if (engine !== 'ag') { engine = 'ag'; localStorage.setItem('wag2api_engine', 'ag'); }
+  }
   const mini = $('miniAg');
   const tab = $('tabSwitchAg');
   if (!engineInfo.supported) { mini.textContent = '未内置'; tab.classList.add('disabled'); }
@@ -134,14 +149,15 @@ function applyEngineChrome() {
   const m = META[engine];
   $('tabSwitchWb').className = 'engine-tab' + (engine === 'wb' ? ' active wb-active' : '');
   $('tabSwitchAg').className = 'engine-tab' + (engine === 'ag' ? ' active ag-active' : '') + ($('tabSwitchAg').classList.contains('disabled') ? ' disabled' : '');
-  document.body.className = engine === 'ag' ? 'theme-ag' : '';
+  document.body.classList.toggle('theme-ag', engine === 'ag');
   $('brandIcon').textContent = m.icon;
   $('currentEngineBadge').textContent = m.title;
-  $('agEngineCard').style.display = engine === 'ag' && engineInfo.supported ? 'block' : 'none';
+  if ($('navEngine')) $('navEngine').textContent = isStandalone() ? 'AG' : m.name;
+  $('agEngineCard').style.display = engine === 'ag' && engineInfo.supported && !isStandalone() ? 'block' : 'none';
 }
 
 function switchEngine(e) {
-  if (e === engine) return;
+  if (e === engine || isStandalone()) return;
   // 保存当前对话现场
   chatState[engine].html = $('chatMessages').innerHTML;
   if (currentAbort) { currentAbort.abort(); currentAbort = null; }
@@ -193,7 +209,7 @@ function setHeader(ok, text) {
 async function loadOverview() {
   await refreshEngineInfo();
   applyEngineChrome();
-  loadGlobalSettings();
+  if (!isStandalone()) loadGlobalSettings();
   const evEl = $('ovEngine');
 
   if (engine === 'wb') {
@@ -320,11 +336,6 @@ async function restartAgEngine() {
   await postJson('/panel/api/engine/restart', {});
   showToast('AG 引擎重启中…', 'info');
   setTimeout(renderCurrent, 3000);
-}
-
-function openAgConsole() {
-  if (!agReady()) { showToast('AG 引擎未运行', 'warn'); return; }
-  window.location.href = '/ag/';
 }
 
 async function resetStats() {
