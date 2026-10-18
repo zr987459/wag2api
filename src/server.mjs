@@ -18,6 +18,7 @@ import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
+import { parseAgImport } from './ag-import.mjs';
 import { statsTracker } from './stats.mjs';
 import { ANTIGRAVITY_ENDPOINTS, ANTIGRAVITY_ENDPOINT_DAILY } from './constants.mjs';
 import { AccessControl } from './access-control.mjs';
@@ -75,8 +76,9 @@ function denyAdmin(res) {
 const ADMIN_PATHS = new Set([
   '/api/status', '/api/stats', '/api/logs', '/api/logs/clear', '/api/gemini/test', '/api/gemini/auth',
   '/api/oauth/exchange', '/api/oauth/token-exchange', '/api/accounts/add-token', '/api/accounts/switch',
-  '/api/accounts/remove',
+  '/api/accounts/remove', '/api/accounts/export', '/api/accounts/import', '/api/trend',
 ]);
+
 
 function readBody(req) {
   return new Promise(resolve => {
@@ -88,8 +90,24 @@ function readBody(req) {
   });
 }
 
-const dashboardHtmlPath = path.join(__dirname, 'dashboard.html');
-const tokenHtmlPath = path.join(__dirname, 'token-page.html');
+// 控制台网页：与安卓共用 app/app/src/main/assets/web（单文件版打包进 EMBED.web）
+const WEB_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const WEB_DIR = [process.env.WEB_DIR, path.join(__dirname, 'web'), path.join(__dirname, '..', 'app', 'app', 'src', 'main', 'assets', 'web')]
+  .find(d => d && fs.existsSync(path.join(d, 'index.html')));
+
+function serveWeb(pathname, res) {
+  const name = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  if (!/^[A-Za-z0-9_.-]+$/.test(name)) return false;
+  const type = WEB_TYPES[path.extname(name)];
+  if (!type) return false;
+  let body = EMBED.web && EMBED.web[name];
+  if (body === undefined && WEB_DIR && fs.existsSync(path.join(WEB_DIR, name))) body = fs.readFileSync(path.join(WEB_DIR, name));
+  if (body === undefined) return false;
+  if (typeof body === 'string' && type.startsWith('image/png')) body = Buffer.from(body, 'base64');
+  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+  res.end(body);
+  return true;
+}
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -125,33 +143,24 @@ const server = http.createServer(async (req, res) => {
     url.pathname = p;
   }
 
-  // 1. 控制台主页
-  if (url.pathname === '/' || url.pathname === '/index.html') {
-    if (EMBED.dashboard || fs.existsSync(dashboardHtmlPath)) {
-      const html = EMBED.dashboard || fs.readFileSync(dashboardHtmlPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-      return;
-    }
+  // 1. 控制台（新版双引擎界面；独立运行时只有 AG）
+  if (req.method === 'GET' && (url.pathname === '/' || /^\/[A-Za-z0-9_.-]+\.(html|js|css|json|svg|png)$/.test(url.pathname)) && serveWeb(url.pathname, res)) {
+    return;
+  }
+  if (url.pathname === '/token' || url.pathname === '/get-token' || url.pathname === '/token.html') {
+    res.writeHead(302, { Location: '/' });
+    res.end();
+    return;
   }
 
-  // 1.1 Token 专属提取页面 (/token, /get-token)
-  if (url.pathname === '/token' || url.pathname === '/get-token' || url.pathname === '/token.html') {
-    if (EMBED.token || fs.existsSync(tokenHtmlPath)) {
-      const html = EMBED.token || fs.readFileSync(tokenHtmlPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-      return;
-    }
+  // 1.0.1 独立运行时（Linux / 源码）给新界面一个引擎状态，界面据此隐藏 WB
+  if (url.pathname === '/panel/api/engine/state') {
+    sendJson(res, 200, { supported: true, enabled: true, state: 'READY', port: PORT, default_engine: 'ag', standalone: true, auth: access.enabled });
+    return;
   }
 
   // 1.5 OAuth 回调
-  if (url.pathname === '/oauth-callback') {
-    const code = url.searchParams.get('code');
-    const redirectUri = `http://localhost:${oauthFlowManager.fixedPort}/oauth-callback`;
-    const result = await oauthFlowManager.processCallbackCode(code, redirectUri);
-    res.writeHead(result.status, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(result.html);
+  if ((url.pathname === '/oauth-callback' || url.pathname === '/oauth-result') && oauthFlowManager.handleHttp(url, res)) {
     return;
   }
 
@@ -315,6 +324,46 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       sendJson(res, 500, { ok: false, error: e.message });
     }
+    return;
+  }
+
+  // 8.7 账号导出（含 Refresh Token，可直接回导）
+  if (url.pathname === '/api/accounts/export') {
+    const only = (url.searchParams.get('email') || '').trim().toLowerCase();
+    const accounts = [];
+    for (const [email, tm] of accountPool.managers.entries()) {
+      if (only && email !== only) continue;
+      if (!tm.tokenData.refreshToken) continue;
+      accounts.push({ email, refresh_token: tm.tokenData.refreshToken, project_id: tm.tokenData.projectId || '' });
+    }
+    sendJson(res, 200, { ok: true, format: 'wag2api-ag', version: 1, exported_at: new Date().toISOString(), accounts });
+    return;
+  }
+
+  // 8.8 批量导入：JSON 备份 / 多行 Refresh Token，逐个向 Google 校验后入池
+  if (url.pathname === '/api/accounts/import' && req.method === 'POST') {
+    const { raw } = await readBody(req);
+    const items = parseAgImport(raw);
+    if (!items.length) {
+      sendJson(res, 400, { ok: false, error: '没有识别到 Refresh Token（应以 1// 开头）' });
+      return;
+    }
+    const added = [], failed = [];
+    for (const it of items) {
+      try {
+        const r = await oauthFlowManager.validateAndAddRefreshToken(it.refresh_token);
+        added.push(r.email);
+      } catch (e) {
+        failed.push({ email: it.email || it.refresh_token.slice(0, 12) + '…', error: e.message });
+      }
+    }
+    sendJson(res, 200, { ok: added.length > 0, added, failed, message: `导入成功 ${added.length} 个${failed.length ? `，失败 ${failed.length} 个` : ''}` });
+    return;
+  }
+
+  // 8.9 全部账号汇总的 24 小时趋势
+  if (url.pathname === '/api/trend') {
+    sendJson(res, 200, statsTracker.getAggregateTrend());
     return;
   }
 

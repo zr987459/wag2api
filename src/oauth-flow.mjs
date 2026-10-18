@@ -9,7 +9,7 @@
  *
  * 解决方案：
  * 1. 始终生成符合 Google 官方规范的标准 redirect_uri (http://localhost:51121/oauth-callback)
- * 2. 授权完成后，浏览器如果跳到 localhost:51121 报无法连接属于正常现象（手机没开本地监听）
+ * 2. 回调立即返回“处理中”页面，后台换票，页面轮询 /oauth-result 显示结果
  * 3. 用户只需复制浏览器地址栏里带有 code= 的完整网址，粘贴回控制台的输入框，一键提交换票激活！
  */
 
@@ -52,24 +52,66 @@ export class OAuthFlowManager {
 
     this.server = http.createServer(async (req, res) => {
       const reqUrl = new URL(req.url, `http://localhost:${this.fixedPort}`);
-      if (reqUrl.pathname === '/oauth-callback') {
-        const code = reqUrl.searchParams.get('code');
-        const htmlResult = await this.processCallbackCode(code, `http://localhost:${this.fixedPort}/oauth-callback`);
-        res.writeHead(htmlResult.status, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(htmlResult.html);
-      } else {
+      if (!this.handleHttp(reqUrl, res)) {
         res.writeHead(404);
         res.end();
       }
     });
 
-    this.server.on('error', () => {});
-
+    // 浏览器可能把 localhost 解析成 ::1，优先监听双栈，失败再退回 IPv4
+    const listenV4 = () => {
+      try {
+        this.server.listen(this.fixedPort, '0.0.0.0', () => {
+          console.log(`📡 Google OAuth 本地回调监听常驻在端口 ${this.fixedPort}`);
+        });
+      } catch (e) {}
+    };
+    this.server.once('error', (e) => {
+      if (e && e.code !== 'EADDRINUSE') listenV4();
+      this.server.on('error', () => {});
+    });
     try {
-      this.server.listen(this.fixedPort, '0.0.0.0', () => {
-        console.log(`📡 Google OAuth 本地回调监听常驻在端口 ${this.fixedPort}`);
+      this.server.listen({ port: this.fixedPort, host: '::', ipv6Only: false }, () => {
+        console.log(`📡 Google OAuth 本地回调监听常驻在端口 ${this.fixedPort}（双栈）`);
       });
-    } catch (e) {}
+    } catch (e) { listenV4(); }
+  }
+
+  /**
+   * 回调立即返回一个“处理中”页面，换票在后台进行，页面轮询 /oauth-result 显示结果。
+   * 避免手机浏览器在 Google 页面上一直转圈。返回 true 表示已处理。
+   */
+  handleHttp(reqUrl, res) {
+    if (reqUrl.pathname === '/oauth-callback') {
+      const code = reqUrl.searchParams.get('code');
+      const err = reqUrl.searchParams.get('error');
+      const id = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      this.pendingResults = this.pendingResults || new Map();
+      const entry = { done: false, status: 0, html: '' };
+      this.pendingResults.set(id, entry);
+      setTimeout(() => this.pendingResults.delete(id), 10 * 60 * 1000).unref?.();
+      const redirectUri = `http://localhost:${this.fixedPort}/oauth-callback`;
+      (err ? Promise.resolve({ status: 400, html: `<h2 style="color:#ef4444">⚠ 授权被取消：${String(err).replace(/[<>&]/g, '')}</h2>` })
+           : this.processCallbackCode(code, redirectUri))
+        .then(r => Object.assign(entry, { done: true, status: r.status, html: r.html }))
+        .catch(e => Object.assign(entry, { done: true, status: 500, html: `<h2 style="color:#ef4444">⚠ ${String(e.message).replace(/[<>&]/g, '')}</h2>` }));
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Connection': 'close' });
+      res.end(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>正在完成授权…</title><style>body{background:#0b1120;color:#fff;font-family:-apple-system,sans-serif;text-align:center;padding:60px 16px;margin:0}
+.sp{width:36px;height:36px;border:4px solid #334155;border-top-color:#38bdf8;border-radius:50%;margin:0 auto 18px;animation:r 1s linear infinite}@keyframes r{to{transform:rotate(360deg)}}p{color:#94a3b8}</style></head>
+<body><div id="w"><div class="sp"></div><h3>已收到 Google 授权</h3><p id="t">正在换取令牌，通常几秒钟…</p></div>
+<script>var n=0;function poll(){fetch('/oauth-result?id=${id}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+if(d.done){document.open();document.write(d.html);document.close();return}
+if(++n>40){document.getElementById('t').textContent='还在处理，可以先回到 App 看账号是否已加上';}setTimeout(poll,1000)}).catch(function(){setTimeout(poll,1500)})}poll();</script></body></html>`);
+      return true;
+    }
+    if (reqUrl.pathname === '/oauth-result') {
+      const e = this.pendingResults && this.pendingResults.get(reqUrl.searchParams.get('id') || '');
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(e ? { done: e.done, status: e.status, html: e.done ? e.html : '' } : { done: true, status: 404, html: '<h3>结果已过期，请回到 App 查看账号</h3>' }));
+      return true;
+    }
+    return false;
   }
 
   async processCallbackCode(code, redirectUri) {
@@ -184,6 +226,9 @@ export class OAuthFlowManager {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
+      signal: AbortSignal.timeout(20000),
+    }).catch(e => {
+      throw new Error(e.name === 'TimeoutError' ? '连接 Google 超时（20 秒），请检查手机代理是否对本应用生效' : `连接 Google 失败：${e.message}`);
     });
 
     if (!res.ok) {
@@ -199,6 +244,7 @@ export class OAuthFlowManager {
     try {
       const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { 'Authorization': `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15000),
       });
       if (userRes.ok) {
         const u = await userRes.json();

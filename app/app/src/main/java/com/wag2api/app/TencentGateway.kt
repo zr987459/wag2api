@@ -262,6 +262,7 @@ object TencentGateway {
         val sbReasoning = StringBuilder()
         var lastChunkPromptTokens = 20
         var lastChunkCompTokens = 20
+        var lastUsage: JSONObject? = null
         var upstreamError: String? = null
         val toolCallsMap = HashMap<Int, JSONObject>()
 
@@ -314,6 +315,7 @@ object TencentGateway {
                     }
                     val usage = chunk.optJSONObject("usage")
                     if (usage != null) {
+                        lastUsage = usage
                         lastChunkPromptTokens = usage.optInt("prompt_tokens", lastChunkPromptTokens)
                         lastChunkCompTokens = usage.optInt("completion_tokens", lastChunkCompTokens)
                     }
@@ -357,6 +359,8 @@ object TencentGateway {
             }
             put("prompt_tokens", lastChunkPromptTokens)
             put("completion_tokens", maxOf(lastChunkCompTokens, (text.length + sbReasoning.length) / 2))
+            // 上游原始 usage（含 cached / reasoning 明细），供统计使用
+            lastUsage?.let { put("usage", it) }
         }
     }
 
