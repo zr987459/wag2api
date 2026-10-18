@@ -49,14 +49,6 @@ const persist = new Persist(DATA_DIR);
 await persist.restore();
 statsTracker.load();
 persist.startStatsSync(() => statsTracker.flush());
-if (persist.enabled) {
-  process.removeAllListeners('SIGTERM');
-  process.once('SIGTERM', async () => {
-    statsTracker.flush();
-    await Promise.race([persist.syncStats(), new Promise(r => setTimeout(r, 8000))]);
-    process.exit(0);
-  });
-}
 
 // 账号池
 const accountPool = new AccountPool(path.join(DATA_DIR, 'accounts'));
@@ -112,6 +104,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  // ── 内部引擎令牌校验 ────────────────────────────────────────
+  // 仅当宿主以 ENGINE_TOKEN 启动时启用（安卓前门模式）。
+  // 防止手机上其他 App 直接连内部端口绕过前门。
+  const ENGINE_TOKEN = process.env.ENGINE_TOKEN;
+  if (ENGINE_TOKEN) {
+    const given = req.headers['x-engine-token'];
+    if (given !== ENGINE_TOKEN) {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'engine token required' }));
+      return;
+    }
+  }
   {
     let p = url.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/';
     if (/(^|\/)messages$/.test(p) && !p.startsWith('/api/')) p = '/v1/messages';
@@ -575,6 +580,31 @@ if ((IS_BINARY || process.env.AUTO_KEY === '1') && !access.enabled && process.en
 }
 
 const HOST = process.env.HOST || '0.0.0.0';
+
+// 统一的优雅退出：宿主关闭引擎时先 drain 再 SIGTERM，Linux systemd 同样受益。
+// 必须在 server.close() 前 flush 统计，且不能有其它监听器提前 process.exit。
+let shuttingDown = false;
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.once(sig, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`收到 ${sig}，正在安全退出…`);
+    try { statsTracker.flush(); } catch (e) {}
+    try {
+      if (persist.enabled) {
+        await Promise.race([
+          persist.syncStats(),
+          new Promise(r => setTimeout(r, 8000)),
+        ]);
+      }
+    } catch (e) {}
+    // 强制 3 秒后退出，避免卡死的长连接拖住进程
+    const force = setTimeout(() => process.exit(0), 3000);
+    force.unref();
+    server.close(() => process.exit(0));
+  });
+}
+
 server.listen(PORT, HOST, () => {
   const lan = Object.values(os.networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
   console.log(`🚀 wag2api 已启动`);

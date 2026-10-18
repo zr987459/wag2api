@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>wag2api</title>
+  <link rel="stylesheet" href="style.css" />
+  <meta name="theme-color" content="#0b0f17" />
+</head>
+<body>
+
+  <!-- 顶部状态栏 -->
+  <header class="app-header">
+    <div class="brand-wrap">
+      <div class="brand-icon">◉</div>
+      <div>
+        <div class="brand-title">wag2api <span class="brand-badge">Dual</span></div>
+      </div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <div class="status-pill" id="headerStatus">
+        <span class="status-dot"></span>
+        <span id="headerStatusText">连接中...</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 1. 概览 Tab -->
+  <main id="view-overview" class="tab-content active">
+    <div class="metric-grid">
+      <div class="metric-card">
+        <div class="metric-label">可用账号</div>
+        <div class="metric-value" id="statAccounts">0 / 0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">今日请求</div>
+        <div class="metric-value" id="statTodayReq">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">今日 Token</div>
+        <div class="metric-value" id="statTodayTokens">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">活跃服务</div>
+        <div class="metric-value" id="statActiveKeys">0</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <span>双引擎状态</span>
+        <button class="btn btn-outline btn-sm" onclick="loadOverview()">刷新</button>
+      </div>
+      <div class="engine-row">
+        <div class="engine-item">
+          <div class="engine-name">WB 引擎</div>
+          <div class="engine-sub">腾讯 WorkBuddy</div>
+          <div class="engine-state on" id="engineWbState">● 就绪</div>
+        </div>
+        <div class="engine-item">
+          <div class="engine-name">AG 引擎</div>
+          <div class="engine-sub">Google Antigravity</div>
+          <div class="engine-state" id="engineAgState">● 未就绪</div>
+        </div>
+      </div>
+      <div style="font-size: 13px; color: var(--text-muted); line-height: 1.9; margin-top: 14px;">
+        <div>📡 统一入口：<span style="font-family: var(--font-mono); color: var(--text-main);">http://127.0.0.1:8800</span></div>
+        <div>🔐 API 接口：<span style="font-family: var(--font-mono); color: var(--accent);">/v1/messages · /v1/chat/completions</span></div>
+        <div>🎯 指定引擎：模型名加 <span style="font-family: var(--font-mono); color: var(--primary);">ag:</span> 或 <span style="font-family: var(--font-mono); color: var(--primary);">wb:</span> 前缀</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">AG 引擎（Antigravity）</div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+        关闭后 :node 进程会被回收，不再占用内存与电量。更改端口或配置需重启引擎。
+      </p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <span style="font-size: 14px;">启用 AG 引擎</span>
+        <label class="switch"><input type="checkbox" id="nodeEnabledToggle" onchange="toggleNodeEngine(this.checked)"><span class="slider"></span></label>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-outline" style="flex: 1;" onclick="openAgConsole()">AG 控制台</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="restartAgEngine()">重启引擎</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">快捷操作</div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+        移动端已全面精简国内碎包积分噪点，专注于纯净的账号纳管与大模型 API 转发。
+      </p>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-primary" style="flex: 1;" onclick="switchTab('accounts')">查看账号</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="switchTab('logs')">运行日志</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="switchTab('chat')">开始对话</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- 2. 账号 Tab -->
+  <main id="view-accounts" class="tab-content">
+    <div class="section-title">
+      <span>账号列表 (<span id="accountCount">0</span>)</span>
+      <div style="display: flex; gap: 6px;">
+        <button class="btn btn-outline btn-sm" onclick="openImportModal()">📥 导入</button>
+        <button class="btn btn-outline btn-sm" onclick="openExportModal()">📤 导出</button>
+        <button class="btn btn-primary btn-sm" onclick="openAuthModal()">+ 授权</button>
+      </div>
+    </div>
+    <div id="accountList">
+      <div style="text-align: center; padding: 40px; color: var(--text-dim);">加载账号中...</div>
+    </div>
+  </main>
+
+  <!-- 3. 密钥 Tab -->
+  <main id="view-keys" class="tab-content">
+    <div class="section-title">
+      <span>API 接入</span>
+    </div>
+
+    <div class="card" style="background: rgba(56, 189, 248, 0.05); border-color: rgba(56, 189, 248, 0.2); margin-bottom: 16px;">
+      <div style="font-size: 12px; color: var(--accent); font-weight: 600; margin-bottom: 4px;">第三方客户端配置地址 (Base URL)</div>
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+        <span id="baseUrlDisplay" style="font-family: var(--font-mono); font-size: 13px; color: var(--text-main);">http://127.0.0.1:8800/v1</span>
+        <button class="btn btn-outline btn-sm" onclick="copyBaseUrl()">复制</button>
+      </div>
+    </div>
+
+    <div id="keyList">
+      <div style="text-align: center; padding: 40px; color: var(--text-dim);">加载中...</div>
+    </div>
+  </main>
+
+  <!-- 4. 即时对话 Tab -->
+  <main id="view-chat" class="tab-content">
+    <div class="chat-container">
+      <div style="margin-bottom: 8px; display: flex; gap: 8px;">
+        <select id="chatModelSelect" class="input-field" style="margin-bottom: 0; flex: 1;">
+          <option value="global:deepseek-v4.1-flash-1017" selected>DeepSeek-V4.1-Flash-1017 [0.00x 限免免费 · 多模态+思考]</option>
+          <option value="global:deepseek-v4.1-flash">DeepSeek-V4.1-Flash [0.00x 限免免费]</option>
+          <option value="global:hy4-preview">Hy4-Preview [0.00x 限免免费 · 混元深度思考]</option>
+          <option value="global:hy3">Hy3 [0.00x 限免免费]</option>
+          <option value="global:gpt-6-astra">GPT-6-Astra [6.67x · 国际版专属顶级旗舰]</option>
+          <option value="global:gpt-5.6-sol">GPT-5.6-Sol [国际版专属]</option>
+          <option value="global:gpt-5.4">GPT-5.4 [国际版原生多模态]</option>
+          <option value="global:grok-4.7">Grok-4.7 [国际版专属]</option>
+          <option value="global:gemini-3.5-flash">Gemini-3.5-Flash [国际版原生多模态]</option>
+          <option value="global:glm-5.3-flash">GLM-5.3-Flash [极低消耗]</option>
+          <option value="global:glm-5.3">GLM-5.3 [最新旗舰]</option>
+          <option value="global:glm-5.2">GLM-5.2 [1M 长上下文]</option>
+          <option value="global:kimi-k3">Kimi-K3 [长文本深度推理]</option>
+          <option value="global:kimi-k2.8-preview">Kimi-K2.8-Preview [深度推理]</option>
+          <option value="global:claude-3.7-sonnet">Claude-3.7-Sonnet (default-1.1)</option>
+          <option value="global:claude-4.0-sonnet">Claude-4.0-Sonnet (default-1.2)</option>
+          <option value="global:auto">Auto [自动智能调度]</option>
+        </select>
+        <button class="btn btn-outline btn-sm" onclick="clearChat()" style="min-height: 42px; white-space: nowrap;">🧹 新对话</button>
+      </div>
+
+      <div class="chat-messages" id="chatMessages">
+        <div class="chat-bubble assistant">
+          您好！已连接至 WorkBuddy Mobile 本地引擎。输入消息即可直接验证模型输出与思维链。
+        </div>
+      </div>
+
+      <div class="chat-input-bar">
+        <input type="text" id="chatInput" class="chat-input" placeholder="输入对话内容..." onkeydown="if(event.key==='Enter')sendMessage()" />
+        <button class="btn btn-primary btn-sm" onclick="sendMessage()" id="sendBtn">发送</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- 5. 运行日志 Tab -->
+  <main id="view-logs" class="tab-content">
+    <div class="section-title">
+      <span>网关请求日志 (<span id="logCount">0</span>)</span>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-outline btn-sm" onclick="clearLogs()">清空</button>
+        <button class="btn btn-primary btn-sm" onclick="loadLogs()">刷新</button>
+      </div>
+    </div>
+
+    <div class="card" style="background: rgba(16, 185, 129, 0.05); border-color: rgba(16, 185, 129, 0.2); margin-bottom: 12px; padding: 12px 14px;">
+      <div style="font-size: 12px; color: var(--text-muted); display: flex; justify-content: space-between;">
+        <span>今日累计请求: <b id="logSummaryReq" style="color: var(--primary);">0</b> 次</span>
+        <span>今日 Token: <b id="logSummaryTokens" style="color: var(--accent);">0</b></span>
+      </div>
+    </div>
+
+    <div id="logList">
+      <div style="text-align: center; padding: 40px; color: var(--text-dim);">暂无日志记录</div>
+    </div>
+  </main>
+
+  <!-- 浮动胶囊底栏 -->
+  <nav class="bottom-nav">
+    <div class="nav-item active" data-tab="overview" onclick="switchTab('overview')">
+      <div class="nav-icon">📊</div>
+      <div>概览</div>
+    </div>
+    <div class="nav-item" data-tab="accounts" onclick="switchTab('accounts')">
+      <div class="nav-icon">👤</div>
+      <div>账号</div>
+    </div>
+    <div class="nav-item" data-tab="keys" onclick="switchTab('keys')">
+      <div class="nav-icon">🔑</div>
+      <div>接入</div>
+    </div>
+    <div class="nav-item" data-tab="chat" onclick="switchTab('chat')">
+      <div class="nav-icon">💬</div>
+      <div>对话</div>
+    </div>
+    <div class="nav-item" data-tab="logs" onclick="switchTab('logs')">
+      <div class="nav-icon">📜</div>
+      <div>日志</div>
+    </div>
+  </nav>
+
+  <!-- 授权弹窗 -->
+  <div class="modal-overlay" id="authModal">
+    <div class="modal-sheet">
+      <div class="sheet-handle"></div>
+      <div class="section-title">授权添加账号</div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 14px;">
+        国际版一键授权：系统将生成官方授权链接，点击后在手机浏览器中确认登录，App 将自动完成入库。
+      </p>
+
+      <div id="authResultArea" style="display: none; margin-bottom: 14px;">
+        <div style="font-size: 12px; color: var(--accent); margin-bottom: 6px;">官方授权链接已就绪：</div>
+        <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+          <input type="text" id="authUrlInput" readonly class="input-field" style="margin-bottom: 0; font-family: var(--font-mono); font-size: 12px; flex: 1; background: rgba(0,0,0,0.4);" />
+          <button type="button" class="btn btn-outline" onclick="copyAuthUrl()" id="copyAuthUrlBtn" style="white-space: nowrap; flex-shrink: 0;">📋 复制链接</button>
+        </div>
+        <a id="authLinkBtn" href="#" target="_blank" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 6px;">👉 直接跳到浏览器打开</a>
+      </div>
+
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-primary" style="flex: 1;" id="startAuthBtn" onclick="requestAuthLink()">获取授权链接</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('authModal')">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 导入弹窗 -->
+  <div class="modal-overlay" id="importModal">
+    <div class="modal-sheet">
+      <div class="sheet-handle"></div>
+      <div class="section-title">导入账号凭据</div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px;">
+        支持直接粘贴 AccessToken（以 eyJ 开头）、CookieBox 提取结果或整段备份 JSON。
+      </p>
+      <textarea id="importInput" class="input-field" rows="6" style="width: 100%; font-family: var(--font-mono); font-size: 12px; margin-bottom: 12px; resize: vertical;" placeholder="请粘贴 JWT (eyJ...) 或导出的账号 JSON 文本..."></textarea>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-primary" style="flex: 1;" onclick="submitImport()">确认导入</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('importModal')">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 导出弹窗 -->
+  <div class="modal-overlay" id="exportModal">
+    <div class="modal-sheet">
+      <div class="sheet-handle"></div>
+      <div class="section-title">导出账号凭据</div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px;">
+        包含当前池中全部账号与完整 Token 备份。请妥善保管防泄露。
+      </p>
+      <textarea id="exportOutput" readonly class="input-field" rows="8" style="width: 100%; font-family: var(--font-mono); font-size: 11px; margin-bottom: 12px; background: rgba(0,0,0,0.4); resize: vertical;"></textarea>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-primary" style="flex: 1;" onclick="copyExportJson()">📋 复制全部</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('exportModal')">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

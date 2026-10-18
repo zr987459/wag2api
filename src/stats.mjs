@@ -154,9 +154,8 @@ export class StatsTracker {
 
   installExitHooks() {
     process.on('exit', () => this.flush());
-    for (const sig of ['SIGTERM', 'SIGINT']) {
-      process.once(sig, () => { this.flush(); process.exit(0); });
-    }
+    // SIGTERM / SIGINT 的集中处理在 server.mjs 里，这里不再抢注册，
+    // 否则 process.exit(0) 会提前杀掉进程，server.close() 来不及 drain。
   }
 
   getUserBucket(email) {

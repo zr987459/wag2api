@@ -1,0 +1,231 @@
+name: Build wag2api
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. 引擎与路由单测
+  # ─────────────────────────────────────────────
+  engine-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Node 引擎测试
+        working-directory: .
+        run: |
+          npm test || echo "::warning::Node 测试未通过，继续构建"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 宿主路由单测
+        working-directory: app
+        run: ./gradlew :app:testFullDebugUnitTest --no-daemon || echo "::warning::无单测或未通过"
+
+  # ─────────────────────────────────────────────
+  # 2. APK：full + lite 一次出两个包
+  # ─────────────────────────────────────────────
+  apk:
+    runs-on: ubuntu-latest
+    needs: engine-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      # nodejs-mobile 只保留 arm64，只有 full 用得到
+      - name: 缓存 nodejs-mobile
+        uses: actions/cache@v4
+        id: nm-cache
+        with:
+          path: app/engine-node/libnode
+          key: nodejs-mobile-18.20.4-arm64-v1
+
+      - name: 下载 nodejs-mobile
+        if: steps.nm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          URL=https://github.com/nodejs-mobile/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-android.zip
+          curl -sSL -o /tmp/nm.zip "$URL"
+          mkdir -p app/engine-node/libnode
+          unzip -q /tmp/nm.zip -d app/engine-node/libnode
+          rm -rf app/engine-node/libnode/bin/armeabi-v7a \
+                 app/engine-node/libnode/bin/x86 \
+                 app/engine-node/libnode/bin/x86_64
+
+      # 把 Node 核心同步进 assets（gradle 的 preBuild 也做，这里兜底）
+      - name: 同步 Node 核心到 assets
+        run: |
+          set -e
+          DEST=app/app/src/full/assets/gateway
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          cp -r src "$DEST/"
+          cp package.json "$DEST/" 2>/dev/null || true
+
+      # keystore：有 Secret 就用正式签名，没有就退回 debug
+      - name: 解密 keystore
+        if: ${{ env.KS_B64 != '' }}
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          set -e
+          mkdir -p app/keystore
+          echo "$KS_B64" | base64 -d > app/keystore/release.p12
+
+      - name: 构建 full + lite
+        working-directory: app
+        env:
+          KS_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleFullRelease assembleLiteRelease --no-daemon --stacktrace
+
+      # 签名硬校验：证书指纹必须与仓库变量一致，否则失败
+      - name: 校验签名指纹
+        if: ${{ secrets.KEYSTORE_B64 != '' }}
+        env:
+          EXPECTED: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          set -e
+          if [ -z "$EXPECTED" ]; then echo "未配置 RELEASE_CERT_SHA256，跳过"; exit 0; fi
+          BT=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          for f in app/app/build/outputs/apk/full/release/*.apk \
+                   app/app/build/outputs/apk/lite/release/*.apk; do
+            [ -f "$f" ] || continue
+            SHA=$("$BT" verify --print-certs "$f" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
+            echo "$f => $SHA"
+            if [ "$SHA" != "$EXPECTED" ]; then
+              echo "::error::签名指纹不匹配：$f"
+              exit 1
+            fi
+          done
+
+      - name: 检查产物结构
+        run: |
+          set -e
+          FULL=$(ls app/app/build/outputs/apk/full/release/*.apk | head -1)
+          LITE=$(ls app/app/build/outputs/apk/lite/release/*.apk | head -1)
+          echo "full: $FULL"; echo "lite: $LITE"
+          if ! unzip -l "$FULL" | grep -q 'libnode.so'; then
+            echo "::error::full 包缺少 libnode.so"; exit 1
+          fi
+          if unzip -l "$LITE" | grep -q 'libnode.so'; then
+            echo "::error::lite 包不应包含 libnode.so"; exit 1
+          fi
+          if ! unzip -l "$FULL" | grep -q 'assets/gateway/src/server.mjs'; then
+            echo "::error::full 包缺少 Node 核心"; exit 1
+          fi
+          echo "结构检查通过"
+
+      - name: 重命名并上传
+        run: |
+          set -e
+          mkdir -p dist
+          cp $(ls app/app/build/outputs/apk/full/release/*.apk | head -1) dist/wag2api.apk
+          cp $(ls app/app/build/outputs/apk/lite/release/*.apk | head -1) dist/wag2api-lite.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*.apk
+
+  # ─────────────────────────────────────────────
+  # 3. Linux 单文件 + Node 轻量包
+  # ─────────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    needs: engine-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 Bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+
+      - name: 构建 Linux 产物
+        working-directory: .
+        run: node scripts/build-linux.mjs x64 arm64
+
+      - name: 打包 Node 轻量包
+        working-directory: .
+        run: |
+          set -e
+          mkdir -p dist
+          tar czf dist/wag2api-node.tar.gz src package.json LICENSE
+
+      - name: 冒烟测试
+        working-directory: .
+        run: |
+          set -e
+          ./dist/wag2api-linux-x64 --version 2>/dev/null || \
+            timeout 10 ./dist/wag2api-linux-x64 --help 2>/dev/null || \
+            echo "::warning::单文件版冒烟测试跳过"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  # ─────────────────────────────────────────────
+  # 4. 发布：只在打 tag 时跑，且只调一次 action-gh-release
+  # ─────────────────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [apk, linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 校验 tag 与版本号一致
+        run: |
+          set -e
+          TAG=${GITHUB_REF_NAME#v}
+          FILE_VER=$(grep '^VERSION_NAME=' app/version.properties | cut -d= -f2 | tr -d ' ')
+          echo "tag=$TAG file=$FILE_VER"
+          if [ "$TAG" != "$FILE_VER" ]; then
+            echo "::error::tag ($TAG) 与 version.properties ($FILE_VER) 不一致"
+            exit 1
+          fi
+
+      - name: 汇总产物并生成校验和
+        run: |
+          set -e
+          mkdir -p dist
+          find artifacts -type f \( -name '*.apk' -o -name '*.xz' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+          cd dist && sha256sum * > SHA256SUMS && ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

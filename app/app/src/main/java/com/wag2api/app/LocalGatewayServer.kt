@@ -1,0 +1,592 @@
+package com.wag2api.app
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.*
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.UUID
+import kotlin.concurrent.thread
+
+class LocalGatewayServer(
+    private val context: Context,
+    private val port: Int = 8800,
+    private val engine: com.wag2api.app.engine.NodeEngineApi,
+    private val onBusy: () -> Unit = {},
+    private val onIdle: () -> Unit = {}
+) {
+
+    private var serverSocket: ServerSocket? = null
+    @Volatile private var isRunning = false
+
+    fun start() {
+        if (isRunning) return
+        isRunning = true
+        thread(name = "LocalGatewayServer") {
+            try {
+                serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
+                while (isRunning) {
+                    val client = serverSocket?.accept() ?: break
+                    client.tcpNoDelay = true // 减少小包网络延迟
+                    client.soTimeout = 120000 // 120 秒空闲读超时，适应超长思考模型首字返回
+                    thread {
+                        onBusy()
+                        try {
+                            client.use { handleConnection(it) }
+                        } finally {
+                            onIdle()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // server closed
+            }
+        }
+    }
+
+    fun stop() {
+        isRunning = false
+        try {
+            serverSocket?.close()
+        } catch (ignored: Exception) {}
+    }
+
+    private fun readHeaderBlock(input: InputStream, max: Int = 64 * 1024): ByteArray? {
+        val buf = ByteArrayOutputStream(512)
+        var lineLen = 0
+        while (true) {
+            val b = input.read()
+            if (b == -1) return if (buf.size() == 0) null else throw EOFException("headers truncated")
+            if (buf.size() >= max) throw IOException("request header too large")
+            buf.write(b)
+            when (b) {
+                '\n'.code -> {
+                    if (lineLen == 0) return buf.toByteArray() // 遇到空行即头部结束
+                    lineLen = 0
+                }
+                '\r'.code -> {}
+                else -> lineLen++
+            }
+        }
+    }
+
+    private fun readRequestBody(input: InputStream, contentLength: Int): String {
+        if (contentLength <= 0) return ""
+        val buf = ByteArray(contentLength)
+        var off = 0
+        while (off < contentLength) {
+            val n = input.read(buf, off, contentLength - off)
+            if (n < 0) throw EOFException("client closed: got $off / $contentLength bytes")
+            off += n
+        }
+        return String(buf, Charsets.UTF_8)
+    }
+
+    private fun handleConnection(client: Socket) {
+        try {
+            // 全连接统一使用一个 BufferedInputStream，严防 Reader 预读吃掉 Body 字节
+            val input = BufferedInputStream(client.getInputStream())
+            val output = client.getOutputStream()
+
+            val rawHead = readHeaderBlock(input) ?: return client.close()
+            val headLines = String(rawHead, Charsets.ISO_8859_1).split('\n')
+                .map { it.removeSuffix("\r") }.filter { it.isNotEmpty() }
+            if (headLines.isEmpty()) return client.close()
+
+            val parts = headLines[0].split(' ')
+            if (parts.size < 2) return client.close()
+
+            val method = parts[0].uppercase()
+            val fullPath = parts[1]
+            val path = fullPath.substringBefore("?")
+            val query = fullPath.substringAfter("?", "")
+
+            // 解析 Headers (小写标准化)
+            val headers = HashMap<String, String>()
+            for (l in headLines.drop(1)) {
+                val i = l.indexOf(':')
+                if (i <= 0) continue
+                val k = l.substring(0, i).trim().lowercase()
+                val v = l.substring(i + 1).trim()
+                headers[k] = headers[k]?.let { "$it, $v" } ?: v
+            }
+
+            // 处理 OPTIONS 预检请求
+            if (method == "OPTIONS") {
+                val preflight = "HTTP/1.1 204 No Content\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n" +
+                        "Access-Control-Allow-Headers: *\r\n" +
+                        "Connection: close\r\n\r\n"
+                output.write(preflight.toByteArray(Charsets.US_ASCII))
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 读取 Body：使用精确字节数读取，彻底根除多字节中文卡死挂起
+            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+            val body = readRequestBody(input, contentLength)
+
+            // ── 前门分流：先问 EngineRouter 这条请求归谁 ──────────────
+            val decision = EngineRouter.decide(context, engine, path, body)
+            when (val d = decision) {
+                is EngineRouter.Route.Reject -> {
+                    sendJsonResponse(output, d.status, d.payload)
+                    output.flush()
+                    client.close()
+                    return
+                }
+                is EngineRouter.Route.ToNode -> {
+                    EngineRouter.proxyToNode(
+                        engine = engine,
+                        token = EngineTokenHolder.token,
+                        method = method,
+                        path = d.path,
+                        query = query,
+                        headers = headers,
+                        body = body,
+                        out = output
+                    )
+                    output.flush()
+                    client.close()
+                    return
+                }
+                is EngineRouter.Route.ToWorkBuddy -> {
+                    // wb: 前缀在 WB 分支里剥掉
+                    val wbBody = if (d.stripPrefix != null && body.isNotEmpty()) {
+                        try {
+                            val j = JSONObject(body)
+                            val m = j.optString("model", "")
+                            if (m.startsWith(d.stripPrefix)) {
+                                j.put("model", m.removePrefix(d.stripPrefix))
+                            }
+                            j.toString()
+                        } catch (e: Exception) { body }
+                    } else body
+                    dispatchWorkBuddy(output, path, query, wbBody, headers)
+                    output.flush()
+                    client.close()
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            try { client.close() } catch (ignored: Exception) {}
+        }
+    }
+
+    /** 原 WB 路由表，保持不动 */
+    private fun dispatchWorkBuddy(
+        output: OutputStream,
+        path: String,
+        query: String,
+        body: String,
+        headers: Map<String, String>
+    ) {
+        when {
+            // 1. API: 状态概览
+            path == "/panel/api/overview" || path == "/m/api/overview" -> {
+                val accounts = AccountVault.getAccounts()
+                val healthy = (0 until accounts.length()).count {
+                    !accounts.getJSONObject(it).optBoolean("disabled", false)
+                }
+                val json = JSONObject().apply {
+                    put("healthy", healthy)
+                    put("total", accounts.length())
+                    put("accounts", accounts)
+                    put("today_requests", GatewayMetrics.getTodayRequests())
+                    put("today_tokens", GatewayMetrics.getTodayTokens())
+                    put("auth_required", false)
+                    put("version", "1.3.0-android")
+                }
+                sendJsonResponse(output, 200, json.toString())
+            }
+
+            // 1.1 API: 请求日志
+            path == "/panel/api/logs" || path == "/m/api/logs" -> {
+                val json = JSONObject().apply {
+                    put("ok", true)
+                    put("logs", GatewayMetrics.getLogsJson())
+                    put("today_requests", GatewayMetrics.getTodayRequests())
+                    put("today_tokens", GatewayMetrics.getTodayTokens())
+                }
+                sendJsonResponse(output, 200, json.toString())
+            }
+
+            // 1.2 API: 清空日志
+            path == "/panel/api/logs/clear" || path == "/m/api/logs/clear" -> {
+                GatewayMetrics.clearLogs()
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
+            }
+
+            // 1.3 API: 导出 Token
+            path == "/panel/api/tokens/export" || path == "/m/api/tokens/export" -> {
+                sendJsonResponse(output, 200, AccountVault.exportTokensJson())
+            }
+
+            // 1.4 API: 导入 Token (支持 JWT 或 JSON 格式)
+            path == "/panel/api/tokens/import" || path == "/m/api/tokens/import" -> {
+                val raw = try { JSONObject(body).optString("raw", body) } catch (e: Exception) { body }
+                val (success, msg) = AccountVault.importToken(raw)
+                val res = JSONObject().put("ok", success).put("msg", msg)
+                sendJsonResponse(output, 200, res.toString())
+            }
+
+            // 1.5 API: 删除账号
+            path == "/panel/api/accounts/delete" || path == "/m/api/accounts/delete" -> {
+                val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
+                val deleted = if (uid.isNotEmpty()) AccountVault.deleteAccount(uid) else false
+                sendJsonResponse(output, 200, JSONObject().put("ok", deleted).toString())
+            }
+
+            // 1.6 API: AG 引擎状态
+            path == "/panel/api/engine/state" || path == "/m/api/engine/state" -> {
+                val enabled = context.getSharedPreferences("wag2api_router", Context.MODE_PRIVATE)
+                    .getBoolean("node_enabled", true)
+                val json = JSONObject().apply {
+                    put("supported", com.wag2api.app.engine.EngineFactory.SUPPORTS_NODE)
+                    put("enabled", enabled)
+                    put("state", engine.state.name)
+                    put("port", engine.port)
+                    put("default_engine", EngineRouter.getDefaultEngine(context))
+                }
+                sendJsonResponse(output, 200, json.toString())
+            }
+
+            // 1.7 API: 开关 AG 引擎
+            path == "/panel/api/engine/toggle" || path == "/m/api/engine/toggle" -> {
+                val on = try { JSONObject(body).optBoolean("enabled", true) } catch (e: Exception) { true }
+                context.getSharedPreferences("wag2api_router", Context.MODE_PRIVATE)
+                    .edit().putBoolean("node_enabled", on).apply()
+                if (on) engine.start() else engine.stop()
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("enabled", on).toString())
+            }
+
+            // 1.8 API: 重启 AG 引擎
+            path == "/panel/api/engine/restart" || path == "/m/api/engine/restart" -> {
+                Thread {
+                    engine.stop()
+                    Thread.sleep(1500)
+                    engine.start()
+                }.start()
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
+            }
+
+            // 1.9 API: 切换默认引擎
+            path == "/panel/api/engine/default" || path == "/m/api/engine/default" -> {
+                val e = try { JSONObject(body).optString("engine", "wb") } catch (ex: Exception) { "wb" }
+                EngineRouter.setDefaultEngine(context, if (e == "ag") "ag" else "wb")
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("engine", e).toString())
+            }
+
+            // 2. API: 发起授权
+            path == "/panel/api/login/start" || path == "/m/api/auth/start" -> {
+                val realm = try { JSONObject(body).optString("realm", "global") } catch (e: Exception) { "global" }
+                val res = TencentGateway.startLogin(realm)
+                sendJsonResponse(output, 200, res.toString())
+            }
+
+            // 3. API: 轮询授权
+            path == "/panel/api/login/poll" || path == "/m/api/auth/poll" -> {
+                val state = query.split("&").find { it.startsWith("state=") }?.substringAfter("state=") ?: ""
+                val res = TencentGateway.pollLogin(java.net.URLDecoder.decode(state, "UTF-8"))
+                sendJsonResponse(output, 200, res.toString())
+            }
+
+            // 4. API: 合并后的模型清单（WB + AG，重名项额外提供 ag:/wb: 前缀版本）
+            path == "/v1/models" || path == "/v1/v1/models" -> {
+                sendJsonResponse(output, 200, EngineRouter.mergedModels(context).toString())
+            }
+
+            // 4.1 API: 仅 WB 的模型清单（旧版兼容）
+            path == "/panel/api/models/wb" || path == "/m/api/models/wb" -> {
+                val json = JSONObject().apply {
+                    put("object", "list")
+                    put("data", WbModels.list())
+                }
+                sendJsonResponse(output, 200, json.toString())
+            }
+
+            // 5. API: OpenAI 标准流式与非流式对话 (完整透传 tools、reasoning_content、多模态)
+            path == "/v1/chat/completions" || path == "/v1/v1/chat/completions" -> {
+                handleOpenAiChat(output, body, headers)
+            }
+
+            // 6. API: Anthropic Messages 协议全功能支持（双向映射 tools 与 thinking）
+            path == "/v1/messages" || path == "/v1/v1/messages" -> {
+                handleAnthropicMessages(output, body, headers)
+            }
+
+            // 7. 静态前端资源
+            else -> {
+                serveStaticAsset(output, path)
+            }
+        }
+    }
+
+    private fun sendJsonResponse(output: OutputStream, code: Int, jsonStr: String) {
+        val bytes = jsonStr.toByteArray(Charsets.UTF_8)
+        val header = "HTTP/1.1 $code OK\r\n" +
+                "Content-Type: application/json; charset=utf-8\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Connection: close\r\n\r\n"
+        output.write(header.toByteArray(Charsets.US_ASCII))
+        output.write(bytes)
+        output.flush()
+    }
+
+    private fun writeChunk(output: OutputStream, chunkStr: String) {
+        val bytes = chunkStr.toByteArray(Charsets.UTF_8)
+        val hex = Integer.toHexString(bytes.size)
+        output.write("$hex\r\n".toByteArray(Charsets.US_ASCII))
+        output.write(bytes)
+        output.write("\r\n".toByteArray(Charsets.US_ASCII))
+        output.flush()
+    }
+
+    private fun endChunked(output: OutputStream) {
+        output.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+        output.flush()
+    }
+
+    private fun errorPayload(e: Exception): Pair<Int, JSONObject> {
+        val (status, type) = when {
+            e is UpstreamException && e.code == 11128 -> 403 to "upstream_channel_rejected"
+            e is UpstreamException && e.status == 403 -> 403 to "upstream_forbidden"
+            e is UpstreamException -> 502 to "upstream_error"
+            else -> 500 to "gateway_error"
+        }
+        val err = JSONObject().put("message", e.message ?: type).put("type", type)
+        if (e is UpstreamException) err.put("code", e.code ?: e.status)
+        return status to JSONObject().put("type", "error").put("error", err)
+    }
+
+    private fun handleOpenAiChat(output: OutputStream, bodyStr: String, reqHeaders: Map<String, String>) {
+        val startTime = System.currentTimeMillis()
+        var model = "deepseek-v4.1-flash-1017"
+        try {
+            val json = JSONObject(bodyStr)
+            val isStream = json.optBoolean("stream", false)
+            model = json.optString("model", "deepseek-v4.1-flash-1017")
+            val convId = ConversationIds.resolve(reqHeaders, json)
+
+            if (!isStream) {
+                // 非流式响应：上游透传，完整包含 reasoning_content 与 tool_calls
+                try {
+                    val res = TencentGateway.chatSync(json, convId)
+                    val reply = res.optString("content")
+                    val reasoning = res.optString("reasoning_content")
+                    val toolCalls = res.optJSONArray("tool_calls")
+                    val promptTokens = res.optInt("prompt_tokens", 20)
+                    val compTokens = res.optInt("completion_tokens", 20)
+                    val totalTokens = promptTokens + compTokens
+
+                    val oaiResp = JSONObject().apply {
+                        put("id", "chatcmpl_${System.currentTimeMillis()}")
+                        put("object", "chat.completion")
+                        put("created", System.currentTimeMillis() / 1000)
+                        put("model", model)
+                        put("choices", JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("index", 0)
+                                put("message", JSONObject().apply {
+                                    put("role", "assistant")
+                                    put("content", reply)
+                                    if (reasoning.isNotEmpty()) {
+                                        put("reasoning_content", reasoning)
+                                    }
+                                    if (toolCalls != null) {
+                                        put("tool_calls", toolCalls)
+                                    }
+                                })
+                                put("finish_reason", if (toolCalls != null) "tool_calls" else "stop")
+                            })
+                        })
+                        put("usage", JSONObject().apply {
+                            put("prompt_tokens", promptTokens)
+                            put("completion_tokens", compTokens)
+                            put("total_tokens", totalTokens)
+                        })
+                    }
+                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "sync", 200, totalTokens, System.currentTimeMillis() - startTime)
+                    sendJsonResponse(output, 200, oaiResp.toString())
+                } catch (e: Exception) {
+                    val (st, body) = errorPayload(e)
+                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "sync", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    sendJsonResponse(output, st, body.toString())
+                }
+            } else {
+                // 流式 Chunked 传输：按字节原样转发 SSE 帧，上游 reasoning_content 与 tool_calls 天然完整送达
+                val sseHeader = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream; charset=utf-8\r\n" +
+                        "Cache-Control: no-cache, no-transform\r\n" +
+                        "X-Accel-Buffering: no\r\n" +
+                        "Transfer-Encoding: chunked\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Connection: keep-alive\r\n\r\n"
+                output.write(sseHeader.toByteArray(Charsets.US_ASCII))
+                output.flush()
+
+                var streamTokens = 0
+                try {
+                    TencentGateway.streamChat(json, convId) { line ->
+                        try {
+                            if (line.startsWith("data: ")) {
+                                val s = line.substring(6).trim()
+                                if (s.startsWith("{") && s != "[DONE]") {
+                                    val u = JSONObject(s).optJSONObject("usage")
+                                    if (u != null) {
+                                        streamTokens = u.optInt("total_tokens", streamTokens)
+                                    }
+                                }
+                            }
+                            writeChunk(output, line)
+                            true
+                        } catch (e: Exception) {
+                            false
+                        }
+                    }
+                    if (streamTokens == 0) streamTokens = 30 // 默认合理预估
+                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", 200, streamTokens, System.currentTimeMillis() - startTime)
+                } catch (e: Exception) {
+                    val (st, payload) = errorPayload(e)
+                    GatewayMetrics.record("POST", "/v1/chat/completions", model, "stream", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    writeChunk(output, "data: $payload\n\n")
+                    writeChunk(output, "data: [DONE]\n\n")
+                } finally {
+                    endChunked(output)
+                }
+            }
+        } catch (e: Exception) {
+            val (st, body) = errorPayload(e)
+            GatewayMetrics.record("POST", "/v1/chat/completions", model, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
+            sendJsonResponse(output, st, body.toString())
+        }
+    }
+
+    private fun handleAnthropicMessages(output: OutputStream, bodyStr: String, reqHeaders: Map<String, String>) {
+        val startTime = System.currentTimeMillis()
+        var modelRaw = "deepseek-v4.1-flash-1017"
+        try {
+            val json = JSONObject(bodyStr)
+            val isStream = json.optBoolean("stream", false)
+            modelRaw = json.optString("model", "deepseek-v4.1-flash-1017")
+
+            // 采用 Hark 工业级转换器：完美解决 tool_use / tool_result 配对、图片、多轮会话锚点
+            val convId = ConversationIds.resolve(reqHeaders, json)
+            val oaiReq = AnthropicToOpenAI.convertRequest(json)
+
+            if (!isStream) {
+                // 1. 非流式响应
+                try {
+                    val oaiResp = TencentGateway.chatSync(oaiReq, convId)
+                    val anthropicResp = AnthropicToOpenAI.convertResponse(oaiResp, modelRaw)
+                    val u = oaiResp.optJSONObject("usage")
+                    val totalTokens = (u?.optInt("prompt_tokens", 20) ?: 20) + (u?.optInt("completion_tokens", 20) ?: 20)
+                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", 200, totalTokens, System.currentTimeMillis() - startTime)
+                    sendJsonResponse(output, 200, anthropicResp.toString())
+                } catch (e: Exception) {
+                    val (st, body) = errorPayload(e)
+                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "sync", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    sendJsonResponse(output, st, body.toString())
+                }
+            } else {
+                // 2. 流式响应 (支持 thinking 与 tool_use 事件)
+                val sseHeader = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream; charset=utf-8\r\n" +
+                        "Cache-Control: no-cache, no-transform\r\n" +
+                        "X-Accel-Buffering: no\r\n" +
+                        "Transfer-Encoding: chunked\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Connection: keep-alive\r\n\r\n"
+                output.write(sseHeader.toByteArray(Charsets.US_ASCII))
+                output.flush()
+
+                val translator = AnthropicStreamTranslator(modelRaw) { event, data ->
+                    writeChunk(output, "event: $event\ndata: $data\n\n")
+                }
+
+                var streamTokens = 0
+                try {
+                    TencentGateway.streamChat(oaiReq, convId) { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
+                            try {
+                                val chunk = JSONObject(trimmed.substring(6))
+                                val u = chunk.optJSONObject("usage")
+                                if (u != null) {
+                                    streamTokens = u.optInt("total_tokens", streamTokens)
+                                }
+                                translator.onChunk(chunk)
+                            } catch (ignored: Exception) {}
+                        }
+                        true
+                    }
+                    translator.finish()
+                    if (streamTokens == 0) streamTokens = 35
+                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", 200, streamTokens, System.currentTimeMillis() - startTime)
+                } catch (e: Exception) {
+                    val (st, body) = errorPayload(e)
+                    GatewayMetrics.record("POST", "/v1/messages", modelRaw, "stream", st, 0, System.currentTimeMillis() - startTime, e.message)
+                    try {
+                        translator.abort(body)
+                    } catch (ignored: Exception) {}
+                } finally {
+                    endChunked(output)
+                }
+            }
+        } catch (e: Exception) {
+            val (st, body) = errorPayload(e)
+            GatewayMetrics.record("POST", "/v1/messages", modelRaw, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
+            sendJsonResponse(output, st, body.toString())
+        }
+    }
+
+    private fun sendErrorJson(output: OutputStream, code: Int, msg: String) {
+        val json = JSONObject().apply { put("error", JSONObject().apply { put("message", msg) }) }
+        val bytes = json.toString().toByteArray(Charsets.UTF_8)
+        val header = "HTTP/1.1 $code Error\r\n" +
+                "Content-Type: application/json; charset=utf-8\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Connection: close\r\n\r\n"
+        output.write(header.toByteArray(Charsets.US_ASCII))
+        output.write(bytes)
+        output.flush()
+    }
+
+    private fun serveStaticAsset(output: OutputStream, path: String) {
+        val cleanPath = when {
+            path == "/" || path.isEmpty() || path == "/index.html" -> "web/index.html"
+            path.startsWith("/m/") -> "web/" + path.removePrefix("/m/")
+            path == "/m" -> "web/index.html"
+            else -> "web/" + path.removePrefix("/")
+        }
+
+        val mime = when {
+            cleanPath.endsWith(".html") -> "text/html; charset=utf-8"
+            cleanPath.endsWith(".css") -> "text/css; charset=utf-8"
+            cleanPath.endsWith(".js") -> "application/javascript; charset=utf-8"
+            cleanPath.endsWith(".json") -> "application/json; charset=utf-8"
+            else -> "application/octet-stream"
+        }
+
+        val bytes = try {
+            context.assets.open(cleanPath).use { it.readBytes() }
+        } catch (e: Exception) {
+            context.assets.open("web/index.html").use { it.readBytes() }
+        }
+
+        val header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: $mime\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Connection: close\r\n\r\n"
+        output.write(header.toByteArray(Charsets.US_ASCII))
+        output.write(bytes)
+        output.flush()
+    }
+}

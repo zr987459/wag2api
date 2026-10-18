@@ -1,14 +1,22 @@
+# Node
 node_modules/
-data/
-*.log
-*.p12
-*.jks
-*.keystore
-!android/keystore/release.p12.enc
-.env
 dist/
-android/app/libnode/
-android/app/src/main/assets/gateway/
-android/.gradle/
-android/app/build/
-build/
+
+# Android
+app/.gradle/
+app/build/
+app/app/build/
+app/engine-node/build/
+app/local.properties
+app/.idea/
+*.iml
+app/engine-node/libnode/
+
+# keystore（CI 从 Secret 解密，不进仓库）
+app/keystore/
+!app/keystore/.gitkeep
+
+# 系统
+.DS_Store
+*.log
+data/
