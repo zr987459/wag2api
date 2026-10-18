@@ -25,6 +25,18 @@ object AccountVault {
         val result = JSONArray()
         val seenUids = mutableSetOf<String>()
 
+        // SharedPreferences 里保存着账号的运行状态（禁用、最近使用、请求数…），
+        // auths/ 文件只存凭证；读文件账号时要把这些状态叠回去，否则「禁用」永远不生效
+        val prefState = HashMap<String, JSONObject>()
+        try {
+            val arr = JSONArray(prefs.getString(KEY_ACCOUNTS, "[]") ?: "[]")
+            for (i in 0 until arr.length()) {
+                val a = arr.optJSONObject(i) ?: continue
+                val u = a.optString("uid")
+                if (u.isNotEmpty()) prefState[u] = a
+            }
+        } catch (ignored: Exception) {}
+
         // 1. 优先扫描本地 auths/ 目录下的官方与网关落盘凭证文件
         val authsDir = File(appContext.filesDir, "auths")
         if (authsDir.exists() && authsDir.isDirectory) {
@@ -57,6 +69,11 @@ object AccountVault {
                                     put("request_count", 0)
                                     put("total_tokens", 0)
                                 })
+                                prefState[uid]?.let { st ->
+                                    for (k in listOf("disabled", "last_used", "token_usage", "credits", "in_pool")) {
+                                        if (st.has(k)) put(k, st.get(k))
+                                    }
+                                }
                             })
                         }
                     } catch (ignored: Exception) {}

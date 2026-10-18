@@ -376,6 +376,17 @@ object TencentGateway {
         payload: JSONObject,
         convId: String? = null,
         onLine: (String) -> Boolean
+    ) = streamChatImpl(payload, convId, allowFinalBackoff = true, onLine = onLine)
+
+    /**
+     * @param allowFinalBackoff 只有最外层调用做「全部繁忙」退避；退避轮内的重试传 false，
+     *        否则持续限流时会层层递归、永不结束
+     */
+    private fun streamChatImpl(
+        payload: JSONObject,
+        convId: String?,
+        allowFinalBackoff: Boolean,
+        onLine: (String) -> Boolean
     ) {
         val modelRaw = payload.optString("model", "deepseek-v4.1-flash-1017")
         val modelLower = modelRaw.lowercase()
@@ -659,6 +670,11 @@ object TencentGateway {
 
         // 已经吐字了就不再退避重试，直接结束
         if (emittedAny) return
+        // 退避轮内部的调用不再嵌套退避，直接把错误交给外层
+        if (!allowFinalBackoff) {
+            lastErr?.let { throw it }
+            return
+        }
 
         // 所有账号都被限流：最后再做一轮退避重试
         for (round in 1..FINAL_BACKOFF_ROUNDS) {
@@ -667,11 +683,17 @@ object TencentGateway {
                 ?: break
             Log.i(TAG, "全部账号繁忙，退避第 $round 轮重试")
             Thread.sleep(RETRY_BACKOFF_MS * round)
+            var innerEmitted = false
             try {
                 AccountScheduler.clearAllCooldowns()
-                streamChat(payload, convId, onLine)
+                streamChatImpl(payload, convId, allowFinalBackoff = false) { l ->
+                    innerEmitted = true
+                    onLine(l)
+                }
                 return
             } catch (e: Exception) {
+                // 这一轮已经向客户端吐过字：不能再重试，否则重复输出
+                if (innerEmitted) throw e
                 lastErr = e
             }
         }

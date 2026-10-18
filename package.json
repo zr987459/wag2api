@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node tests/test-converter.mjs && node tests/test-usage.mjs && node tests/test-engine-router.mjs && node tests/test-ag-import.mjs"
+    "test": "node tests/test-converter.mjs && node tests/test-usage.mjs && node tests/test-engine-router.mjs && node tests/test-ag-import.mjs && node tests/test-wb.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

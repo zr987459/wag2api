@@ -63,6 +63,25 @@ xz -d wag2api-linux-x64.xz && chmod +x wag2api-linux-x64
 ./wag2api-linux-x64          # 数据保存在 ~/.wag2api
 ```
 
+Linux / 源码版（`node src/server.mjs`）同样是 **WB + AG 双引擎**，界面、`/panel/api/*` 接口与分流规则和安卓一致：
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `PORT` / `HOST` | 监听端口与地址（默认 8790 / 0.0.0.0） |
+| `ADMIN_KEY` | 管理密钥；设置后 `/panel/api/*`、`/api/*`、`/v1/*` 都要带 `x-admin-key` / `x-api-key` |
+| `DEFAULT_ENGINE` | 首次启动的默认引擎 `wb`（默认）或 `ag`，之后以界面设置为准 |
+| `WB_ENGINE=0` | 关闭 WB，退回只有 AG 的旧行为 |
+| `DATA_DIR` | 数据目录；WB 账号、统计、设置在 `DATA_DIR/wb/` |
+
+WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/wb/auths/`，启动时自动并入。
+
+> ⚠️ **安全**：默认监听 `0.0.0.0`。如果没设 `ADMIN_KEY`，同一网络 / 公网上的任何人都能调用
+> `/panel/api/tokens/export`、`/api/accounts/export` **导出你全部 WB / AG Token**，并用你的额度调用 `/v1/*`。
+> 启动日志会醒目警告。对外部署务必设置 `ADMIN_KEY`（足够长的随机串），或只在本机监听 `HOST=127.0.0.1`。
+> 单文件版首次运行会自动生成密钥（`NO_AUTH=1` 可关闭，不建议）。
+
+配置了 `GH_TOKEN` + `GH_REPO`（见 `src/persist.mjs`）时，AG 账号、WB 账号与设置、两边统计都会同步到仓库的 `state` 分支，重新部署后自动恢复。
+
 ## 模型分流规则
 
 前门按三层顺序判断，**绝不靠模型名前缀猜**（两边都有 `claude-` 和 `gemini-` 家族，猜一定错）：
@@ -106,7 +125,8 @@ curl ... -d '{"model":"wb:deepseek-v4.1-flash-1017", ...}'
 │  │  └─ src/lite/       不带 Node 引擎（NoopNodeEngine）
 │  └─ engine-node/       Node 引擎模块：JNI、NodeService、libnode
 ├─ linux/                Linux 服务端（Python 单脚本）
-├─ tests/                协议转换、usage、路由规则测试
+├─ src/wb/               WB 引擎 Node 版（Linux / 源码版用；安卓由 Kotlin 处理）
+├─ tests/                协议转换、usage、路由规则、WB 引擎测试
 └─ docs/merge-plan.md    双引擎融合设计文档
 ```
 

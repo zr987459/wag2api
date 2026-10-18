@@ -33,6 +33,7 @@ import { handleStreamConversion } from './sse-streamer.mjs';
 import { cacheProbe } from './cache-probe.mjs';
 import { historyPin } from './history-pin.mjs';
 import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
+import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
 
 let lastClientHeaders = null;
 
@@ -63,6 +64,20 @@ for (const m of ['addAccount', 'removeAccount', 'clearAccounts']) {
 const oauthFlowManager = new OAuthFlowManager(accountPool);
 const access = new AccessControl(path.join(DATA_DIR, 'keys.json'));
 
+// ── 双引擎（Linux / 源码版）────────────────────────────────
+// 安卓上 Node 以 ENGINE_TOKEN 启动，只做 AG 引擎；WB 与前门分流由 Kotlin 负责，这里绝不介入。
+// WB_ENGINE=0 可退回只有 AG 的旧行为。
+const DUAL = !process.env.ENGINE_TOKEN && process.env.WB_ENGINE !== '0';
+const wb = DUAL ? createWbEngine({
+  dataDir: DATA_DIR,
+  port: PORT,
+  defaultEngine: process.env.DEFAULT_ENGINE,
+  authEnabled: () => access.enabled,
+  onChange: () => persist.schedule(), // 账号 / 设置变化 → 同步到 GitHub state 分支（未配置时空操作）
+}) : null;
+if (wb) wb.start();
+const agModelList = () => (getModelsResponse().data || []);
+
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
@@ -80,14 +95,30 @@ const ADMIN_PATHS = new Set([
 ]);
 
 
-function readBody(req) {
+// 按字节收齐再解码，避免多字节中文被切在 chunk 边界；同一请求只读一次
+function readRawBody(req) {
+  if (req._rawBody !== undefined) return Promise.resolve(req._rawBody);
   return new Promise(resolve => {
-    let b = '';
-    req.on('data', c => (b += c));
-    req.on('end', () => {
-      try { resolve(JSON.parse(b || '{}')); } catch (e) { resolve({}); }
-    });
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => { req._rawBody = Buffer.concat(chunks).toString('utf-8'); resolve(req._rawBody); });
+    req.on('error', () => { req._rawBody = ''; resolve(''); });
   });
+}
+
+async function readBody(req) {
+  const b = await readRawBody(req);
+  try { return JSON.parse(b || '{}'); } catch (e) { return {}; }
+}
+
+/** 把 body.model 的引擎前缀去掉，返回新的原文 */
+function stripModelPrefix(raw, prefix) {
+  if (!prefix || !raw) return raw;
+  try {
+    const j = JSON.parse(raw);
+    if (typeof j.model === 'string' && j.model.startsWith(prefix)) { j.model = j.model.slice(prefix.length); return JSON.stringify(j); }
+  } catch (e) { /* 非 JSON 原样 */ }
+  return raw;
 }
 
 // 控制台网页：与安卓共用 app/app/src/main/assets/web（单文件版打包进 EMBED.web）
@@ -153,10 +184,53 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 1.0.1 独立运行时（Linux / 源码）给新界面一个引擎状态，界面据此隐藏 WB
-  if (url.pathname === '/panel/api/engine/state') {
-    sendJson(res, 200, { supported: true, enabled: true, state: 'READY', port: PORT, default_engine: 'ag', standalone: true, auth: access.enabled });
+  // 1.0.1 引擎状态：双引擎时 dual:true（界面显示引擎切换）；WB_ENGINE=0 时 standalone:true（只有 AG）
+  if (url.pathname === '/panel/api/engine/state' || url.pathname === '/m/api/engine/state') {
+    if (wb) {
+      if (!access.isAdmin(req)) { denyAdmin(res); return; }
+      sendJson(res, 200, wb.engineState());
+    } else {
+      sendJson(res, 200, { supported: true, enabled: true, state: 'READY', port: PORT, default_engine: 'ag', standalone: true, auth: access.enabled });
+    }
     return;
+  }
+
+  // 1.0.2 WB 管理接口（与安卓 LocalGatewayServer 同一套 /panel/api/*），设置 ADMIN_KEY 时需带密钥
+  if (wb && (url.pathname.startsWith('/panel/api/') || url.pathname.startsWith('/m/api/'))) {
+    if (!access.isAdmin(req)) { denyAdmin(res); return; }
+    const raw = req.method === 'GET' || req.method === 'HEAD' ? '' : await readRawBody(req);
+    await wb.handlePanel(req, res, url, raw);
+    return;
+  }
+
+  // 1.0.3 网关总开关：关闭时只拦数据面（/v1/*），控制台照常可用
+  if (wb && url.pathname.startsWith('/v1/') && !wb.gatewayEnabled()) {
+    res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': '30' });
+    res.end(JSON.stringify({ error: { message: 'WorkBuddy 网关已关闭，请在管理面板开启', type: 'gateway_disabled', code: 'gateway_disabled' } }));
+    return;
+  }
+
+  // 1.0.4 前门分流：/v1/messages 与 /v1/chat/completions 按 EngineRouter 规则交给 WB 或 AG
+  if (wb && req.method === 'POST' && (url.pathname === '/v1/messages' || url.pathname === '/v1/chat/completions')) {
+    const raw = await readRawBody(req);
+    let model = '';
+    try { model = String(JSON.parse(raw).model || ''); } catch (e) { /* 交给下游报错 */ }
+    const d = decideEngine(url.pathname, model, { agModels: agModelList(), wbModels: wb.models(), defaultEngine: wb.defaultEngine() });
+    if (d.engine === 'wb') {
+      if (access.enabled && !access.isAdmin(req)) {
+        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'API Key 无效或缺失 (x-api-key)' } });
+        return;
+      }
+      let json;
+      try { json = JSON.parse(stripModelPrefix(raw, 'wb:')); } catch (e) {
+        sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: '请求体不是合法 JSON' } });
+        return;
+      }
+      if (url.pathname === '/v1/messages') await wb.handleMessages(req, res, json);
+      else await wb.handleChat(req, res, json);
+      return;
+    }
+    req._rawBody = stripModelPrefix(raw, 'ag:'); // 交给下面的 AG 处理
   }
 
   // 1.5 OAuth 回调
@@ -220,7 +294,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 4. 模型列表接口
+  // 4. 模型列表接口（双引擎时 /v1/models 合并两边；/api/models 仍只给 AG）
+  if (url.pathname === '/v1/models' && wb) {
+    sendJson(res, 200, mergedModels(wb.models(), agModelList()));
+    return;
+  }
   if (url.pathname === '/v1/models' || url.pathname === '/models' || url.pathname === '/api/models') {
     sendJson(res, 200, getModelsResponse());
     return;
@@ -402,9 +480,7 @@ const server = http.createServer(async (req, res) => {
 
   // 10. 核心 Anthropic 协议推理接口：/v1/messages
   if (url.pathname === '/v1/messages' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => (body += chunk));
-    req.on('end', async () => {
+    readRawBody(req).then(async (body) => {
       const startTime = Date.now();
       let statsRecorded = false;
       let statsEmail = null;
@@ -629,6 +705,7 @@ if ((IS_BINARY || process.env.AUTO_KEY === '1') && !access.enabled && process.en
 }
 
 const HOST = process.env.HOST || '0.0.0.0';
+const PUBLIC_BIND = ['0.0.0.0', '::', ''].includes(HOST.trim());
 
 // 统一的优雅退出：宿主关闭引擎时先 drain 再 SIGTERM，Linux systemd 同样受益。
 // 必须在 server.close() 前 flush 统计，且不能有其它监听器提前 process.exit。
@@ -639,6 +716,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     shuttingDown = true;
     console.log(`收到 ${sig}，正在安全退出…`);
     try { statsTracker.flush(); } catch (e) {}
+    try { if (wb) wb.flush(); } catch (e) {}
     try {
       if (persist.enabled) {
         await Promise.race([
@@ -660,5 +738,18 @@ server.listen(PORT, HOST, () => {
   console.log(`   本机:   http://127.0.0.1:${PORT}`);
   if (HOST === '0.0.0.0') lan.forEach(ip => console.log(`   局域网: http://${ip}:${PORT}`));
   console.log(`   数据:   ${DATA_DIR}`);
+  console.log(wb ? `   引擎:   WB + AG（默认 ${wb.defaultEngine().toUpperCase()}，模型名加 wb: / ag: 可强制指定）` : '   引擎:   仅 AG');
   console.log(access.enabled ? `   密钥:   ${access.adminKey}` : '   密钥:   未设置（任何人都能访问，建议设置 ADMIN_KEY）');
+  if (PUBLIC_BIND && !access.enabled) {
+    const bar = '!'.repeat(64);
+    console.warn([
+      '', bar,
+      '!!  安全警告：正在监听所有网卡（HOST=' + (HOST || '0.0.0.0') + '），且没有设置 ADMIN_KEY',
+      '!!  同一网络 / 公网上的任何人都能：',
+      '!!    · 调用 /panel/api/tokens/export、/api/accounts/export 导出全部 WB / AG Token',
+      '!!    · 用你的账号额度调用 /v1/*',
+      '!!  修复：设置 ADMIN_KEY=<足够长的随机串>，或只在本机监听 HOST=127.0.0.1',
+      bar, '',
+    ].join('\n'));
+  }
 });
