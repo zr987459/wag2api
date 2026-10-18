@@ -600,6 +600,7 @@ async function loadAgAccounts() {
       <p class="muted" style="margin-bottom: 10px;">当前账号额度用完或限流时，自动切到下一个账号。</p>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-outline" style="flex: 1;" onclick="agTestActive(this)">⚡ 测试当前账号</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="agBenchHosts(this)">🏁 集群测速</button>
       </div>
       <div class="account-test-banner" id="ag-test-banner"></div>`;
 
@@ -701,6 +702,37 @@ async function agTestActive(btn) {
     testBanner('ag-test-banner', d.all_ok ? 'success' : d.ok ? 'warning' : 'error',
       `${d.validation_account || ''}\n${lines.join('\n') || d.message || ''}`);
     $('ag-test-banner').style.whiteSpace = 'pre-line';
+  } catch (e) { testBanner('ag-test-banner', 'error', `❌ ${e.message}`); }
+  finally { btn.textContent = orig; btn.disabled = false; }
+}
+
+// 集群测速：同一提示词交替发给 daily / autopush / prod，各 2 轮，比较首字与真实生成速度
+function fmtS(ms) { return ms == null ? '—' : (ms / 1000).toFixed(1) + 's'; }
+function renderBench(d) {
+  const lines = [`${d.account || ''} · ${d.model || ''} · ${d.running ? '进行中 ' + (d.progress || '') : '完成'}`];
+  for (const s of d.summary || []) {
+    if (!s.ok) { lines.push(`❌ ${s.host} · ${s.statuses} · ${s.error || '失败'}`); continue; }
+    lines.push(`✅ ${s.host} (${s.ok}/${s.total}) · 首块 ${fmtS(s.t_first_chunk)} · 正文 ${fmtS(s.t_first_text)} · 总 ${fmtS(s.total_ms)} · 生成 ${s.gen_tps ?? '—'} t/s · 正文 ${s.text_tps ?? '—'} t/s`);
+  }
+  for (const r of d.runs || []) {
+    lines.push(`  #${r.round} ${r.host} ${r.status ?? 'ERR'} 首块 ${fmtS(r.t_first_chunk)} 总 ${fmtS(r.total_ms)} 出 ${r.output_tokens || 0} (思考 ${r.thoughts_tokens || 0}) ${r.gen_tps ?? '—'} t/s${r.error ? ' · ' + r.error : ''}`);
+  }
+  testBanner('ag-test-banner', d.running ? '' : ((d.summary || []).some(s => s.ok) ? 'success' : 'error'), lines.join('\n'));
+  $('ag-test-banner').style.whiteSpace = 'pre-line';
+}
+async function agBenchHosts(btn) {
+  if (!confirm('将用当前账号向 3 个集群各发 2 次长文请求，约 2–4 分钟，会消耗少量额度。开始？')) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '测速中…';
+  try {
+    let d = await postJson('/api/bench/hosts', { rounds: 2 });
+    if (!d.ok && !d.running) throw new Error(d.error || '启动失败');
+    renderBench(d);
+    while (d.running) {
+      await new Promise(r => setTimeout(r, 3000));
+      d = await getJson('/api/bench/hosts');
+      renderBench(d);
+    }
   } catch (e) { testBanner('ag-test-banner', 'error', `❌ ${e.message}`); }
   finally { btn.textContent = orig; btn.disabled = false; }
 }

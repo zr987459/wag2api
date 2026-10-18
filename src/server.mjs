@@ -16,6 +16,7 @@ import { AccountPool } from './account-pool.mjs';
 import { signatureCache } from './signature-cache.mjs';
 import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
+import { hostBench } from './host-bench.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
 import { parseAgImport } from './ag-import.mjs';
@@ -335,6 +336,21 @@ const server = http.createServer(async (req, res) => {
     const activeMgr = accountPool.getActiveManager();
     const testResult = await runConnectivityTest(activeMgr, accountPool);
     sendJson(res, 200, testResult);
+    return;
+  }
+
+  // 6.1 集群测速（daily / autopush / prod），后台执行，GET 轮询结果
+  if (url.pathname === '/api/bench/hosts') {
+    if (!access.isAdmin(req)) { denyAdmin(res); return; }
+    if (req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const mgr = accountPool.getActiveManager();
+      if (!mgr) { sendJson(res, 400, { ok: false, error: '账号池暂无可用 Google 账号' }); return; }
+      const started = hostBench.start(mgr, { rounds: body.rounds, model: body.model || 'gemini-3.8-flash-high' });
+      sendJson(res, started ? 200 : 409, { ok: started, ...(started ? {} : { error: '已有测速在进行' }), ...hostBench.status() });
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...hostBench.status() });
     return;
   }
 
