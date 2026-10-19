@@ -17,6 +17,8 @@ import { signatureCache } from './signature-cache.mjs';
 import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
 import { hostBench } from './host-bench.mjs';
+import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
+import { prewarm, lastPrewarm } from './prewarm.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
 import { parseAgImport } from './ag-import.mjs';
@@ -339,6 +341,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 6.2 预热（启动 / 网络恢复 / 控制台回前台）：token + projectId + 上游连接
+  if (url.pathname === '/api/prewarm') {
+    if (!access.isAdmin(req)) { denyAdmin(res); return; }
+    if (req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const r = await prewarm(accountPool, { reason: String(body.reason || 'manual').slice(0, 20) });
+      sendJson(res, 200, { runtime: RUNTIME, ...r });
+      return;
+    }
+    sendJson(res, 200, { runtime: RUNTIME, last: lastPrewarm() });
+    return;
+  }
+
   // 6.1 集群测速（daily / autopush / prod），后台执行，GET 轮询结果
   if (url.pathname === '/api/bench/hosts') {
     if (!access.isAdmin(req)) { denyAdmin(res); return; }
@@ -505,9 +520,9 @@ const server = http.createServer(async (req, res) => {
     readRawBody(req).then(async (body) => {
       const startTime = Date.now();
       // PR2 分段打点：各时间点均为相对 startTime 的毫秒数；多次尝试时保留最后一次（即最终生效的那次）
-      const timing = { t_token: null, t_payload: null, t_headers: null, host: null, attempts: 0, switched_account: false, switched_host: false };
+      const timing = { t_token: null, t_payload: null, t_headers: null, t_tls: null, conn_reused: null, host: null, attempts: 0, switched_account: false, switched_host: false };
       const mark = (k) => { timing[k] = Date.now() - startTime; };
-      const markHeaders = (u) => { mark('t_headers'); try { timing.host = new URL(u).hostname; } catch (e) {} };
+      const markHeaders = (u, r) => { mark('t_headers'); try { timing.host = new URL(u).hostname; } catch (e) {} if (r) { timing.conn_reused = r._gwReused ?? null; timing.t_tls = r._gwTlsMs ?? null; } };
       const timingOut = (extra = {}) => ({ ...timing, switched_host: Boolean(timing.host && timing.host !== DAILY_HOST), ...extra });
       let statsRecorded = false;
       let statsEmail = null;
@@ -563,12 +578,12 @@ const server = http.createServer(async (req, res) => {
           const targetUrl = isStreaming ? streamUrl : nonStreamUrl;
 
           timing.attempts++;
-          let r = await fetch(targetUrl, {
+          let r = await upstreamFetch(targetUrl, {
             method: 'POST',
             headers: buildAntigravityHeaders(tok),
             body: JSON.stringify(p),
           });
-          markHeaders(targetUrl);
+          markHeaders(targetUrl, r);
 
           if (r && r.status === 400) {
             const errText = await r.clone().text().catch(() => '');
@@ -576,12 +591,12 @@ const server = http.createServer(async (req, res) => {
               p = buildCloudCodePayload(anthropicReq, mgr.tokenData.projectId);
               mark('t_payload');
               timing.attempts++;
-              r = await fetch(targetUrl, {
+              r = await upstreamFetch(targetUrl, {
                 method: 'POST',
                 headers: buildAntigravityHeaders(tok),
                 body: JSON.stringify(p),
               });
-              markHeaders(targetUrl);
+              markHeaders(targetUrl, r);
             }
           }
           return r;
@@ -624,12 +639,12 @@ const server = http.createServer(async (req, res) => {
 
               try {
                 timing.attempts++;
-                const r = await fetch(upstreamEndpoint, {
+                const r = await upstreamFetch(upstreamEndpoint, {
                   method: 'POST',
                   headers,
                   body: JSON.stringify(payload),
                 });
-                markHeaders(upstreamEndpoint);
+                markHeaders(upstreamEndpoint, r);
                 if (r.ok) return r;
                 const errText = await r.text().catch(() => '');
                 lastFailedDetails = { status: r.status, body: errText };
@@ -775,6 +790,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 }
 
 server.listen(PORT, HOST, () => {
+  // PR4：启动即预热（不阻塞监听）
+  setTimeout(() => { prewarm(accountPool, { reason: 'start', force: true }).then(r => console.log(`[Prewarm] start ok=${r.ok} conn=${r.t_conn}ms tls=${r.tls_ms}ms`)).catch(() => {}); }, 500).unref?.();
   const lan = Object.values(os.networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
   console.log(`🚀 wag2api 已启动`);
   console.log(`   本机:   http://127.0.0.1:${PORT}`);

@@ -273,8 +273,8 @@ function renderTiming(st) {
   card.style.display = '';
   const ms = v => (v === 0 ? '0ms' : fmtMs(v));
   const cells = [
-    ['取 Token', ms(t.t_token)],
-    ['组包', ms(t.t_payload)],
+    ['Token / 组包', `${ms(t.t_token)} / ${ms(t.t_payload)}`],
+    ['握手', ms(t.t_tls)],
     ['响应头', ms(t.t_headers)],
     ['首个思考', ms(t.t_first_thought)],
     ['首个正文', ms(t.t_first_text)],
@@ -285,7 +285,7 @@ function renderTiming(st) {
   ];
   $('timingGrid').innerHTML = cells.map(([k, v]) => `<div class="stat-cell"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
   const hosts = Object.entries(t.hosts || {}).map(([h, c]) => `${escapeHtml(h.split('.')[0])} ×${c}`).join('，');
-  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次`;
+  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次 · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
 }
 
 function renderStats(st) {
@@ -1127,9 +1127,9 @@ async function loadLogs() {
           </div>
           <div class="log-tokens">${tok}</div>
           ${l.timing ? `<div class="muted mono" style="font-size:11px;">${[
-            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['头', l.timing.t_headers],
+            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['握手', l.timing.conn_reused === false ? l.timing.t_tls : null], ['头', l.timing.t_headers],
             ['思考', l.timing.t_first_thought], ['正文', l.timing.t_first_text],
-          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
+          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
           ${l.who ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(l.who)}</div>` : ''}
           ${l.note ? `<div class="log-note-box">⚠️ ${escapeHtml(l.note)}</div>` : ''}
         </div>`;
@@ -1154,3 +1154,11 @@ async function clearLogs() {
   loadOverview();
   setInterval(() => { if (currentTab === 'overview' && !document.hidden) loadOverview(); }, 15000);
 })();
+
+
+// PR4：控制台回到前台时预热 AG 上游连接 / token（后端 20 秒内去重）
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (typeof agReady === 'function' && !agReady()) return;
+  postJson('/api/prewarm', { reason: 'foreground' }).catch(() => {});
+});
