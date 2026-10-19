@@ -9,6 +9,7 @@ import { signatureCache, FALLBACK_THOUGHT_SIGNATURE } from './signature-cache.mj
 import { scrubIdentity } from './scrub.mjs';
 import { sanitizeSchema } from './schema-sanitizer.mjs';
 import { historyPin } from './history-pin.mjs';
+import { stripDowngradeNotice } from './downgrade-notice.mjs';
 import { pinToolDescriptions } from './session-router.mjs';
 import { normalizeGeminiUsage, toAnthropicUsage } from './usage.mjs';
 
@@ -61,13 +62,16 @@ export function convertAnthropicToGoogle(anthropicRequest) {
     const parts = [];
 
     if (typeof msg.content === 'string') {
-      if (msg.content.length > 0) {
-        parts.push({ text: msg.content });
+      const t = role === 'model' ? stripDowngradeNotice(msg.content) : msg.content;
+      if (t.length > 0) {
+        parts.push({ text: t });
       }
     } else if (Array.isArray(msg.content)) {
       for (const item of msg.content) {
         if (item.type === 'text') {
-          if (item.text) parts.push({ text: item.text });
+          // PR1：剔掉网关插入的降级提示行，永不发回模型；剔完与从未插入时字节一致
+          const t = role === 'model' ? stripDowngradeNotice(item.text) : item.text;
+          if (t) parts.push({ text: t });
         } else if (item.type === 'thinking') {
           // 仅当思考块有文本时保留，附带合法思考签名
           if (item.thinking) {

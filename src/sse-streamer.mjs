@@ -13,7 +13,9 @@ import { normalizeGeminiUsage, mergeRawUsage, toAnthropicUsage } from './usage.m
  * usage = { input_tokens, cached_tokens, output_tokens, thoughts_tokens, total_tokens,
  *           ttft_ms, outcome: 'ok' | 'client_abort' | 'stream_error', error }
  */
-export async function handleStreamConversion(upstreamRes, clientRes, originalModel, onFinish = null, startTime = Date.now()) {
+export async function handleStreamConversion(upstreamRes, clientRes, originalModel, onFinish = null, startTime = Date.now(), { notice = null } = {}) {
+  // PR1：notice 为降级提示行，插在第一个 text block 最前面（不进 thinking block，不动签名）
+  let noticePending = Boolean(notice);
   clientRes.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   clientRes.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   clientRes.setHeader('Connection', 'keep-alive');
@@ -178,6 +180,14 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
                   ? { type: 'thinking', thinking: '' }
                   : { type: 'text', text: '' },
               });
+              if (!isThought && noticePending) {
+                noticePending = false;
+                sendEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: blockIndex,
+                  delta: { type: 'text_delta', text: notice },
+                });
+              }
             }
 
             if (part.text) {

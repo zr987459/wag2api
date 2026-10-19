@@ -23,7 +23,8 @@ export function stableSessionId(anthropicRequest) {
 // 模型别名与降级链映射表 (当 Claude 3P 配额耗尽时，无缝降级到 Gemini 旗舰以防中断)
 export const MODEL_FALLBACK_CHAINS = {
   'gemini-3.8-flash-fast': ['gemini-2.5-flash', 'gemini-3-flash'],
-  'gemini-3.8-flash-high': ['gemini-3-flash', 'gemini-2.5-flash-thinking'],
+  // PR1：按智力从高到低，只留同代思考模型（同样用 thinkingLevel=high），去掉 2.5 这类低一档的
+  'gemini-3.8-flash-high': ['gemini-3.6-flash-high', 'gemini-3-flash'],
   'gemini-3.8-flash': ['gemini-3-flash', 'gemini-2.5-flash'],
   'gemini-3.1-pro-high': ['gemini-3.1-pro-low', 'gemini-2.5-pro'],
   'claude-opus-4-6': ['claude-opus-4-6-thinking', 'claude-sonnet-4-6', 'gemini-3.8-flash-tiered'],
