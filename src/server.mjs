@@ -21,6 +21,7 @@ import { getModelsResponse } from './models-catalog.mjs';
 import { parseAgImport } from './ag-import.mjs';
 import { statsTracker } from './stats.mjs';
 import { ANTIGRAVITY_ENDPOINTS, ANTIGRAVITY_ENDPOINT_DAILY } from './constants.mjs';
+const DAILY_HOST = new URL(ANTIGRAVITY_ENDPOINT_DAILY).hostname;
 import { AccessControl } from './access-control.mjs';
 import { Persist } from './persist.mjs';
 import {
@@ -91,7 +92,7 @@ function denyAdmin(res) {
 const ADMIN_PATHS = new Set([
   '/api/status', '/api/stats', '/api/logs', '/api/logs/clear', '/api/gemini/test', '/api/gemini/auth',
   '/api/oauth/exchange', '/api/oauth/token-exchange', '/api/accounts/add-token', '/api/accounts/switch',
-  '/api/accounts/remove', '/api/accounts/export', '/api/accounts/import', '/api/trend',
+  '/api/accounts/remove', '/api/accounts/export', '/api/accounts/import', '/api/trend', '/api/stats/timing',
 ]);
 
 
@@ -269,6 +270,11 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/api/debug/cache') {
     sendJson(res, 200, { pin: historyPin.stats(), session: sessionStats(), clientHeaders: lastClientHeaders, requests: cacheProbe.report() });
+    return;
+  }
+
+  if (url.pathname === '/api/stats/timing') {
+    sendJson(res, 200, statsTracker.getTimingSummary(Number(url.searchParams.get('n')) || 20));
     return;
   }
 
@@ -482,6 +488,11 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/v1/messages' && req.method === 'POST') {
     readRawBody(req).then(async (body) => {
       const startTime = Date.now();
+      // PR2 分段打点：各时间点均为相对 startTime 的毫秒数；多次尝试时保留最后一次（即最终生效的那次）
+      const timing = { t_token: null, t_payload: null, t_headers: null, host: null, attempts: 0, switched_account: false, switched_host: false };
+      const mark = (k) => { timing[k] = Date.now() - startTime; };
+      const markHeaders = (u) => { mark('t_headers'); try { timing.host = new URL(u).hostname; } catch (e) {} };
+      const timingOut = (extra = {}) => ({ ...timing, switched_host: Boolean(timing.host && timing.host !== DAILY_HOST), ...extra });
       let statsRecorded = false;
       let statsEmail = null;
       let statsModel = null;
@@ -525,29 +536,36 @@ const server = http.createServer(async (req, res) => {
           if (!mgr.tokenData.projectId && typeof mgr.ensureProjectId === 'function') {
             await mgr.ensureProjectId().catch(() => '');
           }
+          mark('t_token');
           anthropicReq._gwEmail = mgr.tokenData.email;
           let p = buildCloudCodePayload(anthropicReq, mgr.tokenData.projectId);
           cacheProbe.record(mgr.tokenData.email, anthropicReq.model, p);
+          mark('t_payload');
 
           const streamUrl = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:streamGenerateContent?alt=sse`;
           const nonStreamUrl = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:generateContent`;
           const targetUrl = isStreaming ? streamUrl : nonStreamUrl;
 
+          timing.attempts++;
           let r = await fetch(targetUrl, {
             method: 'POST',
             headers: buildAntigravityHeaders(tok),
             body: JSON.stringify(p),
           });
+          markHeaders(targetUrl);
 
           if (r && r.status === 400) {
             const errText = await r.clone().text().catch(() => '');
             if (bumpSessionOnOverflow(anthropicReq, mgr.tokenData.email, errText)) {
               p = buildCloudCodePayload(anthropicReq, mgr.tokenData.projectId);
+              mark('t_payload');
+              timing.attempts++;
               r = await fetch(targetUrl, {
                 method: 'POST',
                 headers: buildAntigravityHeaders(tok),
                 body: JSON.stringify(p),
               });
+              markHeaders(targetUrl);
             }
           }
           return r;
@@ -564,6 +582,7 @@ const server = http.createServer(async (req, res) => {
                 const altResp = await trySendToAccount(altMgr);
                 if (altResp && altResp.ok) {
                   activeMgr = altMgr;
+                  timing.switched_account = true;
                   accessToken = await activeMgr.getValidAccessToken();
                   statsEmail = activeMgr.tokenData.email;
                   response = altResp;
@@ -580,6 +599,7 @@ const server = http.createServer(async (req, res) => {
             const reqCopy = { ...anthropicReq, model: modelToUse };
             const payload = buildCloudCodePayload(reqCopy, activeMgr.tokenData.projectId);
             const headers = buildAntigravityHeaders(accessToken);
+            mark('t_payload');
 
             for (const host of ANTIGRAVITY_ENDPOINTS) {
               const upstreamEndpoint = isStreaming
@@ -587,11 +607,13 @@ const server = http.createServer(async (req, res) => {
                 : `${host}/v1internal:generateContent`;
 
               try {
+                timing.attempts++;
                 const r = await fetch(upstreamEndpoint, {
                   method: 'POST',
                   headers,
                   body: JSON.stringify(payload),
                 });
+                markHeaders(upstreamEndpoint);
                 if (r.ok) return r;
                 const errText = await r.text().catch(() => '');
                 lastFailedDetails = { status: r.status, body: errText };
@@ -626,6 +648,7 @@ const server = http.createServer(async (req, res) => {
             latency_ms: Date.now() - startTime,
             status: 502,
             error: String(errDetail).slice(0, 100),
+            timing: timingOut(),
           });
           statsRecorded = true;
           return;
@@ -646,6 +669,7 @@ const server = http.createServer(async (req, res) => {
               cached_tokens: usage.cached_tokens,
               thoughts_tokens: usage.thoughts_tokens,
               error: usage.error || null,
+              timing: timingOut({ t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null }),
             });
           }, startTime);
         } else {
@@ -664,6 +688,7 @@ const server = http.createServer(async (req, res) => {
             output_tokens: u.output_tokens || 0,
             cached_tokens: u.cached_tokens || 0,
             thoughts_tokens: u.thoughts_tokens || 0,
+            timing: timingOut(),
           });
         }
         statsRecorded = true;
@@ -676,6 +701,7 @@ const server = http.createServer(async (req, res) => {
             latency_ms: Date.now() - startTime,
             status: 500,
             error: String(err?.message || err).slice(0, 100),
+            timing: timingOut(),
           });
         }
         if (!res.headersSent) {

@@ -101,6 +101,27 @@ export function migrateBucket(b) {
   return b;
 }
 
+// PR2 分段打点字段（相对请求开始的毫秒数）
+export const TIMING_MS_FIELDS = ['t_token', 't_payload', 't_headers', 't_first_thought', 't_first_text'];
+
+function cleanTiming(t) {
+  const o = {};
+  for (const f of TIMING_MS_FIELDS) o[f] = t[f] === null || t[f] === undefined || !Number.isFinite(Number(t[f])) ? null : Math.max(0, Math.round(Number(t[f])));
+  o.host = t.host ? String(t.host).slice(0, 80) : null;
+  o.attempts = Math.max(0, Math.round(num(t.attempts)));
+  o.switched_account = Boolean(t.switched_account);
+  o.switched_host = Boolean(t.switched_host);
+  return o;
+}
+
+/** 中位数：忽略 null / 非数值；空集返回 null */
+export function median(values) {
+  const a = values.filter(v => v !== null && v !== undefined && Number.isFinite(Number(v))).map(Number).sort((x, y) => x - y);
+  if (!a.length) return null;
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : Math.round(((a[m - 1] + a[m]) / 2) * 1000) / 1000;
+}
+
 export class StatsTracker {
   constructor(storageDir, { autoFlushOnExit = true } = {}) {
     this.storageDir = storageDir;
@@ -180,6 +201,7 @@ export class StatsTracker {
     ttft_ms = null,
     is_stream = false,
     error = null,
+    timing = null,
     now = new Date(),
   }) {
     const { bucket } = this.getUserBucket(email);
@@ -239,6 +261,7 @@ export class StatsTracker {
       cache_hit_rate: cacheHitRate(inp, cac),
       is_stream,
       error,
+      ...(timing ? { timing: cleanTiming(timing) } : {}),
     });
     if (bucket.logs.length > this.maxLogsPerUser) bucket.logs.length = this.maxLogsPerUser;
 
@@ -301,6 +324,7 @@ export class StatsTracker {
     return {
       ...this.summarize(agg),
       today: this.todaySummary(),
+      timing_recent: this.getTimingSummary(20),
       accounts,
       schema: STATS_SCHEMA,
       legacy_data: Object.values(this.userStats).some(b => b.migrated_from_v1),
@@ -393,6 +417,27 @@ export class StatsTracker {
     }
     const today = bucket.daily?.[utcDayKey(now)];
     return { requests_7d: requests, tokens_7d: tokens, requests_today: today?.requests || 0, tokens_today: today?.tokens || 0 };
+  }
+
+  /**
+   * PR2：最近 n 条（默认 20）成功请求的分段耗时中位数，全账号合并。
+   * 只统计带 timing 的日志；ms 字段取中位数，host 给出分布，换号/换 host 给出次数。
+   */
+  getTimingSummary(n = 20) {
+    const logs = this.getAllLogs(Infinity).filter(l => l.timing && isOk(num(l.status))).slice(0, Math.max(1, Math.min(100, n)));
+    const out = { n: logs.length };
+    for (const f of TIMING_MS_FIELDS) out[f] = median(logs.map(l => l.timing[f]));
+    out.ttft_ms = median(logs.map(l => l.ttft_ms));
+    out.latency_ms = median(logs.map(l => l.latency_ms));
+    out.attempts = median(logs.map(l => l.timing.attempts));
+    out.cached_tokens = median(logs.map(l => l.tokens?.cached));
+    out.input_tokens = median(logs.map(l => l.tokens?.input));
+    out.cache_hit_rate = median(logs.map(l => l.cache_hit_rate));
+    out.hosts = {};
+    for (const l of logs) if (l.timing.host) out.hosts[l.timing.host] = (out.hosts[l.timing.host] || 0) + 1;
+    out.switched_account = logs.filter(l => l.timing.switched_account).length;
+    out.switched_host = logs.filter(l => l.timing.switched_host).length;
+    return out;
   }
 
   getUserLogs(email) {

@@ -29,6 +29,8 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
 
   let rawUsage = null;         // 合并后的原始 usageMetadata（累计值取最大）
   let firstTokenAt = 0;        // 首个内容 token 到达时间（TTFT）
+  let firstThoughtAt = 0;      // PR2 打点：首个 thought part 到达
+  let firstTextAt = 0;         // PR2 打点：首个非 thought 的 text part 到达
   let finished = false;
   let clientGone = false;
   const usageNow = () => normalizeGeminiUsage(rawUsage);
@@ -37,7 +39,13 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
     finished = true;
     if (typeof onFinish === 'function') {
       try {
-        onFinish({ ...usageNow(), ttft_ms: firstTokenAt ? firstTokenAt - startTime : null, outcome, error });
+        onFinish({
+          ...usageNow(),
+          ttft_ms: firstTokenAt ? firstTokenAt - startTime : null,
+          t_first_thought: firstThoughtAt ? firstThoughtAt - startTime : null,
+          t_first_text: firstTextAt ? firstTextAt - startTime : null,
+          outcome, error,
+        });
       } catch (e) { console.error('[Stream onFinish Error]', e); }
     }
   };
@@ -154,6 +162,10 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
 
           if (part.text !== undefined) {
             const isThought = part.thought === true;
+            if (part.text) {
+              if (isThought) { if (!firstThoughtAt) firstThoughtAt = Date.now(); }
+              else if (!firstTextAt) firstTextAt = Date.now();
+            }
             const targetType = isThought ? 'thinking' : 'text';
 
             if (currentBlockType !== targetType) {
