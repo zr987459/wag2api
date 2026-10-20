@@ -108,6 +108,7 @@ function convertUser(content) {
 }
 
 /** 每个 tool_call_id 都必须有且只有一条 tool 回复且紧跟其后；孤立的 tool 消息丢弃 */
+/** 每个 tool_call_id 都必须有且只有一条 tool 回复且紧跟其后；兼容 function_call 与 role:function；孤立的 tool 消息丢弃 */
 export function repairToolPairing(msgs) {
   const out = [];
   let i = 0;
@@ -115,25 +116,41 @@ export function repairToolPairing(msgs) {
     const rawM = msgs[i++];
     if (!rawM || typeof rawM !== 'object') continue;
     const m = { ...rawM };
-    // 兼容部分旧客户端使用的 role: 'function'
-    if (m.role === 'function') {
-      m.role = 'tool';
-      if (!m.tool_call_id && m.name) m.tool_call_id = m.name;
+    // 兼容旧式 assistant.function_call -> tool_calls
+    if (m.role === 'assistant' && m.function_call && !m.tool_calls) {
+      const fName = str(m.function_call, 'name') || 'fn';
+      m.tool_calls = [{ id: `call_${fName}_${i}`, type: 'function', function: m.function_call }];
     }
-    if (m.role === 'tool') continue;
+    // 孤立的 tool / function 消息跳过（前面没有 assistant.tool_calls）
+    if (m.role === 'tool' || m.role === 'function') continue;
     out.push(m);
-    if (!Array.isArray(m.tool_calls)) continue;
-    const pending = new Set(m.tool_calls.map(c => c.id));
-    while (i < msgs.length && (msgs[i].role === 'tool' || msgs[i].role === 'function')) {
+    if (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0) continue;
+
+    const pending = new Map();
+    m.tool_calls.forEach((c, idx) => {
+      const id = str(c, 'id') || `call_${idx}`;
+      pending.set(id, c);
+    });
+
+    while (i < msgs.length && msgs[i] && (msgs[i].role === 'tool' || msgs[i].role === 'function')) {
       const rawT = msgs[i++];
       const t = { ...rawT };
       if (t.role === 'function') {
         t.role = 'tool';
-        if (!t.tool_call_id && t.name) t.tool_call_id = t.name;
+        // 如果没有 tool_call_id，尝试按 pending 的第一个匹配
+        if (!t.tool_call_id) {
+          const firstPendingId = pending.keys().next().value;
+          if (firstPendingId) t.tool_call_id = firstPendingId;
+        }
       }
-      if (pending.delete(t.tool_call_id)) out.push(t);
+      if (t.tool_call_id && pending.has(t.tool_call_id)) {
+        pending.delete(t.tool_call_id);
+        out.push(t);
+      }
     }
-    for (const id of pending) out.push({ role: 'tool', tool_call_id: id, content: '[no result: tool call was interrupted]' });
+    for (const [id] of pending) {
+      out.push({ role: 'tool', tool_call_id: id, content: '[no result: tool call was interrupted]' });
+    }
   }
   return out;
 }

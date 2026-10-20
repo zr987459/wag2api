@@ -58,7 +58,7 @@ export class AccessControl {
     if (auth && !auth.includes(' ')) return auth; // 兼容客户端不带 Bearer 前缀的直接 token
     try {
       const u = new URL(req.url, 'http://127.0.0.1');
-      const qk = u.searchParams.get('key') || u.searchParams.get('api_key') || u.searchParams.get('token');
+      const qk = u.searchParams.get('key') || u.searchParams.get('api_key');
       if (qk) return qk.trim();
     } catch (_) {}
     return '';

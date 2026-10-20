@@ -3,7 +3,7 @@ export const UPSTREAM_GLOBAL = 'https://www.workbuddy.ai';
 export const UPSTREAM_CN = 'https://copilot.tencent.com';
 export const ORIGIN_CN = 'https://www.codebuddy.cn';
 export const CLIENT_UA = 'WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1';
-export const DEFAULT_SYSTEM_PROMPT = 'You are WorkBuddy, an advanced AI programming assistant developed by Tencent.';
+export const DEFAULT_SYSTEM_PROMPT = 'You are WorkBuddy, an advanced AI programming assistant developed by Tencent. Tokens matching ⟦P_...⟧ denote literal file paths; output them verbatim.';
 export const DEFAULT_MODEL = 'deepseek-v4.1-flash-1017';
 
 /** 客户端常用别名与快照 → 腾讯官方模型 ID */
