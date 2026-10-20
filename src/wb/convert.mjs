@@ -107,7 +107,6 @@ function convertUser(content) {
   return result;
 }
 
-/** 每个 tool_call_id 都必须有且只有一条 tool 回复且紧跟其后；孤立的 tool 消息丢弃 */
 /** 每个 tool_call_id 都必须有且只有一条 tool 回复且紧跟其后；兼容 function_call 与 role:function；孤立的 tool 消息丢弃 */
 export function repairToolPairing(msgs) {
   const out = [];
@@ -120,6 +119,7 @@ export function repairToolPairing(msgs) {
     if (m.role === 'assistant' && m.function_call && !m.tool_calls) {
       const fName = str(m.function_call, 'name') || 'fn';
       m.tool_calls = [{ id: `call_${fName}_${i}`, type: 'function', function: m.function_call }];
+      delete m.function_call;
     }
     // 孤立的 tool / function 消息跳过（前面没有 assistant.tool_calls）
     if (m.role === 'tool' || m.role === 'function') continue;
@@ -129,18 +129,32 @@ export function repairToolPairing(msgs) {
     const pending = new Map();
     m.tool_calls.forEach((c, idx) => {
       const id = str(c, 'id') || `call_${idx}`;
+      c.id = id;
       pending.set(id, c);
     });
 
-    while (i < msgs.length && msgs[i] && (msgs[i].role === 'tool' || msgs[i].role === 'function')) {
-      const rawT = msgs[i++];
+    while (i < msgs.length) {
+      const rawT = msgs[i];
+      if (!rawT || typeof rawT !== 'object') { i++; continue; }
+      if (rawT.role !== 'tool' && rawT.role !== 'function') break;
+      i++;
       const t = { ...rawT };
       if (t.role === 'function') {
         t.role = 'tool';
-        // 如果没有 tool_call_id，尝试按 pending 的第一个匹配
+        // 如果没有 tool_call_id，优先按名称匹配，否则取 pending 第一个
         if (!t.tool_call_id) {
-          const firstPendingId = pending.keys().next().value;
-          if (firstPendingId) t.tool_call_id = firstPendingId;
+          if (t.name) {
+            for (const [pId, pCall] of pending.entries()) {
+              if (pCall.function?.name === t.name) {
+                t.tool_call_id = pId;
+                break;
+              }
+            }
+          }
+          if (!t.tool_call_id) {
+            const firstPendingId = pending.keys().next().value;
+            if (firstPendingId) t.tool_call_id = firstPendingId;
+          }
         }
       }
       if (t.tool_call_id && pending.has(t.tool_call_id)) {
