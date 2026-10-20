@@ -111,20 +111,24 @@ export class AccountScheduler {
       chosen = candidates.reduce((m, a) => (this.cooldownRemainSec(a.uid) < this.cooldownRemainSec(m.uid) ? a : m));
     }
 
-    // 自动为新会话（或换号会话）绑定亲和表
-    if (chosen && sessionKey) {
-      this.bindSession(sessionKey, chosen.uid);
+    // 自动为新会话绑定亲和表，并立即更新 last_used 避免突发新并发扎堆钉死单账号（Hark 审查加固）
+    if (chosen) {
+      this.touch(chosen.uid);
+      if (sessionKey) {
+        this.bindSession(sessionKey, chosen.uid);
+      }
     }
     return chosen;
   }
 
-  /** 成功出流后记最近使用（易变字段，不触发云端同步） */
+  /** 成功出流或选号时记最近使用（易变字段，不触发云端同步） */
   touch(uid) {
     this.vault.updateAccount(uid, a => { a.last_used = Date.now(); }, { quiet: true });
   }
 
   /**
    * 一次 WB 请求结束（成功或失败）后，记到最终实际使用的账号上：请求数 +1，Token 累加本次合计。
+   * 与 touch 一样只改易变字段，不触发云端同步（persist 推送时也会剥掉 token_usage）。
    */
   recordUsage(uid, tokens = 0) {
     if (!uid) return;
