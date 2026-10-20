@@ -288,6 +288,27 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 2.2 AG 账号池调度与切换接口
+  if (url.pathname === '/api/accounts/pool') {
+    sendJson(res, 200, { ok: true, accounts: accountPool.poolStatus(), selected_email: accountPool.getSelectedEmail() });
+    return;
+  }
+  if (url.pathname === '/api/accounts/select' && req.method === 'POST') {
+    try {
+      const { email } = await readBody(req);
+      accountPool.setSelectedEmail(email);
+      sendJson(res, 200, { ok: true, selected_email: accountPool.getSelectedEmail(), message: email ? `已锁定账号 ${email}` : '已改为全自动智能轮询' });
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+  if (url.pathname === '/api/accounts/clear-cooldown' && req.method === 'POST') {
+    accountPool.clearAllCooldowns();
+    sendJson(res, 200, { ok: true, message: 'AG 账号池冷却已全部清除' });
+    return;
+  }
+
   // 3. 统计数据与日志
   if (url.pathname === '/api/stats') {
     sendJson(res, 200, { ...statsTracker.getStats(), cooldowns: cooldowns.list() });
@@ -568,7 +589,8 @@ const server = http.createServer(async (req, res) => {
           hasClientSession: Boolean(anthropicReq._gwSessionKey),
         };
 
-        let activeMgr = accountPool.getActiveManager();
+        // 智能选号：优先命中会话亲和表（保持 KV-Cache），新会话按最小负载轮询分发，支持 429 冷却避障
+        let activeMgr = accountPool.pickManager(anthropicReq._gwSessionKey);
         if (!activeMgr) {
           const errMsg = '账号池暂无可用 Google 账号，请在控制台添加账号';
           if (isOaiChat) {

@@ -267,8 +267,12 @@ export function createWbEngine({
     },
     pool: () => ({ ok: true, accounts: scheduler.poolStatus(), selected_uid: scheduler.effectiveSelectedUid() }),
     'pool/select': ({ body }) => {
-      const uid = body.uid ? String(body.uid) : '';
-      if (!uid) return { ok: false, msg: 'uid 不能为空' };
+      if (body.uid === undefined) return { ok: false, msg: 'uid 不能为空' };
+      const uid = String(body.uid || '').trim();
+      if (!uid) {
+        scheduler.setSelectedUid('');
+        return { ok: true, uid: '', msg: '已改为自动轮询' };
+      }
       const acc = vault.find(uid);
       if (acc && acc.disabled) return { ok: false, msg: '该账号已暂停，请先启用' };
       scheduler.setSelectedUid(uid);

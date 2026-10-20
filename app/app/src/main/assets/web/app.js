@@ -605,12 +605,22 @@ async function loadAgAccounts() {
     (st.accounts || []).forEach(a => { usage[a.email] = a; });
     $('accountCount').textContent = accs.length;
 
+    const poolRes = await getJson('/api/accounts/pool').catch(() => ({}));
+    const selectedEmail = poolRes?.selected_email || '';
+
     sch.innerHTML = `
       <div class="section-title" style="margin-bottom: 6px;">
-        <span>账号池</span>
-        <button class="btn btn-outline btn-sm" onclick="agRefreshAllQuota()">刷新全部额度</button>
+        <span>账号调度</span>
+        <button class="btn btn-outline btn-sm" onclick="agClearCooldowns()">清除冷却</button>
       </div>
-      <p class="muted" style="margin-bottom: 10px;">当前账号额度用完或限流时，自动切到下一个账号。</p>
+      <p class="muted" style="margin-bottom: 10px;">会话粘滞（保住 KV-Cache）+ 智能负载均衡，遇到限流自动冷却换号。</p>
+      <div class="row-between" style="margin-bottom: 10px;">
+        <span style="font-size: 13px;">调度策略</span>
+        <select class="input-field" style="margin-bottom: 0; max-width: 65%;" onchange="agSelect(this.value)">
+          <option value="">自动轮询 (负载均衡+缓存粘滞)</option>
+          ${accs.map(a => `<option value="${escapeHtml(a.email)}" ${a.email === selectedEmail ? 'selected' : ''}>${escapeHtml(a.email)}</option>`).join('')}
+        </select>
+      </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-outline" style="flex: 1;" onclick="agTestActive(this)">⚡ 测试当前账号</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="agBenchHosts(this)">🏁 集群测速</button>
@@ -688,6 +698,16 @@ async function agLoadQuota(email, toast) {
   if (toast) showToast('额度已刷新', 'success');
 }
 
+async function agSelect(email) {
+  await postJson('/api/accounts/select', { email });
+  showToast(email ? `已锁定账号 ${email}` : '已切换为全自动智能轮询', 'success');
+  loadAgAccounts();
+}
+async function agClearCooldowns() {
+  await postJson('/api/accounts/clear-cooldown');
+  showToast('AG 账号冷却已清除', 'success');
+  loadAgAccounts();
+}
 async function agRefreshAllQuota() {
   Object.keys(agQuota).forEach(k => delete agQuota[k]);
   loadAgAccounts();
