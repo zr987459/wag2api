@@ -62,14 +62,15 @@ console.log('🧪 开始运行 AG 引擎 OpenAI 双协议兼容测试 (含 Hark 
   const textBlock = asst.content.find(b => b.type === 'text');
   assert.strictEqual(textBlock.text, 'Hi there!');
 
-  // 检查工具定义
+  // 检查工具定义与 required
   assert.strictEqual(antReq.tools.length, 1);
   assert.strictEqual(antReq.tools[0].name, 'get_weather');
+  assert.deepStrictEqual(antReq.tools[0].input_schema.required, ['city'], 'required 字段必须完整保留');
 
   console.log('✅ 1. OpenAI -> Anthropic 请求转换、response_format 透传与 P2 思考隔离通过');
 }
 
-// 2. 测试非流式响应转换：Google -> OpenAI
+// 2. 测试非流式响应转换：Google -> OpenAI (含非流式签名继承)
 {
   const googleJson = {
     response: {
@@ -77,8 +78,9 @@ console.log('🧪 开始运行 AG 引擎 OpenAI 双协议兼容测试 (含 Hark 
         {
           content: {
             parts: [
-              { text: 'Analyzing math question...', thought: true },
+              { text: 'Analyzing math question...', thought: true, thoughtSignature: 'NON_STREAM_SIG_888' },
               { text: '1 + 1 equals 2.' },
+              { functionCall: { id: 'call_calc_nonstream', name: 'calculate', args: { expr: '1+1' } } },
             ],
             role: 'model',
           },
@@ -98,15 +100,19 @@ console.log('🧪 开始运行 AG 引擎 OpenAI 双协议兼容测试 (含 Hark 
 
   assert.strictEqual(oaiResp.object, 'chat.completion');
   assert.strictEqual(oaiResp.model, 'gemini-3.8-flash-high');
-  assert.strictEqual(oaiResp.choices[0].finish_reason, 'stop');
+  assert.strictEqual(oaiResp.choices[0].finish_reason, 'tool_calls');
   assert.strictEqual(oaiResp.choices[0].message.content, '1 + 1 equals 2.');
   assert.strictEqual(oaiResp.choices[0].message.reasoning_content, 'Analyzing math question...');
   assert.strictEqual(oaiResp.usage.completion_tokens_details.reasoning_tokens, 4);
 
-  console.log('✅ 2. Google -> OpenAI 非流式响应与 reasoning_content 提取通过');
+  // Hark 阻塞点复核：非流式中的 functionCall 必须成功继承签名
+  const sig = signatureCache.get('call_calc_nonstream');
+  assert.strictEqual(sig, 'NON_STREAM_SIG_888', '非流式工具调用必须成功继承前序 thoughtSignature');
+
+  console.log('✅ 2. Google -> OpenAI 非流式响应、reasoning_content 提取与非流式签名继承通过');
 }
 
-// 3. 测试流式响应转换：Google SSE -> OpenAI SSE
+// 3. 测试流式响应转换：Google SSE -> OpenAI SSE (含 MAX_TOKENS 映射 length)
 {
   const googleChunks = [
     JSON.stringify({
@@ -125,7 +131,7 @@ console.log('🧪 开始运行 AG 引擎 OpenAI 双协议兼容测试 (含 Hark 
     }),
     JSON.stringify({
       response: {
-        candidates: [{ finishReason: 'STOP' }],
+        candidates: [{ finishReason: 'MAX_TOKENS' }],
         usageMetadata: {
           promptTokenCount: 10,
           candidatesTokenCount: 12,
@@ -169,10 +175,12 @@ console.log('🧪 开始运行 AG 引擎 OpenAI 双协议兼容测试 (含 Hark 
   assert.ok(fullOutput.includes('reasoning_content'), '必须包含 reasoning_content');
   assert.ok(fullOutput.includes('Think step 1...'), '必须包含思考内容');
   assert.ok(fullOutput.includes('The answer is 42.'), '必须包含正文回复');
+  assert.ok(fullOutput.includes('"finish_reason":"length"'), 'MAX_TOKENS 必须映射为 finish_reason=length');
   assert.ok(fullOutput.includes('data: [DONE]'), '必须以 [DONE] 正常闭合');
   assert.strictEqual(finishedUsage?.outcome, 'ok');
+  assert.strictEqual(finishedUsage?.thoughts_tokens, 6, 'thoughts_tokens 断言必须准确');
 
-  console.log('✅ 3. Google SSE -> OpenAI SSE 流式打字机与 [DONE] 帧测试通过');
+  console.log('✅ 3. Google SSE -> OpenAI SSE 流式打字机、finish_reason=length 与 usage 校验通过');
 }
 
 // 4. [P0 重点用例] 流式工具调用签名继承：真实 thoughtSignature 必须继承至 functionCall
@@ -261,4 +269,4 @@ console.log('🧪 开始运行 AG 引擎 OpenAI 双协议兼容测试 (含 Hark 
   console.log('✅ 5. [P1] 客户端断开严格熔断并记录 client_abort 验证通过');
 }
 
-console.log('🎉 所有 Hark 审查加固用例全部 100% 通过！');
+console.log('🎉 所有 Hark 审查加固与非流式签名继承测试 100% 全部通过！');

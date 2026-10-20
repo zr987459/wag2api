@@ -214,8 +214,12 @@ export function convertGoogleToOpenAI(googleResponse, clientModel) {
   let text = '';
   let reasoning = '';
   const toolCalls = [];
+  let latestSeenSignature = FALLBACK_THOUGHT_SIGNATURE;
 
   for (const part of parts) {
+    const sig = part.thoughtSignature || part.thought_signature;
+    if (sig) latestSeenSignature = sig;
+
     if (part.thought) {
       reasoning += part.text || '';
     } else if (part.text !== undefined && part.text !== '') {
@@ -224,8 +228,7 @@ export function convertGoogleToOpenAI(googleResponse, clientModel) {
 
     if (part.functionCall) {
       const callId = part.functionCall.id || newId('call_');
-      const sig = part.thoughtSignature || part.thought_signature;
-      signatureCache.set(callId, sig || FALLBACK_THOUGHT_SIGNATURE, part.functionCall.name);
+      signatureCache.set(callId, sig || latestSeenSignature || FALLBACK_THOUGHT_SIGNATURE, part.functionCall.name);
 
       toolCalls.push({
         id: callId,
@@ -379,6 +382,9 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
         }
 
         const candidate = inner?.candidates?.[0];
+        if (candidate?.finishReason === 'MAX_TOKENS') {
+          stopReason = 'length';
+        }
         const parts = candidate?.content?.parts || [];
 
         // 首帧吐 role: assistant
