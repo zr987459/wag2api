@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import { signatureCache, FALLBACK_THOUGHT_SIGNATURE } from './signature-cache.mjs';
 import { scrubIdentity } from './scrub.mjs';
 import { sanitizeSchema } from './schema-sanitizer.mjs';
-import { historyPin } from './history-pin.mjs';
+import { historyPin, nearSameText, sameVisibleParts, sameToolNames, looksTrimmed } from './history-pin.mjs';
 import { stripDowngradeNotice } from './downgrade-notice.mjs';
 import { pinToolDescriptions } from './session-router.mjs';
 import { normalizeGeminiUsage, toAnthropicUsage } from './usage.mjs';
@@ -19,7 +19,9 @@ import { normalizeGeminiUsage, toAnthropicUsage } from './usage.mjs';
 export function convertAnthropicToGoogle(anthropicRequest) {
   let systemInstruction = null;
   // Claude 上下文窗口较小，恢复被客户端裁剪的内容可能超限，只对 Gemini 启用历史锁定
-  historyPin.active = !String(anthropicRequest.model || '').toLowerCase().includes('claude');
+  // 另外：只有客户端带了真实会话 id 才启用。按首条消息哈希推出的 conv 在"固定前缀"的客户端上会让不同对话撞 key，导致串台。
+  historyPin.active = !String(anthropicRequest.model || '').toLowerCase().includes('claude')
+    && Boolean(anthropicRequest._gwSessionKey);
   // 优先采用全局会话唯一标识，保证多轮交互及子代理中 conv 绝对稳定，避免首条消息微变导致历史锁定全部脱靶
   const conv = anthropicRequest._gwSessionKey
     ? crypto.createHash('sha1').update(anthropicRequest._gwSessionKey).digest('hex').slice(0, 12)
@@ -90,7 +92,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
             thoughtSignature: sig,
             functionCall: {
               name: item.name,
-              args: historyPin.pin(conv + ':fc:' + callId + ':' + item.name, item.input || {}),
+              args: historyPin.pinIf(conv + ':fc:' + callId + ':' + item.name, item.input || {}, (prev, cur) => JSON.stringify(prev) === JSON.stringify(cur) || JSON.stringify(cur).length < JSON.stringify(prev).length),
             },
           });
         } else if (item.type === 'tool_result') {
@@ -102,7 +104,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
           if (typeof responseContent !== 'string') {
             responseContent = JSON.stringify(responseContent);
           }
-          responseContent = historyPin.pin(conv + ':fr:' + toolCallId + ':' + actualName, responseContent);
+          responseContent = historyPin.pinIf(conv + ':fr:' + toolCallId + ':' + actualName, responseContent, looksTrimmed);
 
           parts.push({
             functionResponse: {
@@ -160,7 +162,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
     // 会话级全量工具声明锁定：Pi/Claude 在后续特定轮次（如运行子工具、测试等）可能会微调个别工具的入参或说明，
     // 这会导致顶层 tools 哈希瞬变，进而击穿整个 10 万+ Token 的长会话缓存。在此强制锁定首轮的工具全量声明。
     if (historyPin.active) {
-      functionDeclarations = historyPin.pin(conv + ':tools', functionDeclarations);
+      functionDeclarations = historyPin.pinIf(conv + ':tools', functionDeclarations, sameToolNames);
     } else {
       functionDeclarations = pinToolDescriptions(conv, functionDeclarations);
     }
@@ -187,7 +189,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
     // 这会导致从最前面的第 1 条模型消息起，哈希瞬间发生断裂，导致后续整整 24 万+ Token 的庞大缓存全盘清零（0%）！
     // 在此锁定首次见到的模型完整 parts（含 thought 标识与原始签名），彻底免疫客户端的中间修剪！
     if (c.role === 'model' && historyPin.active) {
-      c.parts = historyPin.pin(`${conv}:model_parts:${idx}`, c.parts);
+      c.parts = historyPin.pinIf(`${conv}:model_parts:${idx}`, c.parts, sameVisibleParts);
     }
   }
 
@@ -196,7 +198,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
   if (historyPin.active && contents.length > 0 && contents[0].role === 'user') {
     const firstPart = contents[0].parts?.[0];
     if (firstPart && typeof firstPart.text === 'string') {
-      firstPart.text = historyPin.pin(conv + ':u:0', firstPart.text);
+      firstPart.text = historyPin.pinIf(conv + ':u:0', firstPart.text, nearSameText);
     }
   }
 
@@ -206,7 +208,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
   //    如果开启了历史锁定，仅对 systemInstruction 本身做稳定化。
   if (historyPin.active && systemInstruction) {
     const cur = systemInstruction.parts[0].text;
-    const pinned = historyPin.pin(conv + ':sys', cur);
+    const pinned = historyPin.pinIf(conv + ':sys', cur, nearSameText);
     if (pinned) {
       systemInstruction = { role: 'user', parts: [{ text: pinned }] };
     }
