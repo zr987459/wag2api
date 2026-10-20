@@ -29,6 +29,30 @@ export class AccountPool {
         }
       }
     }
+
+    // 环境变量自动注入（Render / 云端部署利器）
+    const envAg = process.env.AG_ACCOUNTS || process.env.AG_TOKENS || process.env.GOOGLE_ACCOUNTS;
+    if (envAg) {
+      try {
+        let items = [];
+        try {
+          const parsed = JSON.parse(envAg);
+          items = Array.isArray(parsed) ? parsed : [parsed];
+        } catch (e) {
+          // 支持单行裸 refreshToken 格式: email:refreshToken
+          const parts = envAg.split(':');
+          if (parts.length >= 2) items = [{ email: parts[0], refreshToken: parts.slice(1).join(':') }];
+        }
+        for (const it of items) {
+          if (it.refreshToken && it.email) {
+            this.addAccount(it.refreshToken, it.email, it.projectId || '');
+            console.log(`[AccountPool] 成功从环境变量注入 AG 账号: ${it.email}`);
+          }
+        }
+      } catch (e) {
+        console.warn('[AccountPool] 环境变量注入 AG 账号失败:', e.message);
+      }
+    }
   }
 
   addAccount(refreshToken, email, projectId = '') {

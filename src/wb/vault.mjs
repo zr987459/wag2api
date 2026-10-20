@@ -34,6 +34,17 @@ export class AccountVault {
     this.syncAuthsDir();
     // auths/ 是镜像：缺的补上（例如从云端恢复后）
     for (const a of this.list) if (a.uid && a.accessToken && !fs.existsSync(path.join(this.authsDir, `workbuddy-${a.uid}.json`))) this.writeAuthFile(a);
+
+    // 环境变量自动注入（Render / 云端部署利器，容器重启永不丢失）
+    const envToken = process.env.WB_TOKEN || process.env.WORKBUDDY_TOKEN || process.env.WB_ACCOUNTS;
+    if (envToken) {
+      try {
+        const [ok, msg] = this.importToken(envToken);
+        if (ok) console.log(`[AccountVault] 成功从环境变量注入 WB 账号: ${msg}`);
+      } catch (e) {
+        console.warn('[AccountVault] 环境变量注入 WB 账号失败:', e.message);
+      }
+    }
   }
 
   /** @param quiet 只改了易变字段（最近使用、计数），不触发云端同步 */
