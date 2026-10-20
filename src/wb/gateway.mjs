@@ -16,6 +16,7 @@ import {
   UPSTREAM_GLOBAL, UPSTREAM_CN, ORIGIN_CN, CLIENT_UA, DEFAULT_SYSTEM_PROMPT, DEFAULT_MODEL, MODEL_ALIASES,
 } from './constants.mjs';
 import { sanitizeWafPayload } from './waf-sanitizer.mjs';
+import { repairToolPairing } from './convert.mjs';
 
 const MAX_ACCOUNT_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 1200;
@@ -131,7 +132,6 @@ export function buildUpstreamPayload(payload, clean, reasoningLookup) {
   }
   if (!hasSystem) norm.push({ role: 'system', content: DEFAULT_SYSTEM_PROMPT });
   norm.push(...src);
-  up.messages = norm;
 
   // 真正的新一轮 user（排除紧跟在 role:tool 后的拆分片段）
   let lastUserIdx = -1;
@@ -148,6 +148,7 @@ export function buildUpstreamPayload(payload, clean, reasoningLookup) {
       }
     }
   }
+  up.messages = repairToolPairing(norm);
   return up;
 }
 

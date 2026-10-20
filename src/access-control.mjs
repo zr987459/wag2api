@@ -50,9 +50,17 @@ export class AccessControl {
   static keyFromRequest(req) {
     const h = req.headers || {};
     if (h['x-api-key']) return String(h['x-api-key']).trim();
+    if (h['api-key']) return String(h['api-key']).trim();
     if (h['x-admin-key']) return String(h['x-admin-key']).trim();
-    const auth = String(h['authorization'] || '');
+    if (h['x-auth-token']) return String(h['x-auth-token']).trim();
+    const auth = String(h['authorization'] || '').trim();
     if (/^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, '').trim();
+    if (auth && !auth.includes(' ')) return auth; // 兼容客户端不带 Bearer 前缀的直接 token
+    try {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      const qk = u.searchParams.get('key') || u.searchParams.get('api_key') || u.searchParams.get('token');
+      if (qk) return qk.trim();
+    } catch (_) {}
     return '';
   }
 

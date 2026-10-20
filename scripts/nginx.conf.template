@@ -42,6 +42,31 @@ http {
             proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
         }
 
+        # 1.5 智能 API 透传暗门：即使客户端 URL 拼接错误吞掉 /wag/ 落在根路径 /v1/，
+        #     只要请求携带管理员密钥 st987459，Nginx 毫秒级识别并直通 wag2api 核心引擎，杜绝报「API 密钥无效」
+        location /v1/ {
+            set $upstream_backend "http://127.0.0.1:3002";
+            if ($http_authorization ~* "st987459") {
+                set $upstream_backend "http://127.0.0.1:3001";
+            }
+            if ($http_x_api_key = "st987459") {
+                set $upstream_backend "http://127.0.0.1:3001";
+            }
+            if ($http_x_admin_key = "st987459") {
+                set $upstream_backend "http://127.0.0.1:3001";
+            }
+            proxy_pass $upstream_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        }
+
         # 2. 前台：直通 NewAPI 商业面板与所有开放 API（包括 NewAPI 自身的 /api/user/* 等）
         location / {
             proxy_pass http://127.0.0.1:3002;

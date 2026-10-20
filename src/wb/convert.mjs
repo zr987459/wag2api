@@ -112,13 +112,25 @@ export function repairToolPairing(msgs) {
   const out = [];
   let i = 0;
   while (i < msgs.length) {
-    const m = msgs[i++];
+    const rawM = msgs[i++];
+    if (!rawM || typeof rawM !== 'object') continue;
+    const m = { ...rawM };
+    // 兼容部分旧客户端使用的 role: 'function'
+    if (m.role === 'function') {
+      m.role = 'tool';
+      if (!m.tool_call_id && m.name) m.tool_call_id = m.name;
+    }
     if (m.role === 'tool') continue;
     out.push(m);
     if (!Array.isArray(m.tool_calls)) continue;
     const pending = new Set(m.tool_calls.map(c => c.id));
-    while (i < msgs.length && msgs[i].role === 'tool') {
-      const t = msgs[i++];
+    while (i < msgs.length && (msgs[i].role === 'tool' || msgs[i].role === 'function')) {
+      const rawT = msgs[i++];
+      const t = { ...rawT };
+      if (t.role === 'function') {
+        t.role = 'tool';
+        if (!t.tool_call_id && t.name) t.tool_call_id = t.name;
+      }
       if (pending.delete(t.tool_call_id)) out.push(t);
     }
     for (const id of pending) out.push({ role: 'tool', tool_call_id: id, content: '[no result: tool call was interrupted]' });
