@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import {
   UPSTREAM_GLOBAL, UPSTREAM_CN, ORIGIN_CN, CLIENT_UA, DEFAULT_SYSTEM_PROMPT, DEFAULT_MODEL, MODEL_ALIASES,
 } from './constants.mjs';
+import { sanitizeWafPayload } from './waf-sanitizer.mjs';
 
 const MAX_ACCOUNT_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 1200;
@@ -250,8 +251,9 @@ export class TencentGateway {
   async streamChat(payload, convId, onLine, opts = {}) {
     const { realm, clean } = resolveModel(payload.model);
     const base = realm === 'global' ? UPSTREAM_GLOBAL : UPSTREAM_CN;
-    const up = buildUpstreamPayload(payload, clean, id => this.getReasoningByToolId(id));
-    const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, signal: opts.signal, used: opts.used, emittedAny: false };
+    const { payload: sanitizedPayload, restorer } = sanitizeWafPayload(payload);
+    const up = buildUpstreamPayload(sanitizedPayload, clean, id => this.getReasoningByToolId(id));
+    const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, restorer, signal: opts.signal, used: opts.used, emittedAny: false };
 
     try {
       return await this._rotate(ctx, new Set());
@@ -368,18 +370,39 @@ export class TencentGateway {
             if (!isLast || limitedBefore) return { err };
             throw err;
           }
+          let lineToSend = line;
           if (line.startsWith('data: ')) {
             const s = line.slice(6).trim();
             if (s.startsWith('{')) {
               try {
-                const d = JSON.parse(s).choices?.[0]?.delta;
-                if (d && d.reasoning_content) reasoning += d.reasoning_content;
-                if (d && Array.isArray(d.tool_calls)) for (const tc of d.tool_calls) if (tc && tc.id) toolIds.push(tc.id);
+                const chunkObj = JSON.parse(s);
+                const d = chunkObj.choices?.[0]?.delta;
+                if (d) {
+                  if (ctx.restorer && ctx.restorer.hasTokens) {
+                    if (d.content) d.content = ctx.restorer.processContent(d.content);
+                    if (d.reasoning_content) d.reasoning_content = ctx.restorer.processReasoning(d.reasoning_content);
+                  }
+                  if (d.reasoning_content) reasoning += d.reasoning_content;
+                  if (Array.isArray(d.tool_calls)) for (const tc of d.tool_calls) if (tc && tc.id) toolIds.push(tc.id);
+                  lineToSend = `data: ${JSON.stringify(chunkObj)}`;
+                }
               } catch (e) { /* 非 JSON 帧照样透传 */ }
+            } else if (s === '[DONE]') {
+              if (ctx.restorer && ctx.restorer.hasTokens) {
+                const flContent = ctx.restorer.flushContent();
+                const flReasoning = ctx.restorer.flushReasoning();
+                if (flContent || flReasoning) {
+                  const flushDelta = {};
+                  if (flContent) flushDelta.content = flContent;
+                  if (flReasoning) flushDelta.reasoning_content = flReasoning;
+                  const flushChunk = { choices: [{ delta: flushDelta, finish_reason: null }] };
+                  ctx.onLine(`data: ${JSON.stringify(flushChunk)}\n\n`);
+                }
+              }
             }
           }
           ctx.emittedAny = true;
-          if (ctx.onLine(`${line}\n\n`) === false) { ctl.abort(new Error('client closed')); break; }
+          if (ctx.onLine(`${lineToSend}\n\n`) === false) { ctl.abort(new Error('client closed')); break; }
         }
       } catch (e) {
         if (ctx.signal && ctx.signal.aborted) return { done: true };
