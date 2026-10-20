@@ -41,6 +41,11 @@ import {
   convertGoogleToOpenAI,
   handleOpenAIStreamConversion,
 } from './openai-ag-converter.mjs';
+import {
+  openaiRequestToAnthropic,
+  convertGoogleToOpenAI,
+  handleOpenAIStreamConversion,
+} from './openai-ag-converter.mjs';
 import { cacheProbe } from './cache-probe.mjs';
 import { historyPin } from './history-pin.mjs';
 import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
