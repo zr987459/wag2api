@@ -121,9 +121,11 @@ export class AccountScheduler {
     return chosen;
   }
 
-  /** 成功出流或选号时记最近使用（易变字段，不触发云端同步） */
+  /** 成功出流或选号时记最近使用（单调递增戳，防同毫秒并发突发扎堆钉死单账号，易变字段，不触发云端同步） */
   touch(uid) {
-    this.vault.updateAccount(uid, a => { a.last_used = Date.now(); }, { quiet: true });
+    const now = Math.max(Date.now(), (this._lastStamp || 0) + 1);
+    this._lastStamp = now;
+    this.vault.updateAccount(uid, a => { a.last_used = now; }, { quiet: true });
   }
 
   /**

@@ -227,6 +227,15 @@ test('调度：会话亲和表 (Session Affinity) 粘滞与 429 遇冷换绑 (�
   const oldEpoch = curBinding.epoch - 1;
   const staleRes = s.bindSession('conv-alice', 'u1', oldEpoch);
   assert.equal(staleRes.uid, rebountAcc.uid, 'CAS 校验失败时不可覆盖较新的绑定');
+
+  // 5. 同毫秒高并发突发测试：先清空冷却，30 个新会话同时接入，必须严格按 10/10/10 均摊到 3 个账号
+  s.clearAllCooldowns();
+  const burstCounts = { u1: 0, u2: 0, u3: 0 };
+  for (let i = 0; i < 30; i++) {
+    const acc = s.pick('global', new Set(), `burst-session-${i}`);
+    burstCounts[acc.uid]++;
+  }
+  assert.deepEqual(burstCounts, { u1: 10, u2: 10, u3: 10 }, '同毫秒突发新会话必须严格均匀轮询，杜绝扎堆钉死');
 });
 
 // ── gateway ────────────────────────────────────────────────
