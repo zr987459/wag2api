@@ -150,7 +150,8 @@ const WEB_DIR = [process.env.WEB_DIR, path.join(__dirname, 'web'), path.join(__d
   .find(d => d && fs.existsSync(path.join(d, 'index.html')));
 
 function serveWeb(pathname, res) {
-  const name = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const cleanPath = pathname.replace(/^\/(panel|wag)(\/|$)/, '/');
+  const name = cleanPath === '/' ? 'index.html' : cleanPath.replace(/^\/+/, '');
   if (!/^[A-Za-z0-9_.-]+$/.test(name)) return false;
   const type = WEB_TYPES[path.extname(name)];
   if (!type) return false;
@@ -197,8 +198,9 @@ const server = http.createServer(async (req, res) => {
     url.pathname = p;
   }
 
-  // 1. 控制台（新版双引擎界面；独立运行时只有 AG）
-  if (req.method === 'GET' && (url.pathname === '/' || /^\/[A-Za-z0-9_.-]+\.(html|js|css|json|svg|png)$/.test(url.pathname)) && serveWeb(url.pathname, res)) {
+  // 1. 控制台（新版双引擎界面；独立运行时只有 AG，支持 /panel 与 /wag 专属管理入口）
+  const isWebPath = url.pathname === '/' || /^\/(panel|wag)(\/|$)/.test(url.pathname) || /^\/[A-Za-z0-9_.-]+\.(html|js|css|json|svg|png)$/.test(url.pathname);
+  if (req.method === 'GET' && isWebPath && serveWeb(url.pathname, res)) {
     return;
   }
   if (url.pathname === '/token' || url.pathname === '/get-token' || url.pathname === '/token.html') {

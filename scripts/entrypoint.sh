@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # wag2api All-in-One entrypoint
-#   默认：原生 wag2api 直接监听 $PORT（100% 向后兼容，无堆限制）
-#   合体：必须显式 ENABLE_NEW_API=1 且配置 SQL_DSN 时，NewAPI 对外、wag2api 内网 3001
+#   默认模式：原生 wag2api 直接监听 $PORT（100% 向后兼容，无堆限制）
+#   合体模式：必须显式 ENABLE_NEW_API=1 且配置 SQL_DSN 时，前置 Nginx 监听 $PORT 对外：
+#            - /panel/*, /wag/*, /api/*, /oauth-* -> wag2api (127.0.0.1:3001) 供主人管理加号
+#            - 其余全部 -> NewAPI (127.0.0.1:3002) 供群友注册、充值卡密、生成 sk- 独享 Key
 set -euo pipefail
 
 APP_DIR=/app
@@ -9,9 +11,10 @@ export PORT="${PORT:-8790}"
 NEWAPI_BIN="$APP_DIR/new-api"
 WAG_DIR="${WAG_DIR:-$APP_DIR}"
 WAG_PORT="${WAG_PORT:-3001}"
+NEWAPI_PORT="3002"
 NEWAPI_MODE=0
 
-# ---- 1. 判定是否启用 NewAPI（显式开关 + 强制要求 SQL_DSN，Hark 审查项）----
+# ---- 1. 判定是否启用 NewAPI（显式开关 + 强制要求 SQL_DSN）----
 if [ "${ENABLE_NEW_API:-0}" = "1" ]; then
   if [ -z "${SQL_DSN:-}" ]; then
     echo "[entrypoint] ⚠️ WARN: 开启了 ENABLE_NEW_API=1 但未配置 SQL_DSN！" >&2
@@ -34,36 +37,43 @@ if [ "$NEWAPI_MODE" = "0" ]; then
   exec node "$WAG_DIR/src/server.mjs"
 fi
 
-# ---- 3. All-in-One 合体模式（512MB 内存严格受控）----
-echo "[entrypoint] 启动模式: all-in-one | NewAPI(对外):0.0.0.0:$PORT | wag2api(内部算力):127.0.0.1:$WAG_PORT"
+# ---- 3. All-in-One 专业合体模式（Nginx 智能分流 + 双核守护）----
+echo "[entrypoint] 启动模式: all-in-one-pro | Nginx(对外):0.0.0.0:$PORT"
+echo "[entrypoint] 分流规则: /panel/ 专属管理暗门 -> wag2api:3001 | 商业系统与API -> NewAPI:3002"
 
-# [Hark 审查建议] 仅在合体模式下为 Node 注入堆限制，避免单进程模式受影响
+# 仅在合体模式下为 Node 注入堆限制，安全守住 512MB 内存底线
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=192}"
 
-# 启动内部 wag2api 引擎（仅内网监听，供 NewAPI 渠道调用）
+# 1. 启动内部 wag2api 算力与管理引擎 (127.0.0.1:3001)
 PORT="$WAG_PORT" HOST=127.0.0.1 node "$WAG_DIR/src/server.mjs" &
 WAG_PID=$!
 
-# 启动对外 NewAPI
-PORT="$PORT" GIN_MODE=release "$NEWAPI_BIN" --port "$PORT" &
+# 2. 启动内部 NewAPI 商业管理中心 (127.0.0.1:3002)
+PORT="$NEWAPI_PORT" GIN_MODE=release "$NEWAPI_BIN" --port "$NEWAPI_PORT" &
 NEWAPI_PID=$!
 
-echo "[entrypoint] wag2api 进程 PID=$WAG_PID, NewAPI 进程 PID=$NEWAPI_PID"
+# 3. 动态渲染 Nginx 端口模板并启动前置代理
+mkdir -p /tmp/client_body /tmp/proxy_temp /tmp/fastcgi_temp /tmp/uwsgi_temp /tmp/scgi_temp
+envsubst '${PORT}' < /app/scripts/nginx.conf.template > /tmp/nginx.conf
+nginx -c /tmp/nginx.conf -g 'daemon off;' &
+NGINX_PID=$!
+
+echo "[entrypoint] wag2api pid=$WAG_PID, new-api pid=$NEWAPI_PID, nginx pid=$NGINX_PID"
 
 IS_TERMINATING=0
 term_handler() {
   echo "[entrypoint] 收到停机信号 (SIGTERM/SIGINT)，执行优雅平滑退出..."
   IS_TERMINATING=1
-  kill -TERM "$WAG_PID" "$NEWAPI_PID" 2>/dev/null || true
-  wait "$WAG_PID" "$NEWAPI_PID" 2>/dev/null || true
-  echo "[entrypoint] 两个进程均已安全退出，进程守护正常结束。"
+  kill -TERM "$WAG_PID" "$NEWAPI_PID" "$NGINX_PID" 2>/dev/null || true
+  wait "$WAG_PID" "$NEWAPI_PID" "$NGINX_PID" 2>/dev/null || true
+  echo "[entrypoint] 所有子进程均已安全退出，进程守护正常结束。"
   exit 0
 }
 trap term_handler SIGTERM SIGINT
 
 # ---- 4. 守护：任一子进程异常崩溃退出时快速退出自愈 ----
 set +e
-wait -n "$WAG_PID" "$NEWAPI_PID"
+wait -n "$WAG_PID" "$NEWAPI_PID" "$NGINX_PID"
 EXIT_STATUS=$?
 set -e
 
@@ -72,6 +82,6 @@ if [ "$IS_TERMINATING" = "1" ]; then
 fi
 
 echo "[entrypoint] ⚠️ 检测到子进程异常退出 (退出码=$EXIT_STATUS)，立即终止容器以触发云端自愈重启！" >&2
-kill -TERM "$WAG_PID" "$NEWAPI_PID" 2>/dev/null || true
+kill -TERM "$WAG_PID" "$NEWAPI_PID" "$NGINX_PID" 2>/dev/null || true
 wait 2>/dev/null || true
 exit 1
