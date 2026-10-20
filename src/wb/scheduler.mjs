@@ -1,14 +1,20 @@
 /**
- * 账号调度（翻译自 AccountScheduler.kt）：手动选中优先 → 非冷却账号按最久未用轮询 → 全冷却取最快恢复的。
- * 429 / 14003 给账号打 8 秒短冷却；冷却只在内存。
+ * 账号调度（翻译自 AccountScheduler.kt，已接入工业级会话亲和表 Session Affinity）：
+ * 1. 手动选中优先：如果用户锁定某个账号，优先使用；
+ * 2. 会话亲和表（Session Affinity）：同一个 convId 严格锁定同一个账号，复用腾讯 DeepSeek 的 KV-Cache；
+ * 3. 负载均衡与冷却避障：遇到 429 / 14003 打 8 秒短冷却，并以 CAS 方式将该会话无感重绑到其他健康账号；
+ * 4. 滑动 TTL（30 分钟）+ LRU（上限 5000 条），防止内存膨胀。
  */
 export const DEFAULT_COOLDOWN_MS = 8000;
+export const WB_SESSION_TTL_MS = 30 * 60 * 1000; // 30 分钟滑动 TTL
+export const MAX_AFFINITY_ENTRIES = 5000;
 
 export class AccountScheduler {
   constructor(vault, settings) {
     this.vault = vault;
     this.settings = settings;
     this.cooldownUntil = new Map();
+    this.sessionAffinity = new Map(); // convId -> { uid, epoch, expireAt }
   }
 
   getSelectedUid() { return this.settings.get('selected_uid') || ''; }
@@ -30,26 +36,96 @@ export class AccountScheduler {
     return left > 0 ? Math.ceil(left / 1000) : 0;
   }
 
-  pick(realm, exclude = new Set()) {
+  // 会话亲和绑定更新（支持 CAS 防止并发抖动）
+  bindSession(sessionKey, uid, expectedEpoch = null) {
+    if (!sessionKey || !uid) return null;
+    const cur = this.sessionAffinity.get(sessionKey);
+    // CAS 保护：如果外部指定了 expectedEpoch，且当前 epoch 已被其他并发请求递增，说明已被抢先换绑，复用新绑定
+    if (expectedEpoch !== null && cur && cur.epoch !== expectedEpoch) {
+      return cur;
+    }
+    const epoch = cur ? cur.epoch + 1 : 1;
+    if (this.sessionAffinity.has(sessionKey)) {
+      this.sessionAffinity.delete(sessionKey);
+    } else if (this.sessionAffinity.size >= MAX_AFFINITY_ENTRIES) {
+      const oldest = this.sessionAffinity.keys().next().value;
+      this.sessionAffinity.delete(oldest);
+    }
+    const binding = { uid, epoch, expireAt: Date.now() + WB_SESSION_TTL_MS };
+    this.sessionAffinity.set(sessionKey, binding);
+    return binding;
+  }
+
+  getBinding(sessionKey) {
+    if (!sessionKey) return null;
+    const b = this.sessionAffinity.get(sessionKey);
+    if (!b) return null;
+    if (Date.now() >= b.expireAt) {
+      this.sessionAffinity.delete(sessionKey);
+      return null;
+    }
+    // 滑动 TTL 与 LRU 位置刷新
+    b.expireAt = Date.now() + WB_SESSION_TTL_MS;
+    this.sessionAffinity.delete(sessionKey);
+    this.sessionAffinity.set(sessionKey, b);
+    return b;
+  }
+
+  /**
+   * 选号核心：手动指定 > 会话亲和粘滞 > 未冷却 LRU 最久未用 > 全冷却取最快恢复
+   * @param {string} realm 'global' 或 'cn'
+   * @param {Set<string>} exclude 需排除的 uid 集合
+   * @param {string} sessionKey 客户端会话标识 (convId)
+   */
+  pick(realm, exclude = new Set(), sessionKey = '') {
     const all = this.vault.getAccounts();
     const usable = a => !a.disabled && a.uid && !exclude.has(a.uid);
     let candidates = all.filter(a => usable(a) && a.realm === realm);
     if (!candidates.length) candidates = all.filter(usable); // 兼容 realm 缺失的老数据
     if (!candidates.length) return null;
 
+    // 1. 手动锁定某账号时优先使用
     const selected = this.getSelectedUid();
     if (selected) {
-      const s = candidates.find(a => a.uid === selected && !this.isCooling(selected));
+      const s = candidates.find(a => a.uid === selected && !this.isCooling(selected) && !exclude.has(selected));
       if (s) return s;
     }
+
+    // 2. 会话亲和表查询（优先命中同会话锁定的账号，保住腾讯上游 KV-Cache）
+    if (sessionKey) {
+      const bound = this.getBinding(sessionKey);
+      if (bound) {
+        const boundAcc = candidates.find(a => a.uid === bound.uid);
+        if (boundAcc && !this.isCooling(boundAcc.uid) && !exclude.has(boundAcc.uid)) {
+          return boundAcc;
+        }
+      }
+    }
+
+    // 3. 新分配或遇冷换号：在未冷却候选账号中，按最久未用 (LRU) 均摊并发
     const healthy = candidates.filter(a => !this.isCooling(a.uid));
-    if (healthy.length) return healthy.reduce((m, a) => ((a.last_used || 0) < (m.last_used || 0) ? a : m));
-    return candidates.reduce((m, a) => (this.cooldownRemainSec(a.uid) < this.cooldownRemainSec(m.uid) ? a : m));
+    let chosen = null;
+    if (healthy.length) {
+      chosen = healthy.reduce((m, a) => ((a.last_used || 0) < (m.last_used || 0) ? a : m));
+    } else {
+      chosen = candidates.reduce((m, a) => (this.cooldownRemainSec(a.uid) < this.cooldownRemainSec(m.uid) ? a : m));
+    }
+
+    // 自动为新会话绑定亲和表，并立即更新 last_used 避免突发新并发扎堆钉死单账号（Hark 审查加固）
+    if (chosen) {
+      this.touch(chosen.uid);
+      if (sessionKey) {
+        this.bindSession(sessionKey, chosen.uid);
+      }
+    }
+    return chosen;
   }
 
-  /** 成功出流后记最近使用（易变字段，不触发云端同步） */
+  /** 成功出流或选号时记最近使用（单调递增戳，防同毫秒并发突发扎堆钉死单账号，易变字段，不触发云端同步） */
   touch(uid) {
-    this.vault.updateAccount(uid, a => { a.last_used = Date.now(); }, { quiet: true });
+    const now = Math.max(Date.now(), (this._lastStamp || 0) + 1);
+    this._lastStamp = now;
+    this.vault.updateAccount(uid, a => { a.last_used = now; }, { quiet: true });
   }
 
   /**
@@ -89,4 +165,5 @@ export class AccountScheduler {
   }
 
   clearAllCooldowns() { this.cooldownUntil.clear(); }
+  clearAffinity() { this.sessionAffinity.clear(); }
 }

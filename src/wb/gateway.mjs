@@ -285,7 +285,7 @@ export class TencentGateway {
     const endpoints = [`${ctx.base}/v2/chat/completions`, `${ctx.base}/console/chat/completions`];
     let lastErr = null;
     for (let attempt = 1; attempt <= MAX_ACCOUNT_ATTEMPTS; attempt++) {
-      const acc = this.scheduler.pick(ctx.realm, triedUids) || this.vault.getActiveAccount(ctx.realm);
+      const acc = this.scheduler.pick(ctx.realm, triedUids, ctx.convId) || this.vault.getActiveAccount(ctx.realm);
       if (!acc) throw new Error('未登录账号，请先在面板添加账号');
       const uid = acc.uid || 'user_default';
       triedUids.add(uid);

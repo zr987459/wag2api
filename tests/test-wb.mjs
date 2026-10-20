@@ -192,6 +192,52 @@ test('调度：手动选中 → 最久未用 → 全冷却取最快恢复', () =
   assert.deepEqual(v.find('a').token_usage, { request_count: 2, total_tokens: 7 });
 });
 
+test('调度：会话亲和表 (Session Affinity) 粘滞与 429 遇冷换绑 (含 CAS 保护)', () => {
+  const dir = tmp();
+  const v = new AccountVault(dir);
+  const s = new AccountScheduler(v, new Settings(dir));
+  v.saveAccount('u1', 'User1', 'global', 't1', '');
+  v.saveAccount('u2', 'User2', 'global', 't2', '');
+  v.saveAccount('u3', 'User3', 'global', 't3', '');
+
+  // 1. 首次提问分配账号（按 LRU）并锁定亲和
+  const first = s.pick('global', new Set(), 'conv-alice');
+  assert.ok(first && first.uid);
+  const lockedUid = first.uid;
+
+  // 2. 模拟后续 10 轮对话：在无冷却情况下 100% 锁定该账号（保住腾讯 KV-Cache）
+  for (let i = 0; i < 10; i++) {
+    const next = s.pick('global', new Set(), 'conv-alice');
+    assert.equal(next.uid, lockedUid, `第 ${i + 1} 轮对话必须严格锁定同一账号保住 KV-Cache`);
+  }
+
+  // 3. 模拟撞上 429 限流：lockedUid 进入冷却
+  s.markCooling(lockedUid, 8000);
+  // conv-alice 发起新一轮提问，必须自动绕行至其他健康账号并更新绑定
+  const rebountAcc = s.pick('global', new Set([lockedUid]), 'conv-alice');
+  assert.notEqual(rebountAcc.uid, lockedUid, '遇冷时必须无感换号重派');
+
+  // 下一次提问，亲和表已自动更新为新账号并继续锁定
+  const reboundNext = s.pick('global', new Set(), 'conv-alice');
+  assert.equal(reboundNext.uid, rebountAcc.uid, '换号后会话亲和表无缝更新并保持粘滞');
+
+  // 4. CAS 保护测试：慢请求携带旧 epoch 不能覆盖新 epoch
+  const curBinding = s.getBinding('conv-alice');
+  assert.ok(curBinding);
+  const oldEpoch = curBinding.epoch - 1;
+  const staleRes = s.bindSession('conv-alice', 'u1', oldEpoch);
+  assert.equal(staleRes.uid, rebountAcc.uid, 'CAS 校验失败时不可覆盖较新的绑定');
+
+  // 5. 同毫秒高并发突发测试：先清空冷却，30 个新会话同时接入，必须严格按 10/10/10 均摊到 3 个账号
+  s.clearAllCooldowns();
+  const burstCounts = { u1: 0, u2: 0, u3: 0 };
+  for (let i = 0; i < 30; i++) {
+    const acc = s.pick('global', new Set(), `burst-session-${i}`);
+    burstCounts[acc.uid]++;
+  }
+  assert.deepEqual(burstCounts, { u1: 10, u2: 10, u3: 10 }, '同毫秒突发新会话必须严格均匀轮询，杜绝扎堆钉死');
+});
+
 // ── gateway ────────────────────────────────────────────────
 test('模型解析：cn: 前缀与别名', () => {
   assert.deepEqual(resolveModel('CN:Kimi-K3'), { realm: 'cn', clean: 'kimi-k3-1' });
