@@ -1,5 +1,5 @@
-# ---------- Stage 1: 取出 NewAPI 最新稳定单二进制 ----------
-FROM calciumion/new-api:latest AS newapi
+# ---------- Stage 1: 取出 NewAPI 稳定版本单二进制 ----------
+FROM calciumion/new-api:v1.0.0-rc.45 AS newapi
 
 # ---------- Stage 2: wag2api 运行时（glibc，与 NewAPI 二进制 100% 兼容） ----------
 FROM node:20-bookworm-slim
@@ -27,10 +27,8 @@ RUN mkdir -p data/accounts
 COPY scripts/entrypoint.sh /app/scripts/entrypoint.sh
 RUN chmod +x /app/scripts/entrypoint.sh
 
-# ---------- Hark 架构规范：512MB 容器严格内存预算 ----------
-# Go 软内存上限 160MiB；Node 堆上限 192MiB；两者总和控制在 350MiB 内，安全留足 160MiB 系统余量
+# ---------- 基础环境变量 ----------
 ENV GOMEMLIMIT=160MiB \
-    NODE_OPTIONS="--max-old-space-size=192" \
     WEB_DIR=/app/src/web \
     NODE_ENV=production \
     ENABLE_NEW_API=0
