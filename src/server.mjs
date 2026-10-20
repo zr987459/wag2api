@@ -305,6 +305,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/accounts/clear-cooldown' && req.method === 'POST') {
     accountPool.clearAllCooldowns();
+    cooldowns.clear();
     sendJson(res, 200, { ok: true, message: 'AG 账号池冷却已全部清除' });
     return;
   }
@@ -668,7 +669,13 @@ const server = http.createServer(async (req, res) => {
         });
 
         timing.switched_account = result.switchedAccount;
-        if (result.mgr) { activeMgr = result.mgr; statsEmail = activeMgr.tokenData.email; }
+        if (result.mgr) {
+          activeMgr = result.mgr;
+          statsEmail = activeMgr.tokenData.email;
+          if (anthropicReq._gwSessionKey) {
+            accountPool.bindSession(anthropicReq._gwSessionKey, activeMgr.tokenData.email);
+          }
+        }
         const modelUsed = result.modelUsed || anthropicReq.model;
         const dg = { model_used: modelUsed, downgraded: Boolean(result.downgraded), downgrade_reason: result.reason && result.downgraded ? result.reason : null };
         res.setHeader('X-Gateway-Model-Requested', String(anthropicReq.model || ''));
@@ -684,7 +691,11 @@ const server = http.createServer(async (req, res) => {
           const errDetail = e.body || 'Google 集群无响应';
           let status = 502, type = 'upstream_error';
           if (e.kind === 'bad_request') { status = e.status >= 400 && e.status < 500 ? e.status : 400; type = 'invalid_request_error'; }
-          else if (e.kind === 'quota') { status = 429; type = 'rate_limit_error'; }
+          else if (e.kind === 'quota') {
+            status = 429;
+            type = 'rate_limit_error';
+            accountPool.markCooling(activeMgr.tokenData.email, (e.retryDelaySec || 10) * 1000);
+          }
           if (result.reason && e.kind !== 'bad_request') res.setHeader('X-Gateway-Failure-Reason', result.reason);
 
           if (isOaiChat) {

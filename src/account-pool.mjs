@@ -1,11 +1,11 @@
 /**
  * Multi-Account Pool & Smart Concurrent Scheduler for Google Antigravity
  *
- * 遵循 Hark 架构规范：
- * 1. 状态机与冷却管理：429 / 配额耗尽打上冷却时间，冷却中的账号自动绕行；
- * 2. 会话粘滞 (Session Affinity)：同一会话优先绑定同一账号，100% 保持 Google KV-Cache 前缀命中；
- * 3. 智能负载均衡 (P2C / LRU)：新会话在健康账号中按最久未用与低负载分发，多人并发不堵车；
- * 4. 支持手动锁定与「自动轮询」双模式自由切换。
+ * 遵循 Hark 架构规范与审查防御：
+ * 1. 状态机与冷却管理：与 upstream-policy 联动，速率 429 与配额耗尽标记冷却并自动避障；
+ * 2. 会话粘滞 (Session Affinity)：会话亲和表（带 TTL 与 1000 条 LRU 上限防泄漏），保持 KV-Cache 前缀命中；
+ * 3. 换号后亲和表更新：因限流故障转移到新账号后，自动将会话重绑至新账号，防止振荡；
+ * 4. 兼容老接口：保留 switchAccount(email) 别名防 500。
  */
 
 import fs from 'fs';
@@ -14,6 +14,7 @@ import { TokenManager } from './token-manager.mjs';
 
 export const AG_DEFAULT_COOLDOWN_MS = 10000;
 export const AG_SESSION_TTL_MS = 30 * 60 * 1000; // 30 分钟会话亲和期
+export const MAX_AFFINITY_ENTRIES = 1000; // 内存保护：最多存 1000 个活跃会话
 
 export class AccountPool {
   constructor(accountsDir) {
@@ -37,7 +38,7 @@ export class AccountPool {
         const filePath = path.join(this.accountsDir, f);
         const tm = new TokenManager(filePath);
         if (tm.tokenData.email) {
-          const email = tm.tokenData.email.trim().toLowerCase();
+          const email = tm.tokenData.email.trim();
           this.managers.set(email, tm);
           if (!this.activeEmail) this.activeEmail = email;
         }
@@ -58,7 +59,7 @@ export class AccountPool {
         }
         for (const it of items) {
           if (it.refreshToken && it.email) {
-            this.addAccount(it.refreshToken, it.email, it.projectId || '');
+            this.addAccount(it.refreshToken, it.email.trim(), it.projectId || '');
             console.log(`[AccountPool] 成功从环境变量注入 AG 账号: ${it.email}`);
           }
         }
@@ -69,7 +70,7 @@ export class AccountPool {
   }
 
   addAccount(refreshToken, email, projectId = '') {
-    const cleanEmail = email.trim().toLowerCase();
+    const cleanEmail = (email || '').trim();
     const filename = `${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}.json`;
     const filePath = path.join(this.accountsDir, filename);
     const tm = new TokenManager(filePath);
@@ -80,13 +81,24 @@ export class AccountPool {
     return tm;
   }
 
+  // [P0 阻断修复] 保留 switchAccount 作为兼容别名，防止 /api/accounts/switch 报 500
+  switchAccount(email) {
+    this.setSelectedEmail(email);
+    return this.getActiveManager();
+  }
+
   removeAccount(email) {
-    const clean = (email || '').trim().toLowerCase();
+    const clean = (email || '').trim();
     if (this.managers.has(clean)) {
       try { this.managers.get(clean).stopKeepAlive?.(); } catch (e) {}
       this.managers.delete(clean);
       this.cooldownUntil.delete(clean);
       this.lastUsed.delete(clean);
+
+      // 清理 sessionAffinity 中的该账号
+      for (const [sKey, bound] of this.sessionAffinity.entries()) {
+        if (bound.email === clean) this.sessionAffinity.delete(sKey);
+      }
 
       const filename = `${clean.replace(/[^a-zA-Z0-9]/g, '_')}.json`;
       const filePath = path.join(this.accountsDir, filename);
@@ -121,13 +133,13 @@ export class AccountPool {
 
   // 冷却管理
   markCooling(email, ms = AG_DEFAULT_COOLDOWN_MS) {
-    const clean = (email || '').trim().toLowerCase();
+    const clean = (email || '').trim();
     this.cooldownUntil.set(clean, Date.now() + ms);
     console.log(`[AccountPool] 账号 ${clean} 进入冷却 (${Math.round(ms / 1000)}秒)`);
   }
 
   isCooling(email) {
-    const clean = (email || '').trim().toLowerCase();
+    const clean = (email || '').trim();
     const until = this.cooldownUntil.get(clean);
     if (!until) return false;
     if (Date.now() >= until) {
@@ -138,7 +150,7 @@ export class AccountPool {
   }
 
   cooldownRemainSec(email) {
-    const clean = (email || '').trim().toLowerCase();
+    const clean = (email || '').trim();
     const until = this.cooldownUntil.get(clean);
     if (!until) return 0;
     const left = until - Date.now();
@@ -152,19 +164,33 @@ export class AccountPool {
   // 调度设置
   getSelectedEmail() { return this.selectedEmail; }
   setSelectedEmail(email) {
-    this.selectedEmail = (email || '').trim().toLowerCase();
+    this.selectedEmail = (email || '').trim();
+    if (this.selectedEmail && this.managers.has(this.selectedEmail)) {
+      this.activeEmail = this.selectedEmail;
+    }
     console.log(`[AccountPool] 调度模式变更 ➔ ${this.selectedEmail ? '锁定账号: ' + this.selectedEmail : '全自动智能轮询'}`);
   }
 
   touch(email) {
     if (!email) return;
-    this.lastUsed.set(email.trim().toLowerCase(), Date.now());
+    this.lastUsed.set(email.trim(), Date.now());
+  }
+
+  // 会话亲和绑定更新（换号或新分配时调用）
+  bindSession(sessionKey, email) {
+    if (!sessionKey || !email) return;
+    // [P1 内存保护] 限制最多 1000 条，淘汰最早过期的项
+    if (this.sessionAffinity.size >= MAX_AFFINITY_ENTRIES) {
+      const oldestKey = this.sessionAffinity.keys().next().value;
+      this.sessionAffinity.delete(oldestKey);
+    }
+    this.sessionAffinity.set(sessionKey, { email: email.trim(), expireAt: Date.now() + AG_SESSION_TTL_MS });
   }
 
   /**
-   * 核心：智能选号（会话粘滞 + 负载均衡 + 冷却兜底）
-   * @param {string} sessionKey 客户端会话标识 (如 sha256 导出的会话 key)
-   * @param {Set<string>} exclude 本轮已重试过需排除的邮箱
+   * 核心：智能选号（会话粘滞 + 负载均衡 + 冷却避障）
+   * @param {string} sessionKey 客户端会话标识
+   * @param {Set<string>} exclude 需排除的邮箱
    */
   pickManager(sessionKey = '', exclude = new Set()) {
     if (this.managers.size === 0) return null;
@@ -180,7 +206,7 @@ export class AccountPool {
       }
     }
 
-    // 2. 会话亲和表查询：保住长会话的 Google KV-Cache
+    // 2. 会话亲和表查询：优先命中（保住 Google KV-Cache）
     if (sessionKey) {
       const bound = this.sessionAffinity.get(sessionKey);
       if (bound && bound.expireAt > Date.now()) {
@@ -193,7 +219,7 @@ export class AccountPool {
       }
     }
 
-    // 3. 新会话分配：在所有健康未冷却的账号中，选择最久未用 (LRU) 的账号均摊并发
+    // 3. 新会话分配：在健康未冷却的账号中，选择最久未用 (LRU) 的账号均摊并发
     const healthyEmails = usableEmails.filter(e => !this.isCooling(e));
     let chosenEmail = '';
 
@@ -213,9 +239,9 @@ export class AccountPool {
     if (chosenEmail) {
       this.touch(chosenEmail);
       if (sessionKey) {
-        this.sessionAffinity.set(sessionKey, { email: chosenEmail, expireAt: Date.now() + AG_SESSION_TTL_MS });
+        this.bindSession(sessionKey, chosenEmail);
       }
-      this.activeEmail = chosenEmail; // 兼容
+      this.activeEmail = chosenEmail;
       return this.managers.get(chosenEmail);
     }
 
@@ -224,6 +250,9 @@ export class AccountPool {
 
   getActiveManager() {
     if (this.managers.size === 0) return null;
+    if (this.selectedEmail && this.managers.has(this.selectedEmail)) {
+      return this.managers.get(this.selectedEmail);
+    }
     if (this.activeEmail && this.managers.has(this.activeEmail)) {
       return this.managers.get(this.activeEmail);
     }
@@ -234,8 +263,12 @@ export class AccountPool {
 
   getManager(email) {
     if (!email) return this.getActiveManager();
-    const clean = email.trim().toLowerCase();
+    const clean = email.trim();
     if (this.managers.has(clean)) return this.managers.get(clean);
+    // 容差大小写
+    for (const [k, v] of this.managers.entries()) {
+      if (k.toLowerCase() === clean.toLowerCase()) return v;
+    }
     return null;
   }
 

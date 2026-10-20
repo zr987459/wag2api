@@ -611,7 +611,10 @@ async function loadAgAccounts() {
     sch.innerHTML = `
       <div class="section-title" style="margin-bottom: 6px;">
         <span>账号调度</span>
-        <button class="btn btn-outline btn-sm" onclick="agClearCooldowns()">清除冷却</button>
+        <div style="display: flex; gap: 6px;">
+          <button class="btn btn-outline btn-sm" onclick="agRefreshAllQuota()">刷新全部额度</button>
+          <button class="btn btn-outline btn-sm" onclick="agClearCooldowns()">清除冷却</button>
+        </div>
       </div>
       <p class="muted" style="margin-bottom: 10px;">会话粘滞（保住 KV-Cache）+ 智能负载均衡，遇到限流自动冷却换号。</p>
       <div class="row-between" style="margin-bottom: 10px;">
