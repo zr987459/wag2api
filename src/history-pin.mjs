@@ -2,9 +2,15 @@
  * 历史锁定：部分客户端会在后续请求中改写旧的工具调用参数/工具结果（裁剪、去重、"[内容已清除]"）。
  * 这会让请求前缀与上游已缓存的版本不一致，导致隐式缓存从改写处整段失效。
  * 这里按 tool call id 记住第一次见到的内容，之后同一 id 一律按原样转发，保证前缀稳定。
- * 开启：环境变量 HISTORY_PIN=1（默认关闭）
+ * 默认开启，HISTORY_PIN=0 关闭。
+ *
+ * 安全约束（v1.3.4，修复跨会话串台）：
+ *  - 只在客户端带了真实会话 id 时启用（content-converter 负责判断）；按首条消息哈希推出来的 conv 不可靠，
+ *    固定前缀的客户端会让不同对话撞到同一个 key。
+ *  - 模型回复 / 首条提示 / 系统提示 / 工具声明用 pinIf：只有"同一内容的轻微改写"才还原，内容不同就覆盖旧记录，
+ *    绝不把别的对话的内容塞进当前请求。
  */
-const ENABLED = process.env.HISTORY_PIN !== '0'; // 默认开启：锁定同一工具调用的原始输出，防止客户端截断导致前缀缓存击穿
+const ENABLED = process.env.HISTORY_PIN !== '0';
 const TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_BYTES = 150 * 1024 * 1024;
 
@@ -57,6 +63,34 @@ class HistoryPin {
     return value;
   }
 
+  /**
+   * 带校验的锁定：命中且 same(旧值, 新值) 为真才返回旧值；否则用新值覆盖旧记录并原样返回新值。
+   */
+  pinIf(key, value, same) {
+    if (!ENABLED || !this.active || !key) return value;
+    const now = Date.now();
+    const old = this.map.get(key);
+    if (old && old.exp > now) {
+      let prev;
+      if (old.str !== undefined) prev = old.str;
+      else {
+        if (old.obj === undefined) { old.obj = deepFreeze(JSON.parse(old.json)); this.bytes += old.json.length; }
+        prev = old.obj;
+      }
+      let keep = false;
+      try { keep = Boolean(same(prev, value)); } catch (e) { keep = false; }
+      if (keep) {
+        old.exp = now + TTL_MS;
+        if (old.str !== undefined ? prev !== value : old.json !== JSON.stringify(value)) this.hits++;
+        return prev;
+      }
+      this.bytes -= entrySize(old);
+      this.map.delete(key);
+      this.overwrites = (this.overwrites || 0) + 1;
+    }
+    return this.pin(key, value);
+  }
+
   evict(now) {
     for (const [k, v] of this.map) {
       if (this.bytes <= MAX_BYTES && v.exp > now) break;
@@ -64,7 +98,46 @@ class HistoryPin {
     }
   }
 
-  stats() { return { enabled: ENABLED, entries: this.map.size, bytes: this.bytes, restored: this.hits }; }
+  stats() { return { enabled: ENABLED, entries: this.map.size, bytes: this.bytes, restored: this.hits, overwritten: this.overwrites || 0 }; }
 }
 
 export const historyPin = new HistoryPin();
+
+// ---- 校验函数 ----
+const norm = t => String(t ?? '').replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
+
+/** 文本近似相同：归一化空白后相等，或公共前缀 + 公共后缀覆盖较长串的 90% 以上（如只改了时间戳/环境信息）。 */
+export function nearSameText(a, b) {
+  const x = norm(a), y = norm(b);
+  if (x === y) return true;
+  const max = Math.max(x.length, y.length);
+  if (!max) return true;
+  if (Math.min(x.length, y.length) / max < 0.9) return false;
+  let p = 0; while (p < x.length && p < y.length && x[p] === y[p]) p++;
+  let s = 0; while (s < x.length - p && s < y.length - p && x[x.length - 1 - s] === y[y.length - 1 - s]) s++;
+  return (p + s) / max >= 0.9;
+}
+
+/** 模型回复可见内容（剔除 thought 与签名）一致：只允许还原被客户端剥掉/降级的思考块与签名。 */
+export function sameVisibleParts(a, b) {
+  const vis = ps => (Array.isArray(ps) ? ps : []).filter(p => p && !p.thought).map(p =>
+    p.functionCall ? 'fc:' + JSON.stringify([p.functionCall.name, p.functionCall.args ?? {}])
+      : p.functionResponse ? 'fr:' + p.functionResponse.name
+      : p.inlineData ? 'img:' + String(p.inlineData.data || '').length
+      : norm(p.text)).filter(Boolean).join('\n');
+  return vis(a) === vis(b);
+}
+
+/** 工具声明：工具名集合相同才还原（只吸收描述/参数的微调）。 */
+export function sameToolNames(a, b) {
+  const names = fs => (Array.isArray(fs) ? fs : []).map(f => f?.name || '').sort().join(',');
+  return names(a) === names(b);
+}
+
+/** 工具结果：仅当新内容像是被裁剪/清除时才还原。 */
+export function looksTrimmed(prev, cur) {
+  if (typeof prev !== 'string' || typeof cur !== 'string') return false;
+  if (cur === prev) return true;
+  if (cur.length < prev.length) return true;
+  return cur.length <= 200 && /清除|省略|截断|已移除|truncat|omit|clear|remov|elided/i.test(cur);
+}
