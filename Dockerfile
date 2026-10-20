@@ -19,6 +19,7 @@ RUN chmod +x /app/new-api
 
 # wag2api 代码与静态资产
 COPY package.json ./
+RUN npm install pg --omit=dev --no-audit --no-fund
 COPY src/ ./src/
 COPY app/app/src/main/assets/web/ ./src/web/
 

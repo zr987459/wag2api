@@ -78,6 +78,12 @@ export class AccountPool {
     if (projectId) tm.tokenData.projectId = projectId;
     this.managers.set(cleanEmail, tm);
     if (!this.activeEmail || !this.managers.has(this.activeEmail)) this.activeEmail = cleanEmail;
+
+    // 自动云端持久化到 Supabase
+    import('./db-vault.mjs').then(({ dbVault }) => {
+      dbVault.save(cleanEmail, 'ag_account', { email: cleanEmail, refreshToken, projectId });
+    }).catch(() => {});
+
     return tm;
   }
 
@@ -109,6 +115,12 @@ export class AccountPool {
       if (this.activeEmail === clean) {
         this.activeEmail = this.managers.size > 0 ? this.managers.keys().next().value : '';
       }
+
+      // 从云端数据库同步删除
+      import('./db-vault.mjs').then(({ dbVault }) => {
+        dbVault.remove(clean);
+      }).catch(() => {});
+
       return true;
     }
     return false;

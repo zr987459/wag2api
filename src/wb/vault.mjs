@@ -48,7 +48,15 @@ export class AccountVault {
   }
 
   /** @param quiet 只改了易变字段（最近使用、计数），不触发云端同步 */
-  save(quiet = false) { atomicWrite(this.file, JSON.stringify(this.list, null, 2)); if (!quiet) this.onChange(); }
+  save(quiet = false) {
+    atomicWrite(this.file, JSON.stringify(this.list, null, 2));
+    if (!quiet) {
+      this.onChange();
+      import('../db-vault.mjs').then(({ dbVault }) => {
+        dbVault.save('wb_accounts_main', 'wb_accounts', JSON.stringify(this.list));
+      }).catch(() => {});
+    }
+  }
 
   /** 把 auths/ 里尚未入库的官方凭证并入（与安卓扫描 filesDir/auths 等价） */
   syncAuthsDir() {
@@ -85,6 +93,39 @@ export class AccountVault {
       atomicWrite(path.join(this.authsDir, `workbuddy-${a.uid}.json`),
         JSON.stringify({ account: { uid: a.uid, nickname: a.nickname }, auth }, null, 2));
     } catch (e) { /* 镜像失败不影响主库 */ }
+  }
+
+  /** 从云端数据库或持久化全量恢复列表：保留现有状态，不重置 disabled/credits，不递归写库 */
+  restoreList(raw) {
+    if (!raw) return;
+    try {
+      const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!Array.isArray(arr) || !arr.length) return;
+      const byUid = new Map(this.list.map(a => [a.uid, a]));
+      for (const item of arr) {
+        if (!item || !item.uid || !item.accessToken) continue;
+        const existing = byUid.get(item.uid);
+        if (existing) {
+          existing.accessToken = item.accessToken;
+          if (item.refreshToken) existing.refreshToken = item.refreshToken;
+          if (item.nickname) existing.nickname = item.nickname;
+          if (item.disabled !== undefined) existing.disabled = Boolean(item.disabled);
+          if (item.credits !== undefined) existing.credits = item.credits;
+          if (item.in_pool !== undefined) existing.in_pool = Boolean(item.in_pool);
+        } else {
+          this.list.push({
+            ...newAccount(item.uid, item.nickname || 'WorkBuddy用户', item.realm || 'global', item.accessToken, item.refreshToken || ''),
+            disabled: Boolean(item.disabled),
+            credits: Number.isFinite(item.credits) ? item.credits : 350,
+            in_pool: item.in_pool !== undefined ? Boolean(item.in_pool) : true,
+          });
+        }
+      }
+      this.save(true);
+      for (const a of this.list) if (a.uid && a.accessToken) this.writeAuthFile(a);
+    } catch (e) {
+      console.warn('[AccountVault] restoreList 异常:', e.message);
+    }
   }
 
   saveAccount(uid, nickname, realm, accessToken, refreshToken) {
