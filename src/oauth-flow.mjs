@@ -58,23 +58,13 @@ export class OAuthFlowManager {
       }
     });
 
-    // 浏览器可能把 localhost 解析成 ::1，优先监听双栈，失败再退回 IPv4
-    const listenV4 = () => {
-      try {
-        this.server.listen(this.fixedPort, '0.0.0.0', () => {
-          console.log(`📡 Google OAuth 本地回调监听常驻在端口 ${this.fixedPort}`);
-        });
-      } catch (e) {}
-    };
-    this.server.once('error', (e) => {
-      if (e && e.code !== 'EADDRINUSE') listenV4();
-      this.server.on('error', () => {});
-    });
+    // 仅监听 127.0.0.1 本地回环，严禁监听 0.0.0.0，防止 Render/云端平台端口嗅探器误判其为公网主端口
     try {
-      this.server.listen({ port: this.fixedPort, host: '::', ipv6Only: false }, () => {
-        console.log(`📡 Google OAuth 本地回调监听常驻在端口 ${this.fixedPort}（双栈）`);
+      this.server.listen(this.fixedPort, '127.0.0.1', () => {
+        console.log(`📡 Google OAuth 本地回调监听常驻在 127.0.0.1:${this.fixedPort}`);
       });
-    } catch (e) { listenV4(); }
+    } catch (e) {}
+    this.server.on('error', () => {});
   }
 
   /**
