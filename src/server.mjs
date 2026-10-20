@@ -36,6 +36,11 @@ import {
 import { runWithPolicy, Cooldowns, shouldInsertNotice, buildDowngradeNotice } from './upstream-policy.mjs';
 import { convertGoogleToAnthropic } from './content-converter.mjs';
 import { handleStreamConversion } from './sse-streamer.mjs';
+import {
+  openaiRequestToAnthropic,
+  convertGoogleToOpenAI,
+  handleOpenAIStreamConversion,
+} from './openai-ag-converter.mjs';
 import { cacheProbe } from './cache-probe.mjs';
 import { historyPin } from './history-pin.mjs';
 import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
@@ -521,18 +526,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 9.5 OpenAI 兼容接口：/v1/chat/completions
-  if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-    if (access.enabled && !access.isAdmin(req)) {
-      sendJson(res, 401, { error: { message: 'Incorrect API key', type: 'invalid_request_error' } });
-      return;
-    }
-    sendJson(res, 400, { error: { message: '暂不支持 /v1/chat/completions，请使用 Anthropic 协议的 /v1/messages', type: 'invalid_request_error' } });
-    return;
-  }
-
-  // 10. 核心 Anthropic 协议推理接口：/v1/messages
-  if (url.pathname === '/v1/messages' && req.method === 'POST') {
+  // 10. 核心推理接口：OpenAI (/v1/chat/completions) 与 Anthropic (/v1/messages) 双协议兼容
+  const isOaiChat = url.pathname === '/v1/chat/completions';
+  const isAnthropicMsg = url.pathname === '/v1/messages';
+  if ((isOaiChat || isAnthropicMsg) && req.method === 'POST') {
     readRawBody(req).then(async (body) => {
       const startTime = Date.now();
       // PR2 分段打点：各时间点均为相对 startTime 的毫秒数；多次尝试时保留最后一次（即最终生效的那次）
@@ -545,11 +542,19 @@ const server = http.createServer(async (req, res) => {
       let statsModel = null;
       try {
         if (access.enabled && !access.isAdmin(req)) {
-          sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'API Key 无效或缺失 (x-api-key)' } });
+          if (isOaiChat) {
+            sendJson(res, 401, { error: { message: 'Incorrect API key', type: 'invalid_request_error' } });
+          } else {
+            sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'API Key 无效或缺失 (x-api-key)' } });
+          }
           return;
         }
 
-        const anthropicReq = JSON.parse(body);
+        const rawParsed = JSON.parse(body || '{}');
+        const anthropicReq = isOaiChat ? openaiRequestToAnthropic(rawParsed) : rawParsed;
+        if (isOaiChat && rawParsed.stream !== undefined) {
+          anthropicReq.stream = Boolean(rawParsed.stream);
+        }
         statsModel = anthropicReq.model;
 
         // Google / Antigravity 路由通道
@@ -562,12 +567,12 @@ const server = http.createServer(async (req, res) => {
 
         let activeMgr = accountPool.getActiveManager();
         if (!activeMgr) {
-          sendJson(res, 401, {
-            error: {
-              type: 'authentication_error',
-              message: '账号池暂无可用 Google 账号，请在控制台添加账号',
-            },
-          });
+          const errMsg = '账号池暂无可用 Google 账号，请在控制台添加账号';
+          if (isOaiChat) {
+            sendJson(res, 503, { error: { message: errMsg, type: 'server_error' } });
+          } else {
+            sendJson(res, 401, { error: { type: 'authentication_error', message: errMsg } });
+          }
           return;
         }
 
@@ -656,7 +661,12 @@ const server = http.createServer(async (req, res) => {
           if (e.kind === 'bad_request') { status = e.status >= 400 && e.status < 500 ? e.status : 400; type = 'invalid_request_error'; }
           else if (e.kind === 'quota') { status = 429; type = 'rate_limit_error'; }
           if (result.reason && e.kind !== 'bad_request') res.setHeader('X-Gateway-Failure-Reason', result.reason);
-          sendJson(res, status, { type: 'error', error: { type, message: errDetail } });
+
+          if (isOaiChat) {
+            sendJson(res, status, { error: { message: errDetail, type, code: status } });
+          } else {
+            sendJson(res, status, { type: 'error', error: { type, message: errDetail } });
+          }
           statsTracker.recordRequest({
             email: activeMgr.tokenData.email,
             model: anthropicReq.model,
@@ -672,7 +682,8 @@ const server = http.createServer(async (req, res) => {
         const response = result.response;
 
         if (isStreaming) {
-          await handleStreamConversion(response, res, modelUsed, (usage) => {
+          const streamHandler = isOaiChat ? handleOpenAIStreamConversion : handleStreamConversion;
+          await streamHandler(response, res, modelUsed, (usage) => {
             const status = usage.outcome === 'ok' ? 200 : usage.outcome === 'client_abort' ? 499 : 502;
             statsTracker.recordRequest({
               email: activeMgr.tokenData.email,
@@ -692,31 +703,54 @@ const server = http.createServer(async (req, res) => {
           }, startTime, { notice });
         } else {
           const googleData = await response.json();
-          const anthropicResp = convertGoogleToAnthropic(googleData, modelUsed);
-          if (notice) {
-            const tb = anthropicResp.content.find(b => b.type === 'text');
-            if (tb) tb.text = notice + tb.text;
-          }
-          sendJson(res, 200, anthropicResp);
+          if (isOaiChat) {
+            const oaiResp = convertGoogleToOpenAI(googleData, modelUsed);
+            if (notice && oaiResp.choices?.[0]?.message) {
+              const m = oaiResp.choices[0].message;
+              m.content = (m.content ? notice + m.content : notice);
+            }
+            sendJson(res, 200, oaiResp);
+            const u = oaiResp._gw_usage || {};
+            statsTracker.recordRequest({
+              email: activeMgr.tokenData.email,
+              model: anthropicReq.model,
+              latency_ms: Date.now() - startTime,
+              status: 200,
+              is_stream: false,
+              input_tokens: u.input_tokens || 0,
+              output_tokens: u.output_tokens || 0,
+              cached_tokens: u.cached_tokens || 0,
+              thoughts_tokens: u.thoughts_tokens || 0,
+              timing: timingOut(),
+              ...dg,
+            });
+          } else {
+            const anthropicResp = convertGoogleToAnthropic(googleData, modelUsed);
+            if (notice) {
+              const tb = anthropicResp.content.find(b => b.type === 'text');
+              if (tb) tb.text = notice + tb.text;
+            }
+            sendJson(res, 200, anthropicResp);
 
-          const u = anthropicResp._gw_usage || {};
-          statsTracker.recordRequest({
-            email: activeMgr.tokenData.email,
-            model: anthropicReq.model,
-            latency_ms: Date.now() - startTime,
-            status: 200,
-            is_stream: false,
-            input_tokens: u.input_tokens || 0,
-            output_tokens: u.output_tokens || 0,
-            cached_tokens: u.cached_tokens || 0,
-            thoughts_tokens: u.thoughts_tokens || 0,
-            timing: timingOut(),
-            ...dg,
-          });
+            const u = anthropicResp._gw_usage || {};
+            statsTracker.recordRequest({
+              email: activeMgr.tokenData.email,
+              model: anthropicReq.model,
+              latency_ms: Date.now() - startTime,
+              status: 200,
+              is_stream: false,
+              input_tokens: u.input_tokens || 0,
+              output_tokens: u.output_tokens || 0,
+              cached_tokens: u.cached_tokens || 0,
+              thoughts_tokens: u.thoughts_tokens || 0,
+              timing: timingOut(),
+              ...dg,
+            });
+          }
         }
         statsRecorded = true;
       } catch (err) {
-        console.error('[Messages Handler Error]', err);
+        console.error('[Inference Handler Error]', err);
         if (!statsRecorded && statsEmail) {
           statsTracker.recordRequest({
             email: statsEmail,
@@ -728,12 +762,21 @@ const server = http.createServer(async (req, res) => {
           });
         }
         if (!res.headersSent) {
-          sendJson(res, 500, {
-            error: {
-              type: 'api_error',
-              message: err.message,
-            },
-          });
+          if (isOaiChat) {
+            sendJson(res, 500, {
+              error: {
+                message: err.message,
+                type: 'api_error',
+              },
+            });
+          } else {
+            sendJson(res, 500, {
+              error: {
+                type: 'api_error',
+                message: err.message,
+              },
+            });
+          }
         }
       }
     });
