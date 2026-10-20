@@ -1,17 +1,21 @@
 /**
  * Tencent Cloud WAF Prompt Sanitizer & Bidirectional Restorer
  *
- * 遵循 Hark (Claude Opus 5.5) 架构规范：
- * 1. 采用不透明可逆占位符 (⟦PATH_${nonce}_${idx}⟧) 替换高危 Linux 系统路径（如 /root/, /etc/, /proc/ 等）；
+ * 遵循 Hark (Claude Opus 5.5) 审查规范：
+ * 1. 采用不透明可逆占位符 (⟦PATH_${nonce}_${idx}⟧) 替换高危 Linux 系统路径（含尾斜杠与通配符）；
  * 2. 避免使用全角字符（防 WAF Unicode 归一化二次拦截与分词失真）；
- * 3. 采用正向前瞻与反向否定断言，最长匹配优先，避免误伤子路径；
- * 4. 跨 SSE chunk 边界滑动缓冲恢复，确保流式输出完整还原真实路径。
+ * 3. 采用前后向断言，最长匹配优先，支持通配符与尾斜杠；
+ * 4. 深度扫描 tool_calls[].function.arguments 历史与 tool_result；
+ * 5. 跨 SSE chunk 边界滑动缓冲恢复，并在流结束/异常断开时确保 flush；
+ * 6. 11128 双向边界脱敏，进出可逆；
+ * 7. 严格保留 DEFAULT_SYSTEM_PROMPT 身份声明。
  */
 
 import crypto from 'crypto';
+import { DEFAULT_SYSTEM_PROMPT } from './constants.mjs';
 
-// 腾讯云 WAF 重点拦截的高危系统根路径特征
-const DANGEROUS_PATH_REGEX = /(?<![\w/])\/(?:root|proc|sys|etc|boot|dev)(?:\/[\w.\-]+)*(?![\w/])/g;
+// 腾讯云 WAF 重点拦截的高危系统根路径特征（含尾斜杠与通配符，排斥 chroot 与 URL）
+const DANGEROUS_PATH_REGEX = /(?<![\w/])\/(?:root|proc|sys|etc|boot|dev)(?:\/[a-zA-Z0-9_.\-*]+)*\/?(?![\w])/g;
 
 /**
  * 流式跨分片还原器（滑动窗口缓存防截断）
@@ -22,6 +26,7 @@ export class StreamRestorer {
     this.hasTokens = Boolean(revMap && revMap.size > 0);
     this.contentBuf = '';
     this.reasoningBuf = '';
+    this.argsBuf = '';
   }
 
   _processBuffer(buf, nextChunk) {
@@ -68,28 +73,35 @@ export class StreamRestorer {
     return out;
   }
 
+  processArgs(chunk) {
+    const { out, rem } = this._processBuffer(this.argsBuf, chunk);
+    this.argsBuf = rem;
+    return out;
+  }
+
   flushContent() {
     if (!this.contentBuf) return '';
     let rem = this.contentBuf;
     this.contentBuf = '';
-    for (const [token, orig] of this.revMap) {
-      rem = rem.replaceAll(token, orig);
-    }
-    return rem;
+    return this.restoreAll(rem);
   }
 
   flushReasoning() {
     if (!this.reasoningBuf) return '';
     let rem = this.reasoningBuf;
     this.reasoningBuf = '';
-    for (const [token, orig] of this.revMap) {
-      rem = rem.replaceAll(token, orig);
-    }
-    return rem;
+    return this.restoreAll(rem);
+  }
+
+  flushArgs() {
+    if (!this.argsBuf) return '';
+    let rem = this.argsBuf;
+    this.argsBuf = '';
+    return this.restoreAll(rem);
   }
 
   restoreAll(text) {
-    if (!this.hasTokens || !text) return text;
+    if (!this.hasTokens || typeof text !== 'string' || !text) return text;
     let res = text;
     for (const [token, orig] of this.revMap) {
       res = res.replaceAll(token, orig);
@@ -106,7 +118,7 @@ export function sanitizeWafPayload(payload) {
     return { payload, restorer: new StreamRestorer() };
   }
 
-  // 提取所有原始文本片段，直接进行正则断言（避免 JSON.stringify 中 \n 变成字符 n 触发 \\w 误伤断言）
+  // 提取所有原始文本片段（含 text、tool_calls 参数等）
   const allTexts = [];
   for (const m of payload.messages) {
     if (!m || typeof m !== 'object') continue;
@@ -116,11 +128,18 @@ export function sanitizeWafPayload(payload) {
         if (p && typeof p.text === 'string') allTexts.push(p.text);
       }
     }
+    if (Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc?.function?.arguments && typeof tc.function.arguments === 'string') {
+          allTexts.push(tc.function.arguments);
+        }
+      }
+    }
   }
 
   const combined = allTexts.join('\n');
   const matchedPaths = [...new Set(combined.match(DANGEROUS_PATH_REGEX) || [])];
-  const has11128 = combined.includes('11128');
+  const has11128 = /\b11128\b/.test(combined);
 
   if (matchedPaths.length === 0 && !has11128) {
     return { payload, restorer: new StreamRestorer() };
@@ -139,12 +158,22 @@ export function sanitizeWafPayload(payload) {
     revMap.set(token, p);
   });
 
+  // 11128 双向边界可逆脱敏（Token 内部不包含 11128 裸字符，彻底避免特征误杀）
+  if (has11128) {
+    const token11128 = `⟦SIG_${nonce}_CH11⟧`;
+    forwardMap.set('11128', token11128);
+    revMap.set(token11128, '11128');
+  }
+
   const replaceString = (str) => {
     if (typeof str !== 'string' || !str) return str;
     let s = str;
-    if (has11128) s = s.replaceAll('11128', '11-128');
     for (const [orig, token] of forwardMap) {
-      s = s.replaceAll(orig, token);
+      if (orig === '11128') {
+        s = s.replace(/\b11128\b/g, token);
+      } else {
+        s = s.replaceAll(orig, token);
+      }
     }
     return s;
   };
@@ -162,12 +191,26 @@ export function sanitizeWafPayload(payload) {
         return part;
       });
     }
+    if (Array.isArray(copy.tool_calls)) {
+      copy.tool_calls = copy.tool_calls.map(tc => {
+        if (tc?.function?.arguments && typeof tc.function.arguments === 'string') {
+          return {
+            ...tc,
+            function: {
+              ...tc.function,
+              arguments: replaceString(tc.function.arguments),
+            },
+          };
+        }
+        return tc;
+      });
+    }
     return copy;
   });
 
-  // 如果发生了路径替换，向 system 消息尾部追加保真说明，指导模型在引用路径时原样回传 token
+  // 如果发生了路径替换，向 system 消息尾部追加保真说明，指导模型在引用路径与工具参数时原样回传 token
   if (forwardMap.size > 0) {
-    const systemNotice = '\n[System Context: Tokens matching ⟦PATH_...⟧ denote literal file paths. Output them verbatim when referencing.]';
+    const systemNotice = '\n[System Context: Tokens matching ⟦PATH_...⟧ denote literal file paths. Output them verbatim when referencing or calling tools.]';
     let systemFound = false;
     for (const msg of newMessages) {
       if (msg && (msg.role === 'system' || msg.role === 'developer')) {
@@ -183,7 +226,7 @@ export function sanitizeWafPayload(payload) {
     if (!systemFound) {
       newMessages.unshift({
         role: 'system',
-        content: 'You are an advanced programming assistant developed by Tencent.' + systemNotice,
+        content: DEFAULT_SYSTEM_PROMPT + systemNotice,
       });
     }
   }

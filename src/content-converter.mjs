@@ -156,28 +156,10 @@ export function convertAnthropicToGoogle(anthropicRequest) {
     }
   }
 
-  // 3. 规范化 contents：合并连续相同角色，确保以 user 开头
-  const contents = [];
-  for (const item of rawContents) {
-    if (contents.length > 0 && contents[contents.length - 1].role === item.role) {
-      // 连续相同 role，合并其 parts
-      contents[contents.length - 1].parts.push(...item.parts);
-    } else {
-      contents.push(item);
-    }
-  }
-
-  // 确保第一条消息必须是 user 角色，且绝对不能是空文本（避免 Google 报 empty text 400 错误）
-  if (contents.length > 0 && contents[0].role === 'model') {
-    contents.unshift({
-      role: 'user',
-      parts: [{ text: 'Hello' }],
-    });
-  }
-
-  // 剔除空 text part 以及没有任何 part 的无效轮次（避免 Google 报 empty text parameter / parts must not be empty 400）
-  for (let i = contents.length - 1; i >= 0; i--) {
-    const c = contents[i];
+  // 3. 规范化 contents（遵循 Hark 严格清洗流：先剥空 part -> 删空轮次 -> 合并同角色 -> 补首条 user -> 再次防连合）
+  // Step A: 剔除空 text part 及没有任何 part 的无效轮次
+  for (let i = rawContents.length - 1; i >= 0; i--) {
+    const c = rawContents[i];
     c.parts = c.parts.filter(p => {
       if (p.text !== undefined && typeof p.text === 'string' && !p.thought) {
         return p.text.trim().length > 0;
@@ -185,7 +167,34 @@ export function convertAnthropicToGoogle(anthropicRequest) {
       return true;
     });
     if (c.parts.length === 0) {
-      contents.splice(i, 1);
+      rawContents.splice(i, 1);
+    }
+  }
+
+  // Step B: 合并连续相同角色
+  const contents = [];
+  for (const item of rawContents) {
+    if (contents.length > 0 && contents[contents.length - 1].role === item.role) {
+      contents[contents.length - 1].parts.push(...item.parts);
+    } else {
+      contents.push(item);
+    }
+  }
+
+  // Step C: 确保第一条消息必须是 user 角色（绝对不能是空文本，防 Google 报 empty text 400 校验错误）
+  if (contents.length > 0 && contents[0].role === 'model') {
+    contents.unshift({
+      role: 'user',
+      parts: [{ text: 'Hello' }],
+    });
+  }
+
+  // Step D: 再次合并相邻相同角色（兜底边界情况）
+  for (let i = 0; i < contents.length - 1; i++) {
+    if (contents[i].role === contents[i + 1].role) {
+      contents[i].parts.push(...contents[i + 1].parts);
+      contents.splice(i + 1, 1);
+      i--;
     }
   }
 

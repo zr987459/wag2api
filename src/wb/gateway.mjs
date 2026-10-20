@@ -383,7 +383,14 @@ export class TencentGateway {
                     if (d.reasoning_content) d.reasoning_content = ctx.restorer.processReasoning(d.reasoning_content);
                   }
                   if (d.reasoning_content) reasoning += d.reasoning_content;
-                  if (Array.isArray(d.tool_calls)) for (const tc of d.tool_calls) if (tc && tc.id) toolIds.push(tc.id);
+                  if (Array.isArray(d.tool_calls)) {
+                    for (const tc of d.tool_calls) {
+                      if (tc && tc.id) toolIds.push(tc.id);
+                      if (ctx.restorer && ctx.restorer.hasTokens && tc?.function?.arguments) {
+                        tc.function.arguments = ctx.restorer.processArgs(tc.function.arguments);
+                      }
+                    }
+                  }
                   lineToSend = `data: ${JSON.stringify(chunkObj)}`;
                 }
               } catch (e) { /* 非 JSON 帧照样透传 */ }
@@ -391,10 +398,12 @@ export class TencentGateway {
               if (ctx.restorer && ctx.restorer.hasTokens) {
                 const flContent = ctx.restorer.flushContent();
                 const flReasoning = ctx.restorer.flushReasoning();
-                if (flContent || flReasoning) {
+                const flArgs = ctx.restorer.flushArgs();
+                if (flContent || flReasoning || flArgs) {
                   const flushDelta = {};
                   if (flContent) flushDelta.content = flContent;
                   if (flReasoning) flushDelta.reasoning_content = flReasoning;
+                  if (flArgs) flushDelta.tool_calls = [{ index: 0, function: { arguments: flArgs } }];
                   const flushChunk = { choices: [{ delta: flushDelta, finish_reason: null }] };
                   ctx.onLine(`data: ${JSON.stringify(flushChunk)}\n\n`);
                 }
@@ -422,6 +431,7 @@ export class TencentGateway {
   /** 非流式：内部仍走流式，聚合正文 / 思考 / tool_calls / usage */
   async chatSync(payload, convId, opts = {}) {
     const { realm } = resolveModel(payload.model);
+    const { restorer } = sanitizeWafPayload(payload);
     let text = '', reasoning = '', upstreamError = null, lastUsage = null;
     let promptTokens = 20, compTokens = 20;
     const tools = new Map();
@@ -456,6 +466,15 @@ export class TencentGateway {
     if (upstreamError !== null) throw new Error(`Upstream error: ${upstreamError}`);
     if (!text && !tools.size) throw new Error('Upstream returned empty completion');
     const toolCalls = [...tools.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
+    if (restorer && restorer.hasTokens) {
+      text = restorer.restoreAll(text);
+      reasoning = restorer.restoreAll(reasoning);
+      for (const tc of toolCalls) {
+        if (tc?.function?.arguments) {
+          tc.function.arguments = restorer.restoreAll(tc.function.arguments);
+        }
+      }
+    }
     if (reasoning) {
       const uid = (this.vault.getActiveAccount(realm) || {}).uid || 'user_default';
       for (const tc of toolCalls) if (tc.id) this.recordReasoning(`${uid}:${tc.id}`, reasoning);
