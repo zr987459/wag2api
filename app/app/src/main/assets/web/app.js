@@ -924,15 +924,17 @@ async function loadKeys() {
   if (engine === 'ag' && !agReady()) { box.innerHTML = agOffHtml(); return; }
   const models = await loadModels(engine);
   const pre = engine === 'wb' ? 'wb:' : 'ag:';
-  const eps = engine === 'wb'
-    ? `${base}/v1/chat/completions（OpenAI）\n${base}/v1/messages（Anthropic）`
-    : `${base}/v1/messages（Anthropic）\nOpenAI 协议暂不支持，请用 Anthropic 客户端`;
+  const eps = `${base}/v1/chat/completions（OpenAI 兼容）\n${base}/v1/messages（Anthropic 原生）`;
   const sample = models[0] ? models[0].id : (engine === 'wb' ? 'deepseek-v4.1-flash-1017' : 'gemini-3.8-flash-high');
   box.innerHTML = `
     <div class="section-title">${META[engine].name} 接入</div>
     <div class="muted">接口</div>
     <div class="code-box">${escapeHtml(eps)}</div>
     <div class="muted" style="margin-top:12px;">指定引擎：模型名加 <span class="mono" style="color:var(--primary)">${pre}</span> 前缀最稳；不加时按模型表自动分流，重名走默认引擎（现在是 ${META[engineInfo.default_engine || 'wb'].name}）。</div>
+    <div class="muted" style="margin-top:12px;">OpenAI 接入示例 (Cherry Studio / Chatbox / NextChat)</div>
+    <div class="code-box">Base URL : ${escapeHtml(base)}/v1
+API Key  : 随便填 (如 123456)
+Model    : ${escapeHtml(pre + sample)}</div>
     <div class="muted" style="margin-top:12px;">Claude Code 示例</div>
     <div class="code-box">export ANTHROPIC_BASE_URL=${escapeHtml(base)}
 export ANTHROPIC_AUTH_TOKEN=123456
