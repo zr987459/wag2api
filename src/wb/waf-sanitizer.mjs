@@ -166,17 +166,18 @@ export function sanitizeWafPayload(payload) {
 
   const forwardMap = new Map();
   const revMap = new Map();
-  const nonce = crypto.randomBytes(3).toString('hex');
 
-  matchedPaths.forEach((p, idx) => {
-    const token = `⟦PATH_${nonce}_${idx + 1}⟧`;
+  // 【核心修复】：基于路径内容计算确定性哈希，杜绝每轮请求随机 nonce 改变历史 Token 击穿 KV-Cache！
+  matchedPaths.forEach((p) => {
+    const pHash = crypto.createHash('sha256').update(p).digest('hex').slice(0, 8);
+    const token = `⟦P_${pHash}⟧`;
     forwardMap.set(p, token);
     revMap.set(token, p);
   });
 
-  // 11128 双向边界可逆脱敏（Token 内部不包含 11128 裸字符，彻底避免特征误杀）
+  // 11128 双向边界可逆脱敏（确定性 Token，避免破坏缓存前缀字节流）
   if (has11128) {
-    const token11128 = `⟦SIG_${nonce}_CH11⟧`;
+    const token11128 = '⟦SIG_CH11⟧';
     forwardMap.set('11128', token11128);
     revMap.set(token11128, '11128');
   }
@@ -227,27 +228,12 @@ export function sanitizeWafPayload(payload) {
     return copy;
   });
 
-  // 如果发生了路径替换，向首条 system 消息尾部追加保真说明，指导模型在引用路径与工具参数时原样回传 token
-  if (forwardMap.size > 0) {
-    const systemNotice = '\n[System Context: Tokens matching ⟦PATH_...⟧ denote literal file paths. Output them verbatim when referencing or calling tools.]';
-    let systemFound = false;
-    for (const msg of newMessages) {
-      if (msg && (msg.role === 'system' || msg.role === 'developer')) {
-        if (typeof msg.content === 'string') {
-          msg.content += systemNotice;
-        } else if (Array.isArray(msg.content)) {
-          msg.content.push({ type: 'text', text: systemNotice });
-        }
-        systemFound = true;
-        break;
-      }
-    }
-    if (!systemFound) {
-      newMessages.unshift({
-        role: 'system',
-        content: DEFAULT_SYSTEM_PROMPT + systemNotice,
-      });
-    }
+  // 保证首条存在确定的 DEFAULT_SYSTEM_PROMPT，绝不动态追加额外声明以破坏 KV-Cache 前缀
+  if (!newMessages.some(m => m && (m.role === 'system' || m.role === 'developer'))) {
+    newMessages.unshift({
+      role: 'system',
+      content: DEFAULT_SYSTEM_PROMPT,
+    });
   }
 
   const newPayload = { ...payload, messages: newMessages };

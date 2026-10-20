@@ -39,13 +39,13 @@ test('WB: 敏感路径尾斜杠、通配符、tool_calls 参数与 11128 可逆�
   assert.ok(!userContent.includes('/root/'), '尾斜杠 /root/ 必须被脱敏');
   assert.ok(!userContent.includes('/etc/nginx/'), '尾斜杠 /etc/nginx/ 必须被脱敏');
   assert.ok(!userContent.includes('/root/*.log'), '通配符 /root/*.log 必须被脱敏');
-  assert.ok(userContent.includes('⟦PATH_'));
+  assert.ok(userContent.includes('⟦P_'));
 
   // 2. 验证 tool_calls[].function.arguments 里的高危路径与 11128 被脱敏且无裸字符
   assert.ok(!toolArgs.includes('/etc/shadow'), 'tool_calls 参数里的 /etc/shadow 必须被脱敏');
   assert.ok(!toolArgs.includes('11128'), 'tool_calls 参数里的 11128 必须被脱敏');
-  assert.ok(toolArgs.includes('⟦PATH_'));
-  assert.ok(toolArgs.includes('⟦SIG_'));
+  assert.ok(toolArgs.includes('⟦P_'));
+  assert.ok(toolArgs.includes('⟦SIG_CH11⟧'));
 
   // 3. 验证 reasoning_content 里的高危路径被脱敏
   assert.ok(!asstMsg.reasoning_content.includes('/etc/passwd'), 'reasoning 里的 /etc/passwd 必须被脱敏');
