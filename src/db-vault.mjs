@@ -2,13 +2,10 @@
  * Supabase PostgreSQL Database Vault for wag2api
  *
  * 核心功能：
- * 当配置了 SQL_DSN 环境变量时，直接将网页控制台添加/导入的全部账号（Google AG 与 腾讯 WB）
+ * 当配置了 SQL_DSN 环境变量且存在 pg 驱动时，直接将网页控制台添加/导入的全部账号（Google AG 与 腾讯 WB）
  * 实时同步保存到云端 Supabase 数据库的 wag_vault 表中。
  * 容器启动时自动从云端数据库拉取恢复，彻底解决 Render 等容器重启后丢失账号的问题。
  */
-
-import pg from 'pg';
-const { Client } = pg;
 
 export class DbVault {
   constructor(dsn) {
@@ -16,13 +13,30 @@ export class DbVault {
     this.enabled = Boolean(this.dsn && !this.dsn.includes('YOUR-PASSWORD'));
     this.client = null;
     this.initialized = false;
+    this.pg = null;
+  }
+
+  async getPg() {
+    if (this.pg) return this.pg;
+    try {
+      const mod = await import('pg');
+      this.pg = mod.default || mod;
+      return this.pg;
+    } catch (e) {
+      // 零依赖环境兜底，避免单元测试因缺少外部驱动崩溃
+      return null;
+    }
   }
 
   async getClient() {
     if (!this.enabled) return null;
     if (this.client) return this.client;
     try {
-      const client = new Client({ connectionString: this.dsn });
+      const pgModule = await this.getPg();
+      if (!pgModule || !pgModule.Client) {
+        return null;
+      }
+      const client = new pgModule.Client({ connectionString: this.dsn });
       await client.connect();
       this.client = client;
       if (!this.initialized) {
