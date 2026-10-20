@@ -27,6 +27,7 @@ import { ANTIGRAVITY_ENDPOINTS, ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT
 const DAILY_HOST = new URL(ANTIGRAVITY_ENDPOINT_DAILY).hostname;
 import { AccessControl } from './access-control.mjs';
 import { Persist } from './persist.mjs';
+import { dbVault } from './db-vault.mjs';
 import {
   buildAntigravityHeaders,
   buildCloudCodePayload,
@@ -98,6 +99,18 @@ const wb = DUAL ? createWbEngine({
   authEnabled: () => access.enabled,
   onChange: () => persist.schedule(), // 账号 / 设置变化 → 同步到 GitHub state 分支（未配置时空操作）
 }) : null;
+
+// 从 Supabase 云端数据库恢复账号（解决 Render 免费容器重启重置临时硬盘的问题）
+await dbVault.restore({
+  onAgAccount: (email, refreshToken, projectId) => {
+    accountPool.addAccount(refreshToken, email, projectId);
+  },
+  onWbAccounts: (rawJson) => {
+    if (wb && wb.vault) {
+      wb.vault.importToken(rawJson);
+    }
+  },
+});
 if (wb) wb.start();
 const agModelList = () => (getModelsResponse().data || []);
 

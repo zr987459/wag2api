@@ -48,7 +48,15 @@ export class AccountVault {
   }
 
   /** @param quiet 只改了易变字段（最近使用、计数），不触发云端同步 */
-  save(quiet = false) { atomicWrite(this.file, JSON.stringify(this.list, null, 2)); if (!quiet) this.onChange(); }
+  save(quiet = false) {
+    atomicWrite(this.file, JSON.stringify(this.list, null, 2));
+    if (!quiet) {
+      this.onChange();
+      import('../db-vault.mjs').then(({ dbVault }) => {
+        dbVault.save('wb_accounts_main', 'wb_accounts', JSON.stringify(this.list));
+      }).catch(() => {});
+    }
+  }
 
   /** 把 auths/ 里尚未入库的官方凭证并入（与安卓扫描 filesDir/auths 等价） */
   syncAuthsDir() {
