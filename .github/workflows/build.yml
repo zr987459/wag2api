@@ -27,6 +27,9 @@ jobs:
         working-directory: .
         run: npm test
 
+      - name: Dockerfile 冒烟构建测试
+        run: docker build -t wag2api:smoke .
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
