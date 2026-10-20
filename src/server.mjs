@@ -107,7 +107,7 @@ await dbVault.restore({
   },
   onWbAccounts: (rawJson) => {
     if (wb && wb.vault) {
-      wb.vault.importToken(rawJson);
+      wb.vault.restoreList(rawJson);
     }
   },
 });
