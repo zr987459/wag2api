@@ -2,8 +2,8 @@
  * Supabase PostgreSQL Database Vault for wag2api
  *
  * 遵循 Hark 架构审查与生产安全防御：
- * 1. 采用 pg.Pool 连接池（max 2, 5s超时, idleTimeout 30s）并监听 error，杜绝断线导致 Node 崩溃；
- * 2. 启动 restore 加 5s 超时熔断，防止数据库不可达拖死 Render 服务监听；
+ * 1. 采用 pg.Pool 连接池（max 2, query/statement 5s 超时, idleTimeout 30s）并监听 error，杜绝断线导致 Node 崩溃；
+ * 2. 启动 restore 加 5s 超时熔断，且超时分支立刻复位 isRestoring = false 并设 aborted = true，杜绝保存被静默丢弃；
  * 3. 启用 RLS 行级安全防护（ALTER TABLE wag_vault ENABLE ROW LEVEL SECURITY），阻断匿名 Data API 读取凭据；
  * 4. 恢复过程静默，杜绝反复回写数据库。
  */
@@ -36,12 +36,14 @@ export class DbVault {
       const pgModule = await this.getPg();
       if (!pgModule || !pgModule.Pool) return null;
 
-      // [Hark P0 审查] 使用连接池，并挂载 error 监听，防止空闲断开 crash Node 进程
+      // [Hark P0 审查] 使用连接池并加上 query/statement 超时与 error 监听
       const pool = new pgModule.Pool({
         connectionString: this.dsn,
         max: 2,
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 5000,
+        query_timeout: 5000,
+        statement_timeout: 5000,
         ssl: { rejectUnauthorized: false }, // 兼容 Supabase pooler 证书
       });
 
@@ -67,24 +69,40 @@ export class DbVault {
       return this.pool;
     } catch (e) {
       console.warn('[DbVault] 初始化 Supabase 连接池失败:', e.message);
+      if (this.pool) {
+        try { this.pool.end().catch(() => {}); } catch (_) {}
+      }
       this.pool = null;
       return null;
     }
   }
 
   /**
-   * 启动时调用：从云端数据库恢复全部账号（带 5 秒超时保护）
+   * 启动时调用：从云端数据库恢复全部账号（带 5 秒超时保护与超时复位）
    */
   async restore({ onAgAccount, onWbAccounts }) {
     if (!this.enabled) return;
 
+    let aborted = false;
+    this.isRestoring = true;
+
+    const timeoutPromise = new Promise(resolve => {
+      setTimeout(() => {
+        aborted = true;
+        this.isRestoring = false; // [Hark P0 阻断修复] 超时后立刻复位，防止后续 save 静默丢弃
+        console.warn('[DbVault] 数据库恢复超时 (5s)，已熔断放行服务启动。');
+        resolve();
+      }, 5000);
+    });
+
     const doRestore = async () => {
-      this.isRestoring = true;
       try {
         const pool = await this.getPool();
-        if (!pool) return;
+        if (!pool || aborted) return;
 
         const res = await pool.query('SELECT key, type, content FROM wag_vault');
+        if (aborted) return; // 忽略超时后迟到的查询结果
+
         let agCount = 0;
         let wbCount = 0;
 
@@ -112,8 +130,6 @@ export class DbVault {
       }
     };
 
-    // [Hark P1 启动超时熔断] 限制在 5 秒以内，绝不拖死服务监听
-    const timeoutPromise = new Promise(resolve => setTimeout(resolve, 5000));
     await Promise.race([doRestore(), timeoutPromise]);
   }
 
