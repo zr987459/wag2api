@@ -1,0 +1,60 @@
+worker_processes 1;
+pid /tmp/nginx.pid;
+events {
+    worker_connections 1024;
+}
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    access_log off;
+    error_log /dev/stderr error;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    client_max_body_size 64m;
+
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy_temp;
+    fastcgi_temp_path /tmp/fastcgi_temp;
+    uwsgi_temp_path /tmp/uwsgi_temp;
+    scgi_temp_path /tmp/scgi_temp;
+
+    server {
+        listen ${PORT} default_server;
+        server_name _;
+
+        # 0. 自动补全末尾斜杠
+        location = /wag {
+            return 301 /wag/;
+        }
+
+        # 1. 专属管理员暗门：直通 wag2api 面板（结尾斜杠剥离 /wag/ 前缀，完全隔离 NewAPI /api/ 接口）
+        location /wag/ {
+            proxy_pass http://127.0.0.1:3001/;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        }
+
+        # 2. 前台：直通 NewAPI 商业面板与所有开放 API（包括 NewAPI 自身的 /api/user/* 等）
+        location / {
+            proxy_pass http://127.0.0.1:3002;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        }
+    }
+}

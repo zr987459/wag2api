@@ -4,9 +4,11 @@ FROM calciumion/new-api:v1.0.0-rc.45 AS newapi
 # ---------- Stage 2: wag2api 运行时（glibc，与 NewAPI 二进制 100% 兼容） ----------
 FROM node:20-bookworm-slim
 
-# tini: 作为 PID 1 收割僵尸进程；ca-certificates: HTTPS 访问上游
+# tini: 作为 PID 1 收割僵尸进程
+# ca-certificates: HTTPS 访问上游
+# nginx + gettext-base: 轻量前置分流网关（约 4MB，内存占用仅 2MB，隔离 NewAPI 与 wag2api 管理暗门）
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini ca-certificates \
+ && apt-get install -y --no-install-recommends tini ca-certificates nginx gettext-base \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,8 +25,9 @@ COPY app/app/src/main/assets/web/ ./src/web/
 # 持久化目录预建
 RUN mkdir -p data/accounts
 
-# 进程守护脚本
+# 进程守护脚本与分流模板
 COPY scripts/entrypoint.sh /app/scripts/entrypoint.sh
+COPY scripts/nginx.conf.template /app/scripts/nginx.conf.template
 RUN chmod +x /app/scripts/entrypoint.sh
 
 # ---------- 基础环境变量 ----------
