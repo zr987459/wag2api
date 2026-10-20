@@ -45,12 +45,10 @@ function userContentToAnthropic(content) {
 
 /**
  * 转换 assistant 消息，含思考和 tool_calls
+ * 注意：历史 reasoning_content 不构造 thinking 块（避免空签名触发 Claude-on-AG 400）。
  */
 function assistantContentToAnthropic(content, reasoning, toolCalls) {
   const blocks = [];
-  if (reasoning) {
-    blocks.push({ type: 'thinking', thinking: reasoning, signature: '' });
-  }
   if (typeof content === 'string' && content) {
     blocks.push({ type: 'text', text: content });
   } else if (Array.isArray(content)) {
@@ -148,7 +146,7 @@ export function openaiRequestToAnthropic(oai) {
     if (role === 'assistant') {
       const blocks = assistantContentToAnthropic(
         m.content,
-        str(m, 'reasoning_content') || str(m, 'reasoning'),
+        null,
         m.tool_calls
       );
       if (blocks.length === 0) blocks.push({ type: 'text', text: '' });
@@ -158,6 +156,11 @@ export function openaiRequestToAnthropic(oai) {
 
   if (sysPieces.length) out.system = sysPieces.join('\n\n');
   out.messages = msgs;
+
+  // 透传 response_format (P1: 防止 JSON 模式下注入文本提示导致解析崩溃)
+  if (oai.response_format != null) {
+    out.response_format = oai.response_format;
+  }
 
   // 工具定义映射
   if (Array.isArray(oai.tools) && oai.tools.length) {
@@ -269,7 +272,7 @@ export function convertGoogleToOpenAI(googleResponse, clientModel) {
 }
 
 /**
- * 将 Google 原生 SSE 流实时转换为标准 OpenAI SSE 流（支持 delta.reasoning_content）
+ * 将 Google 原生 SSE 流实时转换为标准 OpenAI SSE 流（支持 delta.reasoning_content 与真实的签名继承）
  */
 export async function handleOpenAIStreamConversion(upstreamRes, clientRes, originalModel, onFinish = null, startTime = Date.now(), { notice = null } = {}) {
   let noticePending = Boolean(notice);
@@ -285,6 +288,8 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
   let hasEmittedRole = false;
   let toolIndex = 0;
   let stopReason = 'stop';
+  // P0: 流内最近一次有效 thoughtSignature，回退给无签名的 functionCall
+  let latestSeenSignature = FALLBACK_THOUGHT_SIGNATURE;
 
   let rawUsage = null;
   let firstTokenAt = 0;
@@ -385,6 +390,10 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
 
         for (const part of parts) {
           const sig = part.thoughtSignature || part.thought_signature;
+          // P0: 记录最近一次真实签名
+          if (sig) {
+            latestSeenSignature = sig;
+          }
 
           if (part.text !== undefined) {
             const isThought = part.thought === true;
@@ -412,7 +421,12 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
           } else if (part.functionCall) {
             stopReason = 'tool_calls';
             const callId = part.functionCall.id || newId('call_');
-            signatureCache.set(callId, sig || FALLBACK_THOUGHT_SIGNATURE, part.functionCall.name);
+            // P0: 签名继承至最近的真实签名
+            signatureCache.set(
+              callId,
+              sig || latestSeenSignature || FALLBACK_THOUGHT_SIGNATURE,
+              part.functionCall.name
+            );
 
             sendChunk({
               tool_calls: [{
@@ -430,6 +444,12 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
       }
     }
 
+    // P1: 客户端已断开时，短路为 client_abort，绝不继续发送或以 ok 收尾
+    if (clientGone) {
+      finish('client_abort', '客户端提前断开');
+      return;
+    }
+
     if (!hasEmittedRole) {
       sendChunk({ role: 'assistant', content: '' }, null);
     }
@@ -439,7 +459,7 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
 
     // 发送最终的 usage 帧
     const norm = usageNow();
-    if (clientRes && !clientGone) {
+    if (!clientGone) {
       const usagePayload = {
         id: completionId,
         object: 'chat.completion.chunk',
@@ -455,7 +475,7 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
     finish('ok');
   } catch (err) {
     if (clientGone) {
-      finish('client_abort');
+      finish('client_abort', '客户端提前断开');
     } else {
       console.error('[OpenAI Stream Error]', err);
       finish('stream_error', err.message);
