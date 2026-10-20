@@ -179,12 +179,15 @@ export class AccountPool {
   // 会话亲和绑定更新（换号或新分配时调用）
   bindSession(sessionKey, email) {
     if (!sessionKey || !email) return;
-    // [P1 内存保护] 限制最多 1000 条，淘汰最早过期的项
-    if (this.sessionAffinity.size >= MAX_AFFINITY_ENTRIES) {
+    const cleanEmail = email.trim();
+    // 真正的 LRU：已存在则先删再插，移动至 Map 尾部
+    if (this.sessionAffinity.has(sessionKey)) {
+      this.sessionAffinity.delete(sessionKey);
+    } else if (this.sessionAffinity.size >= MAX_AFFINITY_ENTRIES) {
       const oldestKey = this.sessionAffinity.keys().next().value;
       this.sessionAffinity.delete(oldestKey);
     }
-    this.sessionAffinity.set(sessionKey, { email: email.trim(), expireAt: Date.now() + AG_SESSION_TTL_MS });
+    this.sessionAffinity.set(sessionKey, { email: cleanEmail, expireAt: Date.now() + AG_SESSION_TTL_MS });
   }
 
   /**
