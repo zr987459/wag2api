@@ -43,7 +43,6 @@ export class DbVault {
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 5000,
         query_timeout: 5000,
-        statement_timeout: 5000,
         ssl: { rejectUnauthorized: false }, // 兼容 Supabase pooler 证书
       });
 
@@ -86,8 +85,9 @@ export class DbVault {
     let aborted = false;
     this.isRestoring = true;
 
+    let timer = null;
     const timeoutPromise = new Promise(resolve => {
-      setTimeout(() => {
+      timer = setTimeout(() => {
         aborted = true;
         this.isRestoring = false; // [Hark P0 阻断修复] 超时后立刻复位，防止后续 save 静默丢弃
         console.warn('[DbVault] 数据库恢复超时 (5s)，已熔断放行服务启动。');
@@ -126,6 +126,7 @@ export class DbVault {
       } catch (e) {
         console.warn('[DbVault] 从云数据库恢复账号异常:', e.message);
       } finally {
+        if (timer) clearTimeout(timer);
         this.isRestoring = false;
       }
     };
