@@ -4,3 +4,12 @@ node_modules
 android
 tests
 *.log
+
+# 忽略安卓大文件与构建缓存，但保留 web 资源
+app/.gradle
+app/build
+app/app/build
+app/app/local.properties
+app/engine-node/build
+app/engine-node/libnode
+app/keystore
