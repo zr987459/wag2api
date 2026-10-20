@@ -1,6 +1,6 @@
 {
   "name": "ag-open-gateway",
-  "version": "1.0.0",
+  "version": "1.3.2",
   "description": "Free and open-source local Anthropic-compatible gateway for Google Antigravity / Cloud Code",
   "main": "src/server.mjs",
   "type": "module",
