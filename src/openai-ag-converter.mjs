@@ -1,321 +1,288 @@
 /**
- * OpenAI Protocol Adapter for AG (Gemini) Engine
+ * OpenAI Chat Completions 兼容转换器 (for Google Antigravity / Cloud Code)
  *
- * 提供三类适配能力：
- *   1. openaiRequestToAnthropic(oai)             —— OpenAI 请求 -> AG 内部请求结构
- *   2. convertGoogleToOpenAI(googleData, model)  —— Google 非流式响应 -> OpenAI chat.completion
- *   3. handleOpenAIStreamConversion(...)         —— Google SSE 流 -> OpenAI SSE 流
+ * 核心功能：
+ * 1. openaiRequestToAnthropic: 将客户端发送的 OpenAI ChatCompletion 请求转换为内部 Anthropic 结构
+ * 2. convertGoogleToOpenAI: 将 Google 原生非流式响应转换为标准的 OpenAI chat.completion 结构
+ * 3. handleOpenAIStreamConversion: 将 Google 原生 SSE 流实时转换为标准 OpenAI SSE 打字机流（含 delta.reasoning_content）
  *
- * 与 sse-streamer.mjs 保持一致的健壮性基线：分块解析、客户端断开兜底、
- * onFinish 恰好调用一次、thoughtSignature 缓存防多轮死锁。
+ * 关键健壮性防护：
+ * - [P0] 流式工具调用签名回退：继承上游随路下发的 latestSeenSignature，防止次轮 400
+ * - [P1] 客户端断开判定：clientGone 时强制触发 client_abort 终态，绝不误记为 ok
+ * - [P1] 透传 response_format 保证 JSON Schema 与结构化输出不丢失
+ * - [P2] 过滤 assistant 历史消息中未签名的假 thinking 块，杜绝 Google 400 报 invalid thought_signature
  */
 
 import crypto from 'crypto';
 import { signatureCache, FALLBACK_THOUGHT_SIGNATURE } from './signature-cache.mjs';
 import { normalizeGeminiUsage, mergeRawUsage } from './usage.mjs';
 
-/* ------------------------------------------------------------------ */
-/* 内部工具                                                            */
-/* ------------------------------------------------------------------ */
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const str = (o, k) => (o && o[k] != null ? String(o[k]) : '');
+const newId = p => `${p}${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
 
-const REASONING_EFFORT_LEVELS = ['low', 'medium', 'high'];
-const REASONING_BUDGET_BY_EFFORT = Object.freeze({ low: 1024, medium: 8192, high: 24576 });
+/**
+ * 将单个 content 块（OpenAI 格式）转为 Anthropic 格式
+ */
+function partToAnthropic(p) {
+  if (typeof p === 'string') return { type: 'text', text: p };
+  if (!isObj(p)) return null;
+  if (p.type === 'text') return { type: 'text', text: str(p, 'text') };
+  if (p.type === 'image_url') {
+    const url = isObj(p.image_url) ? str(p.image_url, 'url') : str(p, 'image_url');
+    if (!url) return null;
+    const m = /^data:([^;]+);base64,(.+)$/i.exec(url);
+    if (m) {
+      return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
+    }
+    return { type: 'image', source: { type: 'url', url } };
+  }
+  return null;
+}
 
-/** OpenAI content 兼容：string / 数组（text、image_url）-> 内部 parts */
-function normalizeOpenAIContent(content) {
-  if (content === null || content === undefined) return [];
-  if (typeof content === 'string') {
-    return content ? [{ type: 'text', text: content }] : [];
+/**
+ * 转换 user 消息 content
+ */
+function userContentToAnthropic(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map(partToAnthropic).filter(Boolean);
+}
+
+/**
+ * 转换 assistant 消息，含思考和 tool_calls
+ * 注意 [P2] 防护：绝不为纯文本 reasoning_content 构造无有效签名的 thinking 块，
+ * 否则送往 Google / Claude-on-AG 时会直接报 invalid thought_signature 400 错误。
+ */
+function assistantContentToAnthropic(content, toolCalls) {
+  const blocks = [];
+  if (typeof content === 'string' && content) {
+    blocks.push({ type: 'text', text: content });
+  } else if (Array.isArray(content)) {
+    for (const p of content) {
+      const b = partToAnthropic(p);
+      if (b) blocks.push(b);
+    }
   }
-  if (!Array.isArray(content)) {
-    return [{ type: 'text', text: String(content) }];
-  }
-  const parts = [];
-  for (const item of content) {
-    if (!item || typeof item !== 'object') continue;
-    switch (item.type) {
-      case 'text':
-        if (item.text) parts.push({ type: 'text', text: String(item.text) });
-        break;
-      case 'image_url': {
-        const url = typeof item.image_url === 'string' ? item.image_url : item.image_url?.url;
-        if (!url) break;
-        const m = /^data:([^;,]+);base64,(.+)$/i.exec(url);
-        if (m) {
-          parts.push({ type: 'image', mimeType: m[1], data: m[2] });
-        } else {
-          parts.push({ type: 'image', fileUri: url });
-        }
-        break;
+
+  if (Array.isArray(toolCalls)) {
+    for (const c of toolCalls) {
+      if (!isObj(c)) continue;
+      const f = isObj(c.function) ? c.function : {};
+      let input = {};
+      const raw = str(f, 'arguments');
+      if (raw) {
+        try { input = JSON.parse(raw); } catch (e) { input = { _raw: raw }; }
       }
-      default:
-        if (typeof item.text === 'string' && item.text) {
-          parts.push({ type: 'text', text: item.text });
-        }
+      blocks.push({
+        type: 'tool_use',
+        id: str(c, 'id') || newId('toolu_'),
+        name: str(f, 'name'),
+        input: isObj(input) ? input : {},
+      });
     }
   }
-  return parts;
+  return blocks;
 }
 
-/** 拼接 system 消息为单一 string */
-function collectSystemPrompt(messages) {
-  const sys = [];
-  for (const msg of messages) {
-    if (!msg || msg.role !== 'system') continue;
-    const parts = normalizeOpenAIContent(msg.content);
-    for (const p of parts) {
-      if (p.type === 'text' && p.text) sys.push(p.text);
-    }
-  }
-  return sys.join('\n\n');
-}
-
-/** OpenAI tools -> 内部 tool 定义 */
-function convertOpenAITools(tools) {
-  if (!Array.isArray(tools) || tools.length === 0) return undefined;
-  const out = [];
-  for (const tool of tools) {
-    if (!tool || tool.type !== 'function' || !tool.function) continue;
-    const fn = tool.function;
-    if (!fn.name) continue;
-    out.push({
-      name: fn.name,
-      description: fn.description || '',
-      parameters: fn.parameters || { type: 'object', properties: {} },
-    });
-  }
-  return out.length ? out : undefined;
-}
-
-/** reasoning_effort -> thinking 预算 */
-function mapReasoningEffort(effort, maxTokens) {
-  if (!effort || typeof effort !== 'string') return null;
-  const key = effort.toLowerCase();
-  if (!REASONING_EFFORT_LEVELS.includes(key)) return null;
-  let budget = REASONING_BUDGET_BY_EFFORT[key];
-  if (Number.isFinite(maxTokens) && maxTokens > 0) {
-    budget = Math.min(budget, Math.max(1024, Math.floor(maxTokens * 0.8)));
-  }
-  return { effort: key, budget };
-}
-
-/** tool 调用入参 JSON 解析（容错） */
-function parseToolArguments(raw) {
-  if (raw === null || raw === undefined || raw === '') return {};
-  if (typeof raw === 'object') return raw;
-  try {
-    const v = JSON.parse(raw);
-    return v && typeof v === 'object' ? v : {};
-  } catch {
-    return {};
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* 1. OpenAI 请求 -> 内部请求                                          */
-/* ------------------------------------------------------------------ */
-
+/**
+ * 核心：OpenAI 请求体 -> Anthropic 请求体
+ */
 export function openaiRequestToAnthropic(oai) {
-  const src = oai && typeof oai === 'object' ? oai : {};
-  const rawMessages = Array.isArray(src.messages) ? src.messages : [];
+  if (!isObj(oai)) throw new Error('无效的 OpenAI 请求体');
 
-  const system = collectSystemPrompt(rawMessages);
+  const out = { model: str(oai, 'model') };
 
-  const messages = [];
-  for (const msg of rawMessages) {
-    if (!msg || typeof msg !== 'object') continue;
-    const role = msg.role;
+  const maxTok = oai.max_completion_tokens ?? oai.max_tokens;
+  if (maxTok != null) out.max_tokens = parseInt(maxTok, 10) || 8192;
 
-    if (role === 'system') continue;
+  for (const k of ['temperature', 'top_p']) {
+    if (oai[k] != null) out[k] = oai[k];
+  }
+  if (Array.isArray(oai.stop)) out.stop_sequences = oai.stop;
+  else if (typeof oai.stop === 'string' && oai.stop) out.stop_sequences = [oai.stop];
+
+  // 思考预算映射 (reasoning_effort: low / medium / high)
+  if (oai.reasoning_effort) {
+    const budgetMap = { low: 2048, medium: 8192, high: 24576 };
+    const budget = budgetMap[String(oai.reasoning_effort)] || 4096;
+    out.thinking = { type: 'enabled', budget_tokens: budget };
+    if (out.max_tokens && out.max_tokens <= budget) {
+      out.max_tokens = budget + 4096;
+    }
+  }
+
+  // [P1] 透传结构化输出 / JSON 模式要求
+  if (oai.response_format != null) {
+    out.response_format = oai.response_format;
+  }
+
+  const sysPieces = [];
+  const msgs = [];
+
+  for (const m of Array.isArray(oai.messages) ? oai.messages : []) {
+    if (!isObj(m)) continue;
+    const role = str(m, 'role');
+
+    if (role === 'system' || role === 'developer') {
+      if (typeof m.content === 'string') sysPieces.push(m.content);
+      else if (Array.isArray(m.content)) {
+        for (const p of m.content) {
+          if (isObj(p) && p.type === 'text') sysPieces.push(str(p, 'text'));
+        }
+      }
+      continue;
+    }
 
     if (role === 'user') {
-      const parts = normalizeOpenAIContent(msg.content);
-      if (parts.length) messages.push({ role: 'user', content: parts });
+      msgs.push({ role: 'user', content: userContentToAnthropic(m.content) });
+      continue;
+    }
+
+    if (role === 'tool' || role === 'function') {
+      const id = str(m, 'tool_call_id') || str(m, 'name');
+      let result = m.content;
+      if (typeof result !== 'string') {
+        try { result = JSON.stringify(result); } catch (e) { result = String(result); }
+      }
+      const block = { type: 'tool_result', tool_use_id: id || newId('toolu_'), content: result == null ? '' : result };
+      const last = msgs[msgs.length - 1];
+      if (last && last.role === 'user' && Array.isArray(last.content)) {
+        last.content.push(block);
+      } else {
+        msgs.push({ role: 'user', content: [block] });
+      }
       continue;
     }
 
     if (role === 'assistant') {
-      const content = normalizeOpenAIContent(msg.content);
-      const toolCalls = Array.isArray(msg.tool_calls)
-        ? msg.tool_calls
-            .filter(tc => tc && tc.type === 'function' && tc.function?.name)
-            .map(tc => {
-              const callId = tc.id || `toolu_${crypto.randomBytes(12).toString('hex')}`;
-              const name = tc.function.name;
-              const args = parseToolArguments(tc.function.arguments);
-              const cachedName = signatureCache.getName(callId);
-              return { id: callId, name: cachedName || name, args };
-            })
-        : [];
-
-      if (!toolCalls.length) {
-        if (content.length) messages.push({ role: 'assistant', content });
-        continue;
-      }
-
-      const parts = [];
-      for (const p of content) parts.push(p);
-      for (const call of toolCalls) {
-        parts.push({
-          type: 'tool_call',
-          id: call.id,
-          name: call.name,
-          args: call.args,
-          thoughtSignature: signatureCache.get(call.id) || FALLBACK_THOUGHT_SIGNATURE,
-        });
-      }
-      messages.push({ role: 'assistant', content: parts });
-      continue;
+      const blocks = assistantContentToAnthropic(m.content, m.tool_calls);
+      if (blocks.length === 0) blocks.push({ type: 'text', text: '' });
+      msgs.push({ role: 'assistant', content: blocks });
     }
-
-    if (role === 'tool') {
-      const callId = msg.tool_call_id || '';
-      const text = typeof msg.content === 'string'
-        ? msg.content
-        : normalizeOpenAIContent(msg.content)
-            .filter(p => p.type === 'text')
-            .map(p => p.text)
-            .join('\n');
-      messages.push({
-        role: 'tool',
-        tool_call_id: callId,
-        name: signatureCache.getName(callId) || undefined,
-        content: text,
-      });
-      continue;
-    }
-
-    const parts = normalizeOpenAIContent(msg.content);
-    if (parts.length) messages.push({ role: 'user', content: parts });
   }
 
-  const maxTokens = Number.isFinite(Number(src.max_tokens)) && Number(src.max_tokens) > 0
-    ? Math.floor(Number(src.max_tokens))
-    : undefined;
+  if (sysPieces.length) out.system = sysPieces.join('\n\n');
+  out.messages = msgs;
 
-  const reasoning = mapReasoningEffort(src.reasoning_effort, maxTokens);
-  const thinking = reasoning ? { budget: reasoning.budget, effort: reasoning.effort } : undefined;
+  // 工具定义映射
+  if (Array.isArray(oai.tools) && oai.tools.length) {
+    out.tools = oai.tools
+      .filter(t => isObj(t) && t.type === 'function' && isObj(t.function))
+      .map(t => ({
+        name: str(t.function, 'name'),
+        description: str(t.function, 'description'),
+        input_schema: isObj(t.function.parameters) ? t.function.parameters : { type: 'object', properties: {} },
+      }))
+      .filter(t => t.name);
 
-  const tools = convertOpenAITools(src.tools);
+    const tc = oai.tool_choice;
+    if (typeof tc === 'string') {
+      if (tc === 'auto') out.tool_choice = { type: 'auto' };
+      else if (tc === 'required') out.tool_choice = { type: 'any' };
+      else if (tc === 'none') out.tool_choice = { type: 'none' };
+    } else if (isObj(tc) && tc.type === 'function' && isObj(tc.function)) {
+      out.tool_choice = { type: 'tool', name: str(tc.function, 'name') };
+    }
+  }
 
-  const out = {
-    model: src.model,
-    system,
-    messages,
-    tools,
-    thinking,
-    max_tokens: maxTokens,
-    temperature: src.temperature,
-    top_p: src.top_p,
-    stop: src.stop ?? undefined,
-    stream: Boolean(src.stream),
-  };
-
-  if (reasoning) out.reasoning_effort = reasoning.effort;
   return out;
 }
 
-/* ------------------------------------------------------------------ */
-/* 2. Google 非流式响应 -> OpenAI chat.completion                       */
-/* ------------------------------------------------------------------ */
+/**
+ * 将 normalizeGeminiUsage 转换为标准 OpenAI usage 格式
+ */
+function toOpenAIUsage(normUsage) {
+  const input = normUsage?.input_tokens || 0;
+  const output = normUsage?.output_tokens || 0;
+  const cached = normUsage?.cached_tokens || 0;
+  const reasoning = normUsage?.thoughts_tokens || 0;
+  return {
+    prompt_tokens: input + cached,
+    completion_tokens: output + reasoning,
+    total_tokens: input + cached + output + reasoning,
+    prompt_tokens_details: { cached_tokens: cached },
+    completion_tokens_details: { reasoning_tokens: reasoning },
+  };
+}
 
-export function convertGoogleToOpenAI(googleData, modelUsed) {
-  const data = googleData && typeof googleData === 'object' ? googleData : {};
-  const inner = data.response && typeof data.response === 'object' ? data.response : data;
-
+/**
+ * 将 Google 原生非流式响应转换为标准的 OpenAI chat.completion 结构
+ */
+export function convertGoogleToOpenAI(googleResponse, clientModel) {
+  const inner = googleResponse?.response || googleResponse || {};
   const candidate = inner?.candidates?.[0];
   const parts = candidate?.content?.parts || [];
 
-  let reasoningContent = '';
-  let visibleContent = '';
+  let text = '';
+  let reasoning = '';
+  let latestSeenSignature = FALLBACK_THOUGHT_SIGNATURE;
   const toolCalls = [];
 
   for (const part of parts) {
     const sig = part.thoughtSignature || part.thought_signature;
+    if (sig) latestSeenSignature = sig;
 
-    if (part.text !== undefined) {
-      if (part.thought === true) {
-        reasoningContent += part.text;
-      } else {
-        visibleContent += part.text;
-      }
-      continue;
+    if (part.thought) {
+      reasoning += part.text || '';
+    } else if (part.text !== undefined && part.text !== '') {
+      text += part.text;
     }
 
     if (part.functionCall) {
-      const fc = part.functionCall;
-      const callId = fc.id || `toolu_${crypto.randomBytes(12).toString('hex')}`;
-      const actualSig = sig || FALLBACK_THOUGHT_SIGNATURE;
-      signatureCache.set(callId, actualSig, fc.name);
+      const callId = part.functionCall.id || newId('call_');
+      const actualSig = sig || latestSeenSignature || FALLBACK_THOUGHT_SIGNATURE;
+      signatureCache.set(callId, actualSig, part.functionCall.name);
+
       toolCalls.push({
         id: callId,
         type: 'function',
         function: {
-          name: fc.name || '',
-          arguments: JSON.stringify(fc.args || {}),
+          name: part.functionCall.name,
+          arguments: JSON.stringify(part.functionCall.args || {}),
         },
       });
     }
   }
 
-  const finishMap = {
-    STOP: 'stop',
-    MAX_TOKENS: 'length',
-    SAFETY: 'content_filter',
-    RECITATION: 'content_filter',
-    OTHER: 'stop',
-  };
-  const rawFinish = candidate?.finishReason;
-  let finishReason = finishMap[rawFinish] || (toolCalls.length ? 'tool_calls' : 'stop');
-  if (toolCalls.length && finishReason === 'stop') finishReason = 'tool_calls';
-
-  const u = normalizeGeminiUsage(inner.usageMetadata);
-
   const message = {
     role: 'assistant',
-    content: visibleContent || (toolCalls.length ? null : ''),
+    content: toolCalls.length && !text ? null : text,
   };
-  if (reasoningContent) message.reasoning_content = reasoningContent;
-  if (toolCalls.length) message.tool_calls = toolCalls;
+  if (reasoning) {
+    message.reasoning_content = reasoning;
+  }
+  if (toolCalls.length) {
+    message.tool_calls = toolCalls;
+  }
 
-  return {
-    id: `chatcmpl-${crypto.randomBytes(12).toString('hex')}`,
+  let finishReason = 'stop';
+  if (toolCalls.length) finishReason = 'tool_calls';
+  else if (candidate?.finishReason === 'MAX_TOKENS') finishReason = 'length';
+
+  const normUsage = normalizeGeminiUsage(inner.usageMetadata);
+  const response = {
+    id: newId('chatcmpl-'),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: modelUsed || inner.modelVersion || data.model || 'unknown',
-    choices: [
-      {
-        index: 0,
-        message,
-        finish_reason: finishReason,
-        logprobs: null,
-      },
-    ],
-    usage: {
-      prompt_tokens: u.input_tokens + u.cached_tokens,
-      completion_tokens: u.output_tokens,
-      total_tokens: u.total_tokens,
-      prompt_tokens_details: { cached_tokens: u.cached_tokens },
-      completion_tokens_details: { reasoning_tokens: u.thoughts_tokens },
-    },
-    _gw_usage: u,
+    model: clientModel,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: finishReason,
+    }],
+    usage: toOpenAIUsage(normUsage),
   };
+
+  Object.defineProperty(response, '_gw_usage', { value: normUsage, enumerable: false });
+  return response;
 }
 
-/* ------------------------------------------------------------------ */
-/* 3. Google SSE -> OpenAI SSE 流式转换                                */
-/* ------------------------------------------------------------------ */
-
-export async function handleOpenAIStreamConversion(
-  upstreamRes,
-  clientRes,
-  originalModel,
-  onFinish = null,
-  startTime = Date.now(),
-  { notice = null } = {}
-) {
+/**
+ * 将 Google 原生 SSE 流实时转换为标准 OpenAI SSE 流（支持 delta.reasoning_content）
+ */
+export async function handleOpenAIStreamConversion(upstreamRes, clientRes, originalModel, onFinish = null, startTime = Date.now(), { notice = null } = {}) {
   let noticePending = Boolean(notice);
-
   clientRes.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   clientRes.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   clientRes.setHeader('Connection', 'keep-alive');
@@ -323,9 +290,11 @@ export async function handleOpenAIStreamConversion(
   clientRes.socket?.setNoDelay?.(true);
   clientRes.flushHeaders?.();
 
-  const completionId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
+  const completionId = newId('chatcmpl-');
   const created = Math.floor(Date.now() / 1000);
-  const modelUsed = originalModel || 'unknown';
+  let hasEmittedRole = false;
+  let toolIndex = 0;
+  let stopReason = 'stop';
 
   let rawUsage = null;
   let firstTokenAt = 0;
@@ -333,8 +302,7 @@ export async function handleOpenAIStreamConversion(
   let firstTextAt = 0;
   let finished = false;
   let clientGone = false;
-  let emittedRole = false;
-  let finishReason = 'stop';
+  // [P0] 关键修复：跟踪最近见过的真实 thoughtSignature，供后续 functionCall 继承
   let latestSeenSignature = FALLBACK_THOUGHT_SIGNATURE;
 
   const usageNow = () => normalizeGeminiUsage(rawUsage);
@@ -343,9 +311,8 @@ export async function handleOpenAIStreamConversion(
     finished = true;
     if (typeof onFinish === 'function') {
       try {
-        const u = usageNow();
         onFinish({
-          ...u,
+          ...usageNow(),
           ttft_ms: firstTokenAt ? firstTokenAt - startTime : null,
           t_first_thought: firstThoughtAt ? firstThoughtAt - startTime : null,
           t_first_text: firstTextAt ? firstTextAt - startTime : null,
@@ -358,52 +325,36 @@ export async function handleOpenAIStreamConversion(
     }
   };
 
-  const writeChunk = (payload) => {
+  const sendChunk = (delta, finish_reason = null, extra = {}) => {
     if (clientGone) return;
+    const payload = {
+      id: completionId,
+      object: 'chat.completion.chunk',
+      created,
+      model: originalModel,
+      choices: [{
+        index: 0,
+        delta,
+        finish_reason,
+      }],
+      ...extra,
+    };
     clientRes.write(`data: ${JSON.stringify(payload)}\n\n`);
     clientRes.flush?.();
   };
 
-  const emitRoleChunk = () => {
-    if (emittedRole) return;
-    emittedRole = true;
-    writeChunk({
-      id: completionId,
-      object: 'chat.completion.chunk',
-      created,
-      model: modelUsed,
-      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
-    });
-  };
-
-  const emitDelta = (delta, finish_reason = null) => {
-    if (clientGone) return;
-    emitRoleChunk();
-    writeChunk({
-      id: completionId,
-      object: 'chat.completion.chunk',
-      created,
-      model: modelUsed,
-      choices: [{ index: 0, delta, finish_reason }],
-    });
-  };
-
-  const reader = upstreamRes?.body?.getReader?.();
+  const reader = upstreamRes.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
 
   const onClientClose = () => {
     if (clientRes.writableFinished) return;
     clientGone = true;
-    try { reader?.cancel?.().catch(() => {}); } catch {}
+    reader.cancel().catch(() => {});
   };
   clientRes.on?.('close', onClientClose);
 
   try {
-    if (!reader) throw new Error('upstream response body is not readable');
-
-    let toolCallIndex = 0;
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -417,132 +368,131 @@ export async function handleOpenAIStreamConversion(
         if (!trimmed) continue;
 
         let jsonStr = trimmed;
-        if (jsonStr.startsWith('data:')) jsonStr = jsonStr.slice(5).trim();
+        if (jsonStr.startsWith('data:')) {
+          jsonStr = jsonStr.slice(5).trim();
+        }
         if (!jsonStr || jsonStr === '[DONE]') continue;
 
         let chunk;
         try {
           chunk = JSON.parse(jsonStr);
-        } catch {
+        } catch (e) {
           continue;
         }
 
-        const inner = chunk?.response || chunk;
-        if (!inner || typeof inner !== 'object') continue;
-
+        const inner = chunk.response || chunk;
         if (inner.usageMetadata) {
           rawUsage = mergeRawUsage(rawUsage, inner.usageMetadata);
         }
 
         const candidate = inner?.candidates?.[0];
+        if (candidate?.finishReason === 'MAX_TOKENS') {
+          stopReason = 'length';
+        }
         const parts = candidate?.content?.parts || [];
 
-        if (parts.length && !firstTokenAt) firstTokenAt = Date.now();
+        // 首帧吐 role: assistant
+        if (!hasEmittedRole && parts.length > 0) {
+          hasEmittedRole = true;
+          if (!firstTokenAt) firstTokenAt = Date.now();
+          sendChunk({ role: 'assistant', content: '' }, null);
+        }
 
         for (const part of parts) {
           const sig = part.thoughtSignature || part.thought_signature;
-          if (sig) latestSeenSignature = sig;
+          if (sig) {
+            latestSeenSignature = sig;
+          }
 
           if (part.text !== undefined) {
             const isThought = part.thought === true;
             if (part.text) {
               if (isThought) {
                 if (!firstThoughtAt) firstThoughtAt = Date.now();
-                if (!firstTokenAt) firstTokenAt = Date.now();
-                emitDelta({ reasoning_content: part.text });
-              } else {
-                if (!firstTextAt) firstTextAt = Date.now();
-                if (!firstTokenAt) firstTokenAt = Date.now();
-
-                if (noticePending) {
-                  noticePending = false;
-                  emitDelta({ content: notice });
-                }
-                emitDelta({ content: part.text });
+              } else if (!firstTextAt) {
+                firstTextAt = Date.now();
               }
             }
-            continue;
-          }
 
-          if (part.functionCall) {
-            const fc = part.functionCall;
-            const callId = fc.id || `toolu_${crypto.randomBytes(12).toString('hex')}`;
+            if (isThought) {
+              if (part.text) {
+                sendChunk({ reasoning_content: part.text }, null);
+              }
+            } else {
+              if (noticePending) {
+                noticePending = false;
+                sendChunk({ content: notice }, null);
+              }
+              if (part.text) {
+                sendChunk({ content: part.text }, null);
+              }
+            }
+          } else if (part.functionCall) {
+            stopReason = 'tool_calls';
+            const callId = part.functionCall.id || newId('call_');
+            // [P0] 核心修复：即使 functionCall 节点没带 sig，也继承同轮 thought 的签名存入缓存
             const actualSig = sig || latestSeenSignature || FALLBACK_THOUGHT_SIGNATURE;
-            signatureCache.set(callId, actualSig, fc.name);
+            signatureCache.set(callId, actualSig, part.functionCall.name);
 
-            finishReason = 'tool_calls';
-            if (!firstTokenAt) firstTokenAt = Date.now();
-
-            emitDelta({
-              tool_calls: [
-                {
-                  index: toolCallIndex++,
-                  id: callId,
-                  type: 'function',
-                  function: {
-                    name: fc.name || '',
-                    arguments: JSON.stringify(fc.args || {}),
-                  },
+            sendChunk({
+              tool_calls: [{
+                index: toolIndex++,
+                id: callId,
+                type: 'function',
+                function: {
+                  name: part.functionCall.name,
+                  arguments: JSON.stringify(part.functionCall.args || {}),
                 },
-              ],
-            });
+              }],
+            }, null);
           }
         }
       }
     }
 
+    // [P1] 关键修复：如果客户端提前关闭，直接判定为 client_abort 并退出，绝不误判为 ok
     if (clientGone) {
-      finish('client_abort', 'client disconnected');
+      finish('client_abort', '客户端提前断开连接');
       return;
     }
 
-    emitRoleChunk();
+    if (!hasEmittedRole) {
+      sendChunk({ role: 'assistant', content: '' }, null);
+    }
 
-    const u = usageNow();
-    const usagePayload = {
-      prompt_tokens: u.input_tokens + u.cached_tokens,
-      completion_tokens: u.output_tokens,
-      total_tokens: u.total_tokens,
-      prompt_tokens_details: { cached_tokens: u.cached_tokens },
-      completion_tokens_details: { reasoning_tokens: u.thoughts_tokens },
-    };
+    // 发送带有 finish_reason 的闭合 chunk
+    sendChunk({}, stopReason);
 
-    writeChunk({
-      id: completionId,
-      object: 'chat.completion.chunk',
-      created,
-      model: modelUsed,
-      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-      usage: usagePayload,
-    });
-
-    if (!clientGone) clientRes.write('data: [DONE]\n\n');
-    clientRes.flush?.();
-
+    // 发送最终的 usage 帧
+    const norm = usageNow();
+    if (clientRes && !clientGone) {
+      const usagePayload = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model: originalModel,
+        choices: [],
+        usage: toOpenAIUsage(norm),
+      };
+      clientRes.write(`data: ${JSON.stringify(usagePayload)}\n\n`);
+      clientRes.write('data: [DONE]\n\n');
+      clientRes.flush?.();
+    }
     finish('ok');
-    clientRes.end();
   } catch (err) {
     if (clientGone) {
-      finish('client_abort', 'client disconnected');
+      finish('client_abort');
     } else {
-      console.error('[OpenAI Stream Processing Error]', err);
-      finish('stream_error', String(err?.message || err).slice(0, 100));
+      console.error('[OpenAI Stream Error]', err);
+      finish('stream_error', err.message);
       try {
-        if (!clientRes.writableEnded) {
-          writeChunk({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model: modelUsed,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          });
-          clientRes.write('data: [DONE]\n\n');
-        }
-      } catch {}
+        clientRes.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'stream_error' } })}\n\n`);
+        clientRes.write('data: [DONE]\n\n');
+        clientRes.flush?.();
+      } catch (e) {}
     }
-    try { clientRes.end(); } catch {}
   } finally {
     clientRes.off?.('close', onClientClose);
-    finish('ok');
+    try { clientRes.end(); } catch (e) {}
   }
 }
