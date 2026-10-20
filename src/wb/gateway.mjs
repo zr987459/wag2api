@@ -251,8 +251,9 @@ export class TencentGateway {
   async streamChat(payload, convId, onLine, opts = {}) {
     const { realm, clean } = resolveModel(payload.model);
     const base = realm === 'global' ? UPSTREAM_GLOBAL : UPSTREAM_CN;
-    const { payload: sanitizedPayload, restorer } = sanitizeWafPayload(payload);
-    const up = buildUpstreamPayload(sanitizedPayload, clean, id => this.getReasoningByToolId(id));
+    // Hark 审查加固：先执行 buildUpstreamPayload 补齐思考缓存与 system，再整体进行 WAF 路径脱敏
+    const upRaw = buildUpstreamPayload(payload, clean, id => this.getReasoningByToolId(id));
+    const { payload: up, restorer } = sanitizeWafPayload(upRaw);
     const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, restorer, signal: opts.signal, used: opts.used, emittedAny: false };
 
     try {
@@ -318,6 +319,22 @@ export class TencentGateway {
       ctx.signal.addEventListener('abort', onClientAbort, { once: true });
     }
     const connectTimer = setTimeout(() => ctl.abort(new Error('upstream connect timeout')), CONNECT_MS + READ_IDLE_MS);
+    const flushRestorer = () => {
+      if (!ctx.restorer || !ctx.restorer.hasTokens) return;
+      const flContent = ctx.restorer.flushContent();
+      const flReasoning = ctx.restorer.flushReasoning();
+      const flArgsList = ctx.restorer.flushAllArgs();
+      if (flContent || flReasoning || flArgsList.length > 0) {
+        const flushDelta = {};
+        if (flContent) flushDelta.content = flContent;
+        if (flReasoning) flushDelta.reasoning_content = flReasoning;
+        if (flArgsList.length > 0) {
+          flushDelta.tool_calls = flArgsList.map(a => ({ index: a.index, function: { arguments: a.arguments } }));
+        }
+        const flushChunk = { choices: [{ delta: flushDelta, finish_reason: null }] };
+        ctx.onLine(`data: ${JSON.stringify(flushChunk)}\n\n`);
+      }
+    };
     try {
       let resp;
       try {
@@ -356,6 +373,7 @@ export class TencentGateway {
 
       let reasoning = '';
       const toolIds = [];
+
       try {
         for await (const line of readLines(resp, ctl)) {
           if (!line) continue;
@@ -376,7 +394,8 @@ export class TencentGateway {
             if (s.startsWith('{')) {
               try {
                 const chunkObj = JSON.parse(s);
-                const d = chunkObj.choices?.[0]?.delta;
+                const choice = chunkObj.choices?.[0];
+                const d = choice?.delta;
                 if (d) {
                   if (ctx.restorer && ctx.restorer.hasTokens) {
                     if (d.content) d.content = ctx.restorer.processContent(d.content);
@@ -384,30 +403,24 @@ export class TencentGateway {
                   }
                   if (d.reasoning_content) reasoning += d.reasoning_content;
                   if (Array.isArray(d.tool_calls)) {
-                    for (const tc of d.tool_calls) {
+                    for (let i = 0; i < d.tool_calls.length; i++) {
+                      const tc = d.tool_calls[i];
                       if (tc && tc.id) toolIds.push(tc.id);
+                      const idx = Number.isInteger(tc.index) ? tc.index : i;
                       if (ctx.restorer && ctx.restorer.hasTokens && tc?.function?.arguments) {
-                        tc.function.arguments = ctx.restorer.processArgs(tc.function.arguments);
+                        tc.function.arguments = ctx.restorer.processArgs(tc.function.arguments, idx);
                       }
                     }
                   }
                   lineToSend = `data: ${JSON.stringify(chunkObj)}`;
                 }
+                // 看到 finish_reason 时立即 flush 暂存碎片，避免落到 finish_reason 之后被部分客户端丢弃
+                if (choice && choice.finish_reason) {
+                  flushRestorer();
+                }
               } catch (e) { /* 非 JSON 帧照样透传 */ }
             } else if (s === '[DONE]') {
-              if (ctx.restorer && ctx.restorer.hasTokens) {
-                const flContent = ctx.restorer.flushContent();
-                const flReasoning = ctx.restorer.flushReasoning();
-                const flArgs = ctx.restorer.flushArgs();
-                if (flContent || flReasoning || flArgs) {
-                  const flushDelta = {};
-                  if (flContent) flushDelta.content = flContent;
-                  if (flReasoning) flushDelta.reasoning_content = flReasoning;
-                  if (flArgs) flushDelta.tool_calls = [{ index: 0, function: { arguments: flArgs } }];
-                  const flushChunk = { choices: [{ delta: flushDelta, finish_reason: null }] };
-                  ctx.onLine(`data: ${JSON.stringify(flushChunk)}\n\n`);
-                }
-              }
+              flushRestorer();
             }
           }
           ctx.emittedAny = true;
@@ -424,6 +437,7 @@ export class TencentGateway {
       this.scheduler.touch(uid);
       return { done: true };
     } finally {
+      flushRestorer();
       if (ctx.signal) ctx.signal.removeEventListener('abort', onClientAbort);
     }
   }
@@ -431,7 +445,6 @@ export class TencentGateway {
   /** 非流式：内部仍走流式，聚合正文 / 思考 / tool_calls / usage */
   async chatSync(payload, convId, opts = {}) {
     const { realm } = resolveModel(payload.model);
-    const { restorer } = sanitizeWafPayload(payload);
     let text = '', reasoning = '', upstreamError = null, lastUsage = null;
     let promptTokens = 20, compTokens = 20;
     const tools = new Map();
@@ -466,15 +479,6 @@ export class TencentGateway {
     if (upstreamError !== null) throw new Error(`Upstream error: ${upstreamError}`);
     if (!text && !tools.size) throw new Error('Upstream returned empty completion');
     const toolCalls = [...tools.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
-    if (restorer && restorer.hasTokens) {
-      text = restorer.restoreAll(text);
-      reasoning = restorer.restoreAll(reasoning);
-      for (const tc of toolCalls) {
-        if (tc?.function?.arguments) {
-          tc.function.arguments = restorer.restoreAll(tc.function.arguments);
-        }
-      }
-    }
     if (reasoning) {
       const uid = (this.vault.getActiveAccount(realm) || {}).uid || 'user_default';
       for (const tc of toolCalls) if (tc.id) this.recordReasoning(`${uid}:${tc.id}`, reasoning);

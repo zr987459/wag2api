@@ -1,14 +1,15 @@
 /**
  * Tencent Cloud WAF Prompt Sanitizer & Bidirectional Restorer
  *
- * 遵循 Hark (Claude Opus 5.5) 审查规范：
+ * 遵循 Hark (Claude Opus 5.5) 审查规范（二轮深度加固）：
  * 1. 采用不透明可逆占位符 (⟦PATH_${nonce}_${idx}⟧) 替换高危 Linux 系统路径（含尾斜杠与通配符）；
  * 2. 避免使用全角字符（防 WAF Unicode 归一化二次拦截与分词失真）；
  * 3. 采用前后向断言，最长匹配优先，支持通配符与尾斜杠；
- * 4. 深度扫描 tool_calls[].function.arguments 历史与 tool_result；
- * 5. 跨 SSE chunk 边界滑动缓冲恢复，并在流结束/异常断开时确保 flush；
- * 6. 11128 双向边界脱敏，进出可逆；
- * 7. 严格保留 DEFAULT_SYSTEM_PROMPT 身份声明。
+ * 4. 深度扫描 tool_calls[].function.arguments 历史与 reasoning_content 历史；
+ * 5. 按 tool call index 独立分桶缓冲，彻底杜绝并行工具参数串台与吞吐；
+ * 6. 在 finish_reason 触发时即时 flush，[DONE] 与异常断开时兜底 flush；
+ * 7. 11128 双向边界脱敏且 Token 无裸字符，进出可逆；
+ * 8. 严格保留 DEFAULT_SYSTEM_PROMPT 身份声明。
  */
 
 import crypto from 'crypto';
@@ -26,7 +27,7 @@ export class StreamRestorer {
     this.hasTokens = Boolean(revMap && revMap.size > 0);
     this.contentBuf = '';
     this.reasoningBuf = '';
-    this.argsBuf = '';
+    this.argsBufMap = new Map(); // 按 tool index 独立分桶，防并行工具调用串台
   }
 
   _processBuffer(buf, nextChunk) {
@@ -73,9 +74,10 @@ export class StreamRestorer {
     return out;
   }
 
-  processArgs(chunk) {
-    const { out, rem } = this._processBuffer(this.argsBuf, chunk);
-    this.argsBuf = rem;
+  processArgs(chunk, index = 0) {
+    const cur = this.argsBufMap.get(index) || '';
+    const { out, rem } = this._processBuffer(cur, chunk);
+    this.argsBufMap.set(index, rem);
     return out;
   }
 
@@ -93,11 +95,22 @@ export class StreamRestorer {
     return this.restoreAll(rem);
   }
 
-  flushArgs() {
-    if (!this.argsBuf) return '';
-    let rem = this.argsBuf;
-    this.argsBuf = '';
-    return this.restoreAll(rem);
+  flushArgs(index = 0) {
+    const cur = this.argsBufMap.get(index) || '';
+    this.argsBufMap.delete(index);
+    return this.restoreAll(cur);
+  }
+
+  flushAllArgs() {
+    const res = [];
+    for (const [idx, buf] of this.argsBufMap.entries()) {
+      if (buf) {
+        const text = this.restoreAll(buf);
+        if (text) res.push({ index: idx, arguments: text });
+      }
+    }
+    this.argsBufMap.clear();
+    return res;
   }
 
   restoreAll(text) {
@@ -118,7 +131,7 @@ export function sanitizeWafPayload(payload) {
     return { payload, restorer: new StreamRestorer() };
   }
 
-  // 提取所有原始文本片段（含 text、tool_calls 参数等）
+  // 提取所有原始文本片段（含 text、tool_calls 参数、reasoning_content 等）
   const allTexts = [];
   for (const m of payload.messages) {
     if (!m || typeof m !== 'object') continue;
@@ -127,6 +140,9 @@ export function sanitizeWafPayload(payload) {
       for (const p of m.content) {
         if (p && typeof p.text === 'string') allTexts.push(p.text);
       }
+    }
+    if (typeof m.reasoning_content === 'string') {
+      allTexts.push(m.reasoning_content);
     }
     if (Array.isArray(m.tool_calls)) {
       for (const tc of m.tool_calls) {
@@ -191,6 +207,9 @@ export function sanitizeWafPayload(payload) {
         return part;
       });
     }
+    if (typeof copy.reasoning_content === 'string') {
+      copy.reasoning_content = replaceString(copy.reasoning_content);
+    }
     if (Array.isArray(copy.tool_calls)) {
       copy.tool_calls = copy.tool_calls.map(tc => {
         if (tc?.function?.arguments && typeof tc.function.arguments === 'string') {
@@ -208,7 +227,7 @@ export function sanitizeWafPayload(payload) {
     return copy;
   });
 
-  // 如果发生了路径替换，向 system 消息尾部追加保真说明，指导模型在引用路径与工具参数时原样回传 token
+  // 如果发生了路径替换，向首条 system 消息尾部追加保真说明，指导模型在引用路径与工具参数时原样回传 token
   if (forwardMap.size > 0) {
     const systemNotice = '\n[System Context: Tokens matching ⟦PATH_...⟧ denote literal file paths. Output them verbatim when referencing or calling tools.]';
     let systemFound = false;
