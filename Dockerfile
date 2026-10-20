@@ -1,5 +1,5 @@
-# ---------- Stage 1: 取出 NewAPI 稳定版本单二进制 ----------
-FROM calciumion/new-api:0.4.3 AS newapi
+# ---------- Stage 1: 取出 NewAPI 最新稳定单二进制 ----------
+FROM calciumion/new-api:latest AS newapi
 
 # ---------- Stage 2: wag2api 运行时（glibc，与 NewAPI 二进制 100% 兼容） ----------
 FROM node:20-bookworm-slim
