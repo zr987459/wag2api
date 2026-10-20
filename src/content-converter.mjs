@@ -156,23 +156,46 @@ export function convertAnthropicToGoogle(anthropicRequest) {
     }
   }
 
-  // 3. 规范化 contents：合并连续相同角色，确保以 user 开头
+  // 3. 规范化 contents（遵循 Hark 严格清洗流：先剥空 part -> 删空轮次 -> 合并同角色 -> 补首条 user -> 再次防连合）
+  // Step A: 剔除空 text part 及没有任何 part 的无效轮次
+  for (let i = rawContents.length - 1; i >= 0; i--) {
+    const c = rawContents[i];
+    c.parts = c.parts.filter(p => {
+      if (p.text !== undefined && typeof p.text === 'string' && !p.thought) {
+        return p.text.trim().length > 0;
+      }
+      return true;
+    });
+    if (c.parts.length === 0) {
+      rawContents.splice(i, 1);
+    }
+  }
+
+  // Step B: 合并连续相同角色
   const contents = [];
   for (const item of rawContents) {
     if (contents.length > 0 && contents[contents.length - 1].role === item.role) {
-      // 连续相同 role，合并其 parts
       contents[contents.length - 1].parts.push(...item.parts);
     } else {
       contents.push(item);
     }
   }
 
-  // 确保第一条消息必须是 user 角色
+  // Step C: 确保第一条消息必须是 user 角色（绝对不能是空文本，防 Google 报 empty text 400 校验错误）
   if (contents.length > 0 && contents[0].role === 'model') {
     contents.unshift({
       role: 'user',
-      parts: [{ text: '' }],
+      parts: [{ text: 'Hello' }],
     });
+  }
+
+  // Step D: 再次合并相邻相同角色（兜底边界情况）
+  for (let i = 0; i < contents.length - 1; i++) {
+    if (contents[i].role === contents[i + 1].role) {
+      contents[i].parts.push(...contents[i + 1].parts);
+      contents.splice(i + 1, 1);
+      i--;
+    }
   }
 
   // 4. 处理工具声明 (Tools) 并清洗 Schema (按工具名排序固化 + 会话级工具全量锁定，保护前缀缓存哈希)
@@ -291,9 +314,13 @@ export function convertGoogleToAnthropic(googleData, originalModel) {
     }
   }
 
-  // 兜底：如果内容为空，补一个空文本块防止下游客户端解析崩溃
+  // 兜底：如果内容为空，检查是否命中了 SAFETY；补全文本块防止下游客户端解析崩溃
   if (anthropicContent.length === 0) {
-    anthropicContent.push({ type: 'text', text: '' });
+    if (candidate?.finishReason === 'SAFETY' || responseObj?.promptFeedback?.blockReason === 'SAFETY') {
+      anthropicContent.push({ type: 'text', text: '[提示：上游安全策略拦截了当前内容生成，请微调提示词或去除敏感关键字后重试。]' });
+    } else {
+      anthropicContent.push({ type: 'text', text: '' });
+    }
   }
 
   const usage = normalizeGeminiUsage(responseObj?.usageMetadata);
