@@ -558,7 +558,8 @@ const server = http.createServer(async (req, res) => {
         statsModel = anthropicReq.model;
 
         // Google / Antigravity 路由通道
-        anthropicReq._gwSessionKey = clientSessionKey(req.headers, anthropicReq);
+        // OpenAI 请求体里的 session_id / conversation_id / metadata 在协议转换时会丢，取会话 id 时用原始请求体（不使用常被设成固定值的 user 字段）
+        anthropicReq._gwSessionKey = clientSessionKey(req.headers, isOaiChat ? { ...rawParsed, user: undefined } : anthropicReq);
         lastClientHeaders = {
           names: Object.keys(req.headers).sort(),
           metadataKeys: Object.keys(anthropicReq.metadata || {}),

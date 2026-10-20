@@ -13,19 +13,44 @@ import { stripDowngradeNotice } from './downgrade-notice.mjs';
 import { pinToolDescriptions } from './session-router.mjs';
 import { normalizeGeminiUsage, toAnthropicUsage } from './usage.mjs';
 
+/** 无会话 id 时的会话指纹：首条用户消息 + 首条模型回复的可见内容（忽略 thinking / 签名 / 空白差异）。首轮返回 ''。 */
+export function fallbackConvSeed(messages) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  const firstUser = msgs.find(m => m?.role === 'user');
+  const firstModel = msgs.find(m => m?.role === 'assistant');
+  if (!firstUser || !firstModel) return '';
+  const vis = m => {
+    if (typeof m.content === 'string') return [stripDowngradeNotice(m.content)];
+    return (Array.isArray(m.content) ? m.content : []).map(b => {
+      if (!b || b.type === 'thinking' || b.type === 'redacted_thinking') return '';
+      if (b.type === 'text') return m.role === 'assistant' ? stripDowngradeNotice(b.text || '') : (b.text || '');
+      if (b.type === 'tool_use') return 'tu:' + (b.name || '') + ':' + (b.id || '');
+      if (b.type === 'tool_result') return 'tr:' + (b.tool_use_id || '');
+      if (b.type === 'image') return 'img:' + String(b.source?.data || b.source?.url || '').length;
+      return '';
+    });
+  };
+  const norm = a => a.join('\n').replace(/\s+/g, ' ').trim();
+  const u = norm(vis(firstUser)), a = norm(vis(firstModel));
+  if (!a) return '';
+  return 'fp:' + u + '\u0000' + a;
+}
+
 /**
  * 转换 Anthropic Request 为 Google Cloud Code / Gemini Request
  */
 export function convertAnthropicToGoogle(anthropicRequest) {
   let systemInstruction = null;
   // Claude 上下文窗口较小，恢复被客户端裁剪的内容可能超限，只对 Gemini 启用历史锁定
-  // 另外：只有客户端带了真实会话 id 才启用。按首条消息哈希推出的 conv 在"固定前缀"的客户端上会让不同对话撞 key，导致串台。
-  historyPin.active = !String(anthropicRequest.model || '').toLowerCase().includes('claude')
-    && Boolean(anthropicRequest._gwSessionKey);
-  // 优先采用全局会话唯一标识，保证多轮交互及子代理中 conv 绝对稳定，避免首条消息微变导致历史锁定全部脱靶
-  const conv = anthropicRequest._gwSessionKey
-    ? crypto.createHash('sha1').update(anthropicRequest._gwSessionKey).digest('hex').slice(0, 12)
-    : crypto.createHash('sha1').update(JSON.stringify((anthropicRequest.messages || [])[0] || '')).digest('hex').slice(0, 12);
+  // 会话 key：
+  //  1) 客户端带了会话 id（Claude Code 等）→ 直接用；
+  //  2) 没带（多数 OpenAI 客户端）→ 用「首条用户消息 + 首条模型回复的可见内容」做指纹。
+  //     只用首条消息会让"首条是固定前缀"的客户端所有对话撞同一个 key，导致串台；
+  //     加上首条模型回复后每个对话天然不同，且客户端剥思考块/签名不影响指纹。
+  //     还没有模型回复（首轮）时没有历史可锁，直接关闭锁定。
+  const sessionKey = anthropicRequest._gwSessionKey || fallbackConvSeed(anthropicRequest.messages);
+  historyPin.active = !String(anthropicRequest.model || '').toLowerCase().includes('claude') && Boolean(sessionKey);
+  const conv = crypto.createHash('sha1').update(sessionKey || JSON.stringify((anthropicRequest.messages || [])[0] || '')).digest('hex').slice(0, 12);
 
   // 1. 处理 System Prompt 并清洗竞品标识
   if (anthropicRequest.system) {

@@ -1,12 +1,13 @@
 /**
  * 历史锁定防串台：node tests/test-history-pin.mjs
- * - 没有真实会话 id 时不锁定（固定前缀的客户端不会撞 key）
+ * - 没有真实会话 id 时用「首条用户消息 + 首条模型回复」做指纹（固定前缀的客户端不会撞 key）
  * - 同一会话 id 下，两个不同对话的模型回复/首条提示/系统提示不会互相替换
  * - 客户端剥掉思考块或签名、裁剪工具结果时，仍然能还原（原有的缓存保护还在）
  */
 import assert from 'assert/strict';
 import { buildCloudCodePayload } from '../src/cloudcode.mjs';
 import { nearSameText, sameVisibleParts, looksTrimmed } from '../src/history-pin.mjs';
+import { fallbackConvSeed } from '../src/content-converter.mjs';
 
 let passed = 0;
 const ok = (name, fn) => { fn(); passed++; console.log('  ✓', name); };
@@ -54,6 +55,28 @@ ok('同一会话：系统提示只改时间戳 → 还原；整段换掉 → 用
   buildCloudCodePayload(mk(long + ' now=10:00'), 'proj');
   assert.ok(sysOf(buildCloudCodePayload(mk(long + ' now=10:05'), 'proj')).includes('now=10:00'));
   assert.ok(sysOf(buildCloudCodePayload(mk('完全不同的系统提示'), 'proj')).includes('完全不同的系统提示'));
+});
+
+ok('无会话 id：同一对话里客户端剥掉思考块/签名，仍能还原（OpenAI 客户端也有锁定保护）', () => {
+  const base = { model: M, max_tokens: 100, system: 'SYS' };
+  const full = { ...base, messages: [{ role: 'user', content: '<env>fixed</env>' },
+    { role: 'assistant', content: [{ type: 'thinking', thinking: '想', signature: 'SIG-OAI' }, { type: 'text', text: '第一条回复A' }] },
+    { role: 'user', content: 'go' }] };
+  const stripped = { ...base, messages: [{ role: 'user', content: '<env>fixed</env>' },
+    { role: 'assistant', content: '第一条回复A' }, { role: 'user', content: 'go' }] };
+  const a = texts(buildCloudCodePayload(full, 'proj'));
+  const b = texts(buildCloudCodePayload(stripped, 'proj'));
+  assert.ok(b.includes('SIG-OAI'));
+  assert.equal(a, b);
+});
+
+ok('会话指纹：首轮为空；剥思考块不变；首条回复不同则不同', () => {
+  assert.equal(fallbackConvSeed([{ role: 'user', content: 'x' }]), '');
+  const s1 = fallbackConvSeed([{ role: 'user', content: 'p' }, { role: 'assistant', content: [{ type: 'thinking', thinking: 't' }, { type: 'text', text: 'A ' }] }]);
+  const s2 = fallbackConvSeed([{ role: 'user', content: 'p' }, { role: 'assistant', content: 'A' }, { role: 'user', content: 'more' }]);
+  const s3 = fallbackConvSeed([{ role: 'user', content: 'p' }, { role: 'assistant', content: 'B' }]);
+  assert.equal(s1, s2);
+  assert.notEqual(s1, s3);
 });
 
 ok('校验函数', () => {
