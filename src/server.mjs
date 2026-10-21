@@ -17,6 +17,7 @@ import { signatureCache } from './signature-cache.mjs';
 import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
 import { hostBench } from './host-bench.mjs';
+import { splitHeaderTiming, thinkingLevelOf } from './timing-split.mjs';
 import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
 import { prewarm, lastPrewarm } from './prewarm.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
@@ -568,10 +569,18 @@ const server = http.createServer(async (req, res) => {
     readRawBody(req).then(async (body) => {
       const startTime = Date.now();
       // PR2 分段打点：各时间点均为相对 startTime 的毫秒数；多次尝试时保留最后一次（即最终生效的那次）
-      const timing = { t_token: null, t_payload: null, t_headers: null, t_tls: null, conn_reused: null, host: null, attempts: 0, switched_account: false, switched_host: false };
+      const timing = { t_token: null, t_payload: null, t_headers: null, t_tls: null, conn_reused: null, host: null, attempts: 0, switched_account: false, switched_host: false,
+        upload_ms: null, wait_headers_ms: null, body_bytes: null, thinking_level: null, failover: false };
       const mark = (k) => { timing[k] = Date.now() - startTime; };
-      const markHeaders = (u, r) => { mark('t_headers'); try { timing.host = new URL(u).hostname; } catch (e) {} if (r) { timing.conn_reused = r._gwReused ?? null; timing.t_tls = r._gwTlsMs ?? null; } };
-      const timingOut = (extra = {}) => ({ ...timing, switched_host: Boolean(timing.host && timing.host !== DAILY_HOST), ...extra });
+      const markHeaders = (u, r, sentAt) => {
+        mark('t_headers');
+        try { timing.host = new URL(u).hostname; } catch (e) {}
+        if (r) { timing.conn_reused = r._gwReused ?? null; timing.t_tls = r._gwTlsMs ?? null; }
+        Object.assign(timing, splitHeaderTiming(Date.now() - sentAt, r?._gwUploadMs));
+      };
+      // 首个 host 不再写死为 daily：以本次请求排在第一位的 host 为准
+      let firstHost = DAILY_HOST;
+      const timingOut = (extra = {}) => ({ ...timing, switched_host: Boolean(timing.host && timing.host !== firstHost), ...extra });
       let statsRecorded = false;
       let statsEmail = null;
       let statsModel = null;
@@ -626,13 +635,17 @@ const server = http.createServer(async (req, res) => {
             const e = new Error(`upstream header timeout ${timeoutMs}ms`); e.name = 'TimeoutError'; ac.abort(e);
           }, timeoutMs) : null;
           try {
+            const bodyStr = JSON.stringify(payload);
+            timing.body_bytes = Buffer.byteLength(bodyStr);
+            timing.thinking_level = thinkingLevelOf(payload);
+            const sentAt = Date.now();
             const r = await upstreamFetch(targetUrl, {
               method: 'POST',
               headers: buildAntigravityHeaders(tok),
-              body: JSON.stringify(payload),
+              body: bodyStr,
               ...(ac ? { signal: ac.signal } : {}),
             });
-            markHeaders(targetUrl, r);
+            markHeaders(targetUrl, r, sentAt);
             return r;
           } finally {
             if (timer) clearTimeout(timer);
@@ -744,7 +757,10 @@ const server = http.createServer(async (req, res) => {
               cached_tokens: usage.cached_tokens,
               thoughts_tokens: usage.thoughts_tokens,
               error: usage.error || null,
-              timing: timingOut({ t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null }),
+              timing: timingOut({
+                t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null,
+                first_chunk_ms: usage.ttft_ms ?? null, first_thought_ms: usage.t_first_thought ?? null, first_text_ms: usage.t_first_text ?? null,
+              }),
               ...dg,
             });
           }, startTime, { notice });

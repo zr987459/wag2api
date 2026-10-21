@@ -9,6 +9,8 @@
  * 额外挂两个只读字段，供打点：
  *   resp._gwReused  本次是否复用了已有连接（Bun 下为 null，未知）
  *   resp._gwTlsMs   新建连接时 TCP+TLS 握手耗时（复用为 0，Bun 下为 null）
+ *   resp._gwUploadMs 从发起请求到请求体全部写出（req 'finish'）的耗时，含建连；Bun 下为 null。
+ *                    注意：'finish' 表示数据已交给本机 socket 缓冲区，不代表服务端已收完，所以是近似值（偏小）。
  *
  * 取消：body.getReader().cancel() 会 destroy 底层请求，不会留下半截连接继续收数据。
  * 复用到已被服务端关掉的空闲连接（ECONNRESET 且尚未收到响应）时自动重发一次，这是 Node 文档推荐做法。
@@ -61,6 +63,8 @@ function nodeRequestOnce(url, opts, allowRetry) {
     if (body) headers['Content-Length'] = String(body.length);
     let settled = false;
     let tlsMs = 0;
+    const tStart = Date.now();
+    let uploadMs = null;
     const req = https.request({
       protocol: u.protocol, hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search,
       method: opts.method || 'GET', headers, agent: keepAliveAgent,
@@ -68,6 +72,8 @@ function nodeRequestOnce(url, opts, allowRetry) {
     const onAbort = () => req.destroy(abortError(signal));
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+
+    req.on('finish', () => { uploadMs = Date.now() - tStart; });
 
     req.on('socket', (sock) => {
       if (req.reusedSocket) return;
@@ -122,6 +128,7 @@ function nodeRequestOnce(url, opts, allowRetry) {
       const resp = new Response(stream, { status: res.statusCode, statusText: res.statusMessage || '', headers: h });
       Object.defineProperty(resp, '_gwReused', { value: Boolean(req.reusedSocket) });
       Object.defineProperty(resp, '_gwTlsMs', { value: req.reusedSocket ? 0 : tlsMs });
+      Object.defineProperty(resp, '_gwUploadMs', { value: uploadMs });
       resolve(resp);
     });
 

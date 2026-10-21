@@ -82,6 +82,25 @@ WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/
 
 配置了 `GH_TOKEN` + `GH_REPO`（见 `src/persist.mjs`）时，AG 账号、WB 账号与设置、两边统计都会同步到仓库的 `state` 分支，重新部署后自动恢复。
 
+## AG 引擎首字延迟（TTFT）调优
+
+### 分段耗时
+
+每条 AG 请求日志都带分段打点（毫秒），控制台「分段耗时」面板显示最近 20 条的中位数：
+
+| 字段 | 含义 |
+| --- | --- |
+| `t_token` / `t_payload` | 取 token / 组包完成（相对请求开始） |
+| `upload_ms` | 本次尝试从发起请求到请求体全部写出（含建连/握手）。取自 Node `req.on('finish')`，表示数据已交给本机 socket 缓冲区，**是近似值、偏小**；Bun 下为 `null` |
+| `wait_headers_ms` | 响应头耗时 − `upload_ms`，即上游排队 + prefill（+ 首个思考块）的时间；Bun 下等于整段头耗时 |
+| `first_chunk_ms` / `first_thought_ms` / `first_text_ms` | 首个内容块 / 首个思考块 / 首个正文（相对请求开始） |
+| `body_bytes` | 发给上游的请求体字节数 |
+| `host` / `attempts` / `thinking_level` | 最终走的 host、尝试次数、思考档位 |
+
+日志卡片里「头」被拆成「上传 · 等待 · 首思考 · 首正文」，并显示请求体大小和 host。
+
+<!-- ttft-env -->
+
 ## 模型分流规则
 
 前门按三层顺序判断，**绝不靠模型名前缀猜**（两边都有 `claude-` 和 `gemini-` 家族，猜一定错）：

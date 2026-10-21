@@ -36,6 +36,7 @@ function fmtNum(n) {
 
 function fmtPct(r) { return r === null || r === undefined ? '--' : (r * 100).toFixed(1) + '%'; }
 function fmtMs(ms) { return ms === null || ms === undefined || ms === 0 ? '--' : ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
+function fmtBytes(b) { if (b === null || b === undefined || !Number.isFinite(Number(b))) return "--"; b = Number(b); return b >= 1048576 ? (b / 1048576).toFixed(2) + " MB" : b >= 1024 ? Math.round(b / 1024) + " KB" : b + " B"; }
 
 // 独立运行：standalone=只有 AG（WB_ENGINE=0）；dual=Linux / 源码版双引擎（没有安卓宿主）。
 // 设置了 ADMIN_KEY 时管理接口需带密钥
@@ -282,8 +283,10 @@ function renderTiming(st) {
     ['Token / 组包', `${ms(t.t_token)} / ${ms(t.t_payload)}`],
     ['握手', ms(t.t_tls)],
     ['响应头', ms(t.t_headers)],
-    ['首个思考', ms(t.t_first_thought)],
-    ['首个正文', ms(t.t_first_text)],
+    ['上传 / 等待', `${t.upload_ms === null || t.upload_ms === undefined ? '--' : ms(t.upload_ms)} / ${ms(t.wait_headers_ms)}`],
+    ['首个思考', ms(t.first_thought_ms ?? t.t_first_thought)],
+    ['首个正文', ms(t.first_text_ms ?? t.t_first_text)],
+    ['请求体', fmtBytes(t.body_bytes)],
     ['总耗时', ms(t.latency_ms)],
     ['尝试次数', t.attempts ?? '--'],
     ['缓存 / 未命中', `${fmtNum(t.cached_tokens)} / ${fmtNum(t.input_tokens)}`],
@@ -298,7 +301,7 @@ function renderTiming(st) {
     const rs = Object.entries(dg?.reasons || {}).map(([k, v]) => `${labels[k] || escapeHtml(k)} ${v}`).join('，');
     dgEl.textContent = dg ? `近 24 小时降级 ${dg.count} 次 · 降级率 ${dg.rate === null ? '--' : fmtPct(dg.rate)}${rs ? ' · ' + rs : ''}` : '';
   }
-  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次 · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
+  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次${t.failover ? ` · 首块超时切换 ${t.failover} 次` : ''} · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
 }
 
 function renderStats(st) {
@@ -1167,9 +1170,13 @@ async function loadLogs() {
           </div>
           <div class="log-tokens">${tok}</div>
           ${l.timing ? `<div class="muted mono" style="font-size:11px;">${[
-            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['握手', l.timing.conn_reused === false ? l.timing.t_tls : null], ['头', l.timing.t_headers],
-            ['思考', l.timing.t_first_thought], ['正文', l.timing.t_first_text],
-          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
+            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['握手', l.timing.conn_reused === false ? l.timing.t_tls : null],
+            // fix/ttft：「头」拆成 上传 · 等待；旧日志没有拆分字段时仍显示「头」
+            ...(l.timing.wait_headers_ms !== null && l.timing.wait_headers_ms !== undefined
+              ? [['上传', l.timing.upload_ms], ['等待', l.timing.wait_headers_ms]]
+              : [['头', l.timing.t_headers]]),
+            ['首思考', l.timing.first_thought_ms ?? l.timing.t_first_thought], ['首正文', l.timing.first_text_ms ?? l.timing.t_first_text],
+          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.body_bytes ? ` · 体 ${fmtBytes(l.timing.body_bytes)}` : ''}${l.timing.thinking_level ? ` · 思考 ${escapeHtml(l.timing.thinking_level)}` : ''}${l.timing.failover ? ' · 超时换 host' : ''}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
           ${l.who ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(l.who)}</div>` : ''}
           ${l.note ? `<div class="log-note-box">⚠️ ${escapeHtml(l.note)}</div>` : ''}
         </div>`;

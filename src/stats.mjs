@@ -103,7 +103,9 @@ export function migrateBucket(b) {
 }
 
 // PR2 分段打点字段（相对请求开始的毫秒数）
-export const TIMING_MS_FIELDS = ['t_token', 't_payload', 't_tls', 't_headers', 't_first_thought', 't_first_text'];
+export const TIMING_MS_FIELDS = ['t_token', 't_payload', 't_tls', 't_headers', 't_first_thought', 't_first_text',
+  // fix/ttft：把「头」拆开。upload/wait 是本次尝试内的耗时；first_* 与 t_* 一样相对请求开始
+  'upload_ms', 'wait_headers_ms', 'first_chunk_ms', 'first_thought_ms', 'first_text_ms'];
 
 function cleanTiming(t) {
   const o = {};
@@ -113,6 +115,9 @@ function cleanTiming(t) {
   o.switched_account = Boolean(t.switched_account);
   o.switched_host = Boolean(t.switched_host);
   o.conn_reused = t.conn_reused === true ? true : t.conn_reused === false ? false : null;
+  o.body_bytes = Number.isFinite(Number(t.body_bytes)) && t.body_bytes !== null ? Math.max(0, Math.round(Number(t.body_bytes))) : null;
+  o.thinking_level = t.thinking_level ? String(t.thinking_level).slice(0, 16) : null;
+  o.failover = Boolean(t.failover);
   return o;
 }
 
@@ -446,6 +451,8 @@ export class StatsTracker {
     out.ttft_ms = median(logs.map(l => l.ttft_ms));
     out.latency_ms = median(logs.map(l => l.latency_ms));
     out.attempts = median(logs.map(l => l.timing.attempts));
+    out.body_bytes = median(logs.map(l => l.timing.body_bytes));
+    out.failover = logs.filter(l => l.timing.failover).length;
     out.cached_tokens = median(logs.map(l => l.tokens?.cached));
     out.input_tokens = median(logs.map(l => l.tokens?.input));
     out.cache_hit_rate = median(logs.map(l => l.cache_hit_rate));
