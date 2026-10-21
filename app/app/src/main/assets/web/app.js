@@ -268,6 +268,7 @@ async function loadOverview() {
   }
   renderStats(lastStats[engine]);
   renderTiming(lastStats[engine]);
+  loadAgTuning();
   renderTrend(lastStats[engine]);
 }
 
@@ -302,6 +303,45 @@ function renderTiming(st) {
     dgEl.textContent = dg ? `近 24 小时降级 ${dg.count} 次 · 降级率 ${dg.rate === null ? '--' : fmtPct(dg.rate)}${rs ? ' · ' + rs : ''}` : '';
   }
   $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次${t.failover ? ` · 首块超时切换 ${t.failover} 次` : ''} · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
+}
+
+// fix/ttft：AG 调优开关（/api/ag/tuning）
+let agTuningAt = 0;
+async function loadAgTuning(force) {
+  const card = $('agTuningCard');
+  if (!card) return;
+  if (engine !== 'ag') { card.style.display = 'none'; return; }
+  if (!force && Date.now() - agTuningAt < 30000) return;
+  if (!force && card.contains(document.activeElement)) return; // 正在编辑时不刷新
+  agTuningAt = Date.now();
+  let d;
+  try { d = await getJson('/api/ag/tuning'); } catch (e) { return; }
+  if (!d || !d.items) return;
+  card.style.display = '';
+  const src = { console: '控制台', env: '环境变量', default: '默认' };
+  $('agTuningList').innerHTML = d.items.map(it => `
+    <div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div class="row-between"><span class="mono" style="font-size:12px;font-weight:600;">${escapeHtml(it.name)}</span><span class="muted" style="font-size:11px;">${src[it.source] || it.source} · 默认 ${escapeHtml(it.default || '空')}</span></div>
+      <div class="muted" style="font-size:11px;margin:2px 0 4px;">${escapeHtml(it.doc)}</div>
+      <div style="display:flex;gap:6px;">
+        <input class="input-field mono" style="margin-bottom:0;flex:1;font-size:12px;" id="tune-${it.name}" value="${escapeHtml(it.source === 'console' ? it.value : '')}" placeholder="${escapeHtml(it.value)}">
+        <button class="btn btn-primary btn-sm" onclick="saveAgTuning('${it.name}')">保存</button>
+      </div>
+    </div>`).join('');
+  const hh = Object.entries(d.health?.hosts || {}).map(([h, v]) => {
+    let name = h; try { name = new URL(h).hostname.split('.')[0]; } catch (e) {}
+    return `${escapeHtml(name)} 样本 ${v.samples} 等待中位 ${fmtMs(v.median_wait_ms)}${v.demoted_until ? ' · 已降权' : ''}`;
+  });
+  $('agHostHealth').textContent = hh.length ? `host 健康度：${hh.join('；')} · 粘滞会话 ${d.health.sticky_sessions}` : '';
+}
+async function saveAgTuning(name) {
+  const v = $('tune-' + name)?.value ?? '';
+  try {
+    const d = await postJson('/api/ag/tuning', { name, value: v.trim() });
+    if (!d.ok) throw new Error(d.error || '保存失败');
+    showToast(v.trim() ? `${name} 已保存` : `${name} 已恢复默认`, 'success');
+  } catch (e) { showToast(e.message, 'error'); }
+  loadAgTuning(true);
 }
 
 function renderStats(st) {

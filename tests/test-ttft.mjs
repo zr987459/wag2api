@@ -125,4 +125,129 @@ console.log('2. 长上下文回放测速');
   });
 }
 
+console.log('3. 集群顺序 / 首块超时切换 / host 粘滞与健康度');
+{
+  const { parseEndpoints, configuredEndpoints, loadTuning, setTuning, tuning } = await import('../src/ag-tuning.mjs');
+  const { HostRouter, DEMOTE_MS } = await import('../src/host-router.mjs');
+  const { runWithPolicy, Cooldowns } = await import('../src/upstream-policy.mjs');
+  const { mapToUpstreamModel } = await import('../src/cloudcode.mjs');
+  const { resolveSessionId } = await import('../src/session-router.mjs');
+  const fs = await import('fs'); const os = await import('os'); const path = await import('path');
+  const DAILY = 'https://daily-cloudcode-pa.sandbox.googleapis.com', AUTO = 'https://autopush-cloudcode-pa.sandbox.googleapis.com', PROD = 'https://cloudcode-pa.googleapis.com';
+
+  await ok('AG_ENDPOINTS 解析：别名、完整 URL、大小写、去重、无效项忽略', () => {
+    assert.deepEqual(parseEndpoints('prod,daily,autopush'), [PROD, DAILY, AUTO]);
+    assert.deepEqual(parseEndpoints(' PROD , https://x.example.com/ ,bogus,prod,ftp://y'), [PROD, 'https://x.example.com']);
+    assert.deepEqual(parseEndpoints(''), []);
+  });
+  await ok('默认顺序保持 daily,autopush,prod；无效环境变量回退默认；控制台覆盖优先并可清除', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tune-'));
+    loadTuning(path.join(dir, 't.json'));
+    const old = process.env.AG_ENDPOINTS;
+    delete process.env.AG_ENDPOINTS;
+    assert.deepEqual(configuredEndpoints(), [DAILY, AUTO, PROD]);
+    process.env.AG_ENDPOINTS = 'bogus';
+    assert.deepEqual(configuredEndpoints(), [DAILY, AUTO, PROD]);
+    process.env.AG_ENDPOINTS = 'prod,daily';
+    assert.deepEqual(configuredEndpoints(), [PROD, DAILY]);
+    assert.equal(setTuning('AG_ENDPOINTS', 'autopush').ok, true);
+    assert.deepEqual(configuredEndpoints(), [AUTO]);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 't.json'), 'utf8')).AG_ENDPOINTS, 'autopush');
+    assert.equal(setTuning('AG_ENDPOINTS', 'nope').ok, false);
+    setTuning('AG_ENDPOINTS', '');
+    assert.deepEqual(configuredEndpoints(), [PROD, DAILY]);
+    if (old === undefined) delete process.env.AG_ENDPOINTS; else process.env.AG_ENDPOINTS = old;
+    assert.equal(tuning('AG_FIRST_CHUNK_FAILOVER_MS'), '0', '默认关闭');
+  });
+
+  const mk = email => ({ tokenData: { email, projectId: 'p' } });
+  const okResp = () => ({ ok: true, status: 200, text: async () => '', headers: { get: () => null } });
+  const timeoutErr = ms => Object.assign(new Error(`upstream header timeout ${ms}ms`), { name: 'TimeoutError' });
+  function run({ rule, failoverMs = 30000, hosts = [DAILY, AUTO, PROD], allowDowngrade = true }) {
+    const calls = [];
+    let t = 0;
+    const cd = new Cooldowns(() => t);
+    const req = { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'hi' }] };
+    const p = runWithPolicy({
+      model: req.model, anthropicReq: req, upstreamOf: mapToUpstreamModel,
+      accounts: () => ['a', 'b'].map(mk), activeEmail: 'a', quotaOf: () => null, cooldowns: cd,
+      buildPayload: (model, m) => ({ model: mapToUpstreamModel(model), requestId: 'r', request: { sessionId: resolveSessionId(req, m.tokenData.email), contents: [] } }),
+      send: async (payload, m, host, timeoutMs) => {
+        calls.push({ host, email: m.tokenData.email, sid: payload.request.sessionId, model: payload.model, timeoutMs });
+        const r = rule(calls.length - 1, host, timeoutMs);
+        if (r instanceof Error) { t += timeoutMs; throw r; }
+        return r;
+      },
+      hosts, chain: ['gemini-3.6-flash-high'], allowDowngrade, headerTimeoutMs: 180000, deadlineMs: 90000, failoverMs,
+      now: () => t, sleep: async ms => { t += ms; }, startedAt: 0,
+    });
+    return p.then(r => ({ r, calls }));
+  }
+
+  await ok('首块超时：第一次尝试用短超时，超时后同账号、同 sessionId 换下一个 host，成功', async () => {
+    const { r, calls } = await run({ rule: (n, host, to) => (n === 0 ? timeoutErr(to) : okResp()) });
+    assert.equal(r.ok, true);
+    assert.equal(r.failover, true);
+    assert.deepEqual(calls.map(c => c.host), [DAILY, AUTO]);
+    assert.deepEqual(calls.map(c => c.timeoutMs), [30000, 180000]);
+    assert.ok(calls.every(c => c.email === 'a' && c.sid === calls[0].sid));
+    assert.equal(r.switchedAccount, false);
+  });
+  await ok('首块超时只切换一次：第二个 host 也超时 → 返回错误，不换号、不降级、不再换 host', async () => {
+    const { r, calls } = await run({ rule: (n, host, to) => timeoutErr(to) });
+    assert.equal(r.ok, false);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(c => c.host), [DAILY, AUTO]);
+    assert.ok(calls.every(c => c.email === 'a' && c.model === 'gemini-3.8-flash-tiered'));
+    assert.equal(r.downgraded, false);
+  });
+  await ok('已开始吐字后绝不重发：拿到响应头即返回，流再慢也只发 1 次', async () => {
+    let pulls = 0;
+    const slowBody = new ReadableStream({ async pull(c) { pulls++; await new Promise(x => setTimeout(x, 20)); if (pulls > 3) c.close(); else c.enqueue(new TextEncoder().encode('data: {}\n\n')); } });
+    const { r, calls } = await run({ failoverMs: 5, rule: () => ({ ...okResp(), body: slowBody }) });
+    assert.equal(r.ok, true);
+    assert.equal(r.failover, false);
+    assert.equal(calls.length, 1);
+    const reader = r.response.body.getReader();
+    while (!(await reader.read()).done) { /* 消费完 */ }
+    assert.equal(calls.length, 1, '读流期间没有任何重发');
+  });
+  await ok('failoverMs=0（默认）：行为与原来一致，单次超时用原超时', async () => {
+    const { calls } = await run({ failoverMs: 0, rule: (n, h, to) => (n === 0 ? timeoutErr(to) : okResp()) });
+    assert.equal(calls[0].timeoutMs, 180000);
+  });
+  await ok('只有一个 host 时不触发切换', async () => {
+    const { calls } = await run({ hosts: [PROD], rule: () => okResp() });
+    assert.equal(calls[0].timeoutMs, 180000);
+  });
+
+  await ok('host 粘滞：同会话固定 host，TTL 过期后回到配置顺序；未绑定会话按配置顺序', () => {
+    let t = 0;
+    const hr = new HostRouter({ now: () => t, endpoints: () => [DAILY, AUTO, PROD], healthEnabled: () => false, ttlMs: 1000 });
+    assert.deepEqual(hr.orderFor('k'), [DAILY, AUTO, PROD]);
+    hr.bind('k', AUTO);
+    assert.deepEqual(hr.orderFor('k'), [AUTO, DAILY, PROD]);
+    assert.deepEqual(hr.orderFor('other'), [DAILY, AUTO, PROD]);
+    t += 1001;
+    assert.deepEqual(hr.orderFor('k'), [DAILY, AUTO, PROD]);
+  });
+  await ok('健康度：同体积档中位数 > 2 倍时降权 10 分钟（只影响未粘滞会话），恢复后取消', () => {
+    let t = 0, on = true;
+    const hr = new HostRouter({ now: () => t, endpoints: () => [DAILY, AUTO, PROD], healthEnabled: () => on, ttlMs: 60 * 60 * 1000 });
+    hr.bind('sticky', DAILY);
+    const big = 2 * 1024 * 1024;
+    for (let i = 0; i < 3; i++) hr.record(AUTO, 10000, big);
+    for (let i = 0; i < 3; i++) hr.record(DAILY, 60000, big);
+    assert.deepEqual(hr.orderFor('new'), [AUTO, PROD, DAILY]);
+    assert.deepEqual(hr.orderFor('sticky')[0], DAILY, '粘滞会话不受降权影响');
+    for (let i = 0; i < 3; i++) hr.record(DAILY, 1000, 1000);
+    assert.deepEqual(hr.orderFor('new'), [AUTO, PROD, DAILY], '小请求样本不参与大请求档比较');
+    t += DEMOTE_MS + 1;
+    assert.deepEqual(hr.orderFor('new'), [DAILY, AUTO, PROD]);
+    on = false;
+    for (let i = 0; i < 5; i++) hr.record(DAILY, 999999, big);
+    assert.deepEqual(hr.orderFor('new'), [DAILY, AUTO, PROD], 'AG_HOST_HEALTH=0 不降权');
+  });
+}
+
 console.log(`\n${passed} passed`);

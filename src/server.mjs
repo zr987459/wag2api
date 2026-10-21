@@ -19,6 +19,8 @@ import { runConnectivityTest } from './test-runner.mjs';
 import { hostBench } from './host-bench.mjs';
 import { splitHeaderTiming, thinkingLevelOf } from './timing-split.mjs';
 import { rememberPayload } from './replay-store.mjs';
+import { loadTuning, describeTuning, setTuning, tuningNumber } from './ag-tuning.mjs';
+import { hostRouter } from './host-router.mjs';
 import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
 import { prewarm, lastPrewarm } from './prewarm.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
@@ -68,6 +70,7 @@ import os from 'os';
 let EMBED = {};
 try { EMBED = (await import('./embedded.mjs')).default || {}; } catch (e) {}
 fs.mkdirSync(path.join(DATA_DIR, 'accounts'), { recursive: true });
+loadTuning(path.join(DATA_DIR, 'ag-tuning.json'));
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8790;
 
 // 状态持久化
@@ -331,6 +334,19 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/api/debug/cache') {
     sendJson(res, 200, { pin: historyPin.stats(), session: sessionStats(), clientHeaders: lastClientHeaders, requests: cacheProbe.report() });
+    return;
+  }
+
+  // fix/ttft：AG 调优开关（环境变量为默认，控制台可覆盖并持久化到 DATA_DIR/ag-tuning.json）
+  if (url.pathname === '/api/ag/tuning') {
+    if (!access.isAdmin(req)) { denyAdmin(res); return; }
+    if (req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const r = setTuning(String(body.name || ''), body.value);
+      sendJson(res, r.ok ? 200 : 400, { ...r, items: describeTuning(), health: hostRouter.health() });
+      return;
+    }
+    sendJson(res, 200, { ok: true, items: describeTuning(), health: hostRouter.health() });
     return;
   }
 
@@ -632,6 +648,12 @@ const server = http.createServer(async (req, res) => {
         const isStreaming = Boolean(anthropicReq.stream);
 
         // PR1：失败处理收敛到 upstream-policy（400 直接返回；429 冷却换号；5xx/超时换 host 一次再换号一次；最后才降级）
+        // fix/ttft：host 顺序 = AG_ENDPOINTS + 会话粘滞 + 健康度（辅助请求不参与粘滞）
+        const isAux = isAuxiliaryRequest(anthropicReq);
+        const hostKey = isAux ? '' : (anthropicReq._gwSessionKey || '');
+        const hostOrder = hostRouter.orderFor(hostKey);
+        try { firstHost = new URL(hostOrder[0]).hostname; } catch (e) {}
+        let lastHostBase = null;
         const send = async (payload, mgr, host, timeoutMs) => {
           const tok = await mgr.getValidAccessToken();
           const targetUrl = isStreaming ? `${host}/v1internal:streamGenerateContent?alt=sse` : `${host}/v1internal:generateContent`;
@@ -656,6 +678,8 @@ const server = http.createServer(async (req, res) => {
               ...(ac ? { signal: ac.signal } : {}),
             });
             markHeaders(targetUrl, r, sentAt);
+            lastHostBase = host;
+            if (r && r.ok) hostRouter.record(host, timing.wait_headers_ms, timing.body_bytes);
             return r;
           } finally {
             if (timer) clearTimeout(timer);
@@ -693,7 +717,8 @@ const server = http.createServer(async (req, res) => {
           },
           onBadRequest: (body, mgr) => bumpSessionOnOverflow(anthropicReq, mgr.tokenData.email, body),
           send,
-          hosts: [ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_AUTOPUSH],
+          hosts: hostOrder,
+          failoverMs: isStreaming ? tuningNumber('AG_FIRST_CHUNK_FAILOVER_MS') : 0,
           chain: MODEL_FALLBACK_CHAINS[anthropicReq.model] || [],
           allowDowngrade: POLICY.allowDowngrade,
           headerTimeoutMs: isStreaming ? POLICY.streamHeaderTimeoutMs : POLICY.nonStreamHeaderTimeoutMs,
@@ -703,6 +728,9 @@ const server = http.createServer(async (req, res) => {
         });
 
         timing.switched_account = result.switchedAccount;
+        timing.failover = Boolean(result.failover);
+        // 只在成功换到别的 host 后才重新绑定；首次成功也绑定，之后同会话固定走这个 host
+        if (result.ok && hostKey && lastHostBase && hostRouter.stickyHost(hostKey) !== lastHostBase) hostRouter.bind(hostKey, lastHostBase);
         if (result.mgr) {
           activeMgr = result.mgr;
           statsEmail = activeMgr.tokenData.email;
