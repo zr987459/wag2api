@@ -4,6 +4,7 @@ import { scrubIdentity } from '../src/scrub.mjs';
 import { convertAnthropicToGoogle } from '../src/content-converter.mjs';
 import { signatureCache } from '../src/signature-cache.mjs';
 import { buildCloudCodePayload } from '../src/cloudcode.mjs';
+import { openaiRequestToAnthropic } from '../src/openai-ag-converter.mjs';
 
 console.log('🧪 开始运行协议转换与清洗单元测试...');
 
@@ -100,13 +101,20 @@ const pFlashDefault = buildCloudCodePayload({ model: 'gemini-3.8-flash', message
 assert.strictEqual(pFlashDefault.request.generationConfig.thinkingConfig.thinkingLevel, 'low');
 assert.strictEqual(pFlashDefault.request.generationConfig.thinkingConfig.thinkingBudget, 0);
 
-// 5.2 Flash + budget_tokens=16000 -> high (尊重显式高预算)
-const pFlashBudget = buildCloudCodePayload({ model: 'gemini-3.8-flash', thinking: { type: 'enabled', budget_tokens: 16000 }, messages: [{ role: 'user', content: 'hi' }] });
+// 5.2 Flash + budget_tokens=24000 -> high (尊重显式高预算 >= 16384)
+const pFlashBudget = buildCloudCodePayload({ model: 'gemini-3.8-flash', thinking: { type: 'enabled', budget_tokens: 24000 }, messages: [{ role: 'user', content: 'hi' }] });
 assert.strictEqual(pFlashBudget.request.generationConfig.thinkingConfig.thinkingLevel, 'high');
 
-// 5.3 Flash + reasoning_effort=high -> high (尊重显式 effort)
-const pFlashEffort = buildCloudCodePayload({ model: 'gemini-3.8-flash', reasoning_effort: 'high', messages: [{ role: 'user', content: 'hi' }] });
-assert.strictEqual(pFlashEffort.request.generationConfig.thinkingConfig.thinkingLevel, 'high');
+// 5.3 OpenAI 真实链路三档映射验证 (low 2048 -> low, medium 8192 -> medium, high 24576 -> high)
+for (const [effort, expectedLevel] of [['low', 'low'], ['medium', 'medium'], ['high', 'high']]) {
+  const converted = openaiRequestToAnthropic({
+    model: 'gemini-3.8-flash-tiered',
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: effort,
+  });
+  const p = buildCloudCodePayload(converted);
+  assert.strictEqual(p.request.generationConfig.thinkingConfig.thinkingLevel, expectedLevel, `OpenAI reasoning_effort=${effort} 必须精确映射至 ${expectedLevel}`);
+}
 
 // 5.4 Pro 系列模型默认不降级 -> high (保持旗舰质量)
 const pProDefault = buildCloudCodePayload({ model: 'gemini-3.1-pro', messages: [{ role: 'user', content: 'hi' }] });

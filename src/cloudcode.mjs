@@ -99,7 +99,7 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
   const levelMatch = String(anthropicRequest.model || '').match(/-(low|medium|high)\b/);
   const clientEffort = anthropicRequest.reasoning_effort || anthropicRequest.output_config?.effort;
   const budget = anthropicRequest.thinking?.type === 'enabled' ? Number(anthropicRequest.thinking.budget_tokens) || 0 : 0;
-  const budgetLevel = budget >= 8000 ? 'high' : budget >= 2048 ? 'medium' : budget > 0 ? 'low' : null;
+  const budgetLevel = budget >= 16384 ? 'high' : budget >= 4096 ? 'medium' : budget > 0 ? 'low' : null;
   const effort = ['low', 'medium', 'high'].includes(clientEffort) ? clientEffort : null;
   const resolvedLevel = levelMatch?.[1] || effort || budgetLevel
     || (isHighReasoning ? 'high' : isFlash ? 'low' : 'high');
