@@ -631,6 +631,15 @@ async function loadAgAccounts() {
         <button class="btn btn-outline" style="flex: 1;" onclick="agTestActive(this)">⚡ 测试当前账号</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="agBenchHosts(this)">🏁 集群测速</button>
       </div>
+      <div style="display: flex; gap: 6px; margin-top: 8px; align-items: center;">
+        <select id="replayLevel" class="input-field" style="margin-bottom: 0; flex: 1;" title="思考档位变体">
+          <option value="">思考：原样</option><option value="low">low</option><option value="high">high</option><option value="low,high">low + high</option>
+        </select>
+        <select id="replaySafety" class="input-field" style="margin-bottom: 0; flex: 1;" title="safetySettings 变体">
+          <option value="">safety：原样</option><option value="on">on</option><option value="off">off</option><option value="on,off">on + off</option>
+        </select>
+        <button class="btn btn-outline" style="flex: 1.3;" onclick="agBenchReplay(this)">🔁 长上下文回放</button>
+      </div>
       <div class="account-test-banner" id="ag-test-banner"></div>`;
 
     if (!accs.length) { box.innerHTML = '<div class="empty">还没有 Google 账号，点右上角「+ 添加」登录，或「导入」Refresh Token</div>'; return; }
@@ -748,6 +757,7 @@ async function agTestActive(btn) {
 // 集群测速：同一提示词交替发给 daily / autopush / prod，各 2 轮，比较首字与真实生成速度
 function fmtS(ms) { return ms == null ? '—' : (ms / 1000).toFixed(1) + 's'; }
 function renderBench(d) {
+  if (d.mode === 'replay') return renderReplay(d);
   const lines = [`${d.account || ''} · ${d.model || ''} · ${d.running ? '进行中 ' + (d.progress || '') : '完成'}`];
   for (const s of d.summary || []) {
     if (!s.ok) { lines.push(`❌ ${s.host} · ${s.statuses} · ${s.error || '失败'}`); continue; }
@@ -758,6 +768,49 @@ function renderBench(d) {
   }
   testBanner('ag-test-banner', d.running ? '' : ((d.summary || []).some(s => s.ok) ? 'success' : 'error'), lines.join('\n'));
   $('ag-test-banner').style.whiteSpace = 'pre-line';
+}
+// fix/ttft：长上下文回放。用最近一次正式请求（同账号、同 sessionId）按 daily→autopush→prod 交替各发 N 轮
+function renderReplay(d) {
+  const pct = v => (v == null ? '—' : Math.round(v * 100) + '%');
+  const lines = [`回放 · ${d.account || ''} · ${d.model || ''} · ${d.running ? '进行中 ' + (d.progress || '') : '完成'}`];
+  lines.push('host · 思考 · safety → 响应头 / 首思考 / 首正文 · 缓存命中（中位数）');
+  for (const s of d.summary || []) {
+    if (!s.ok) { lines.push(`❌ ${s.host} · ${s.level} · ${s.safety} · ${s.statuses} · ${s.error || '失败'}`); continue; }
+    lines.push(`✅ ${s.host} · ${s.level} · ${s.safety} (${s.ok}/${s.total}) → ${fmtS(s.t_headers)} / ${fmtS(s.t_first_thought)} / ${fmtS(s.t_first_text)} · ${pct(s.cache_hit_rate)}`);
+  }
+  for (const r of d.runs || []) {
+    lines.push(`  #${r.round} ${r.host}${r.level ? ' ' + r.level : ''}${r.safety ? ' safety ' + r.safety : ''} ${r.status ?? 'ERR'} 头 ${fmtS(r.t_headers)} 思考 ${fmtS(r.t_first_thought)} 正文 ${fmtS(r.t_first_text)} 命中 ${pct(r.cache_hit_rate)}${r.error ? ' · ' + r.error : ''}`);
+  }
+  testBanner('ag-test-banner', d.running ? '' : ((d.summary || []).some(s => s.ok) ? 'success' : 'error'), lines.join('\n'));
+  $('ag-test-banner').style.whiteSpace = 'pre-line';
+}
+async function agBenchReplay(btn) {
+  const level = $('replayLevel')?.value || '';
+  const safety = $('replaySafety')?.value || '';
+  let info;
+  try { info = (await getJson('/api/bench/hosts')).replay_info; } catch (e) { info = null; }
+  if (!info || !info.available) { testBanner('ag-test-banner', 'error', '❌ 还没有正式 AG 请求可回放，先用客户端发一轮对话'); return; }
+  const combos = (level ? level.split(',').length : 1) * (safety ? safety.split(',').length : 1);
+  const n = combos * 3 * 2;
+  const estTok = info.est_input_tokens * n;
+  const msg = `将用 ${info.email} 回放最近一次请求（约 ${fmtNum(info.est_input_tokens)} 输入 token，${info.age_s}s 前）。\n`
+    + `3 个集群 × 2 轮 × ${combos} 个组合 = ${n} 次请求，输出限 256 token。\n`
+    + `预计输入合计约 ${fmtNum(estTok)} token；未命中缓存的集群按全价计。\n`
+    + `注意：同一 sessionId 在上游有约 104 万 token 的累计上限，次数越多越可能触发换代（下一轮正式对话缓存未命中）。开始？`;
+  if (!confirm(msg)) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '回放中…';
+  try {
+    let d = await postJson('/api/bench/hosts', { mode: 'replay', rounds: 2, level, safety });
+    if (!d.ok && !d.running) throw new Error(d.error || '启动失败');
+    renderBench(d);
+    while (d.running) {
+      await new Promise(r => setTimeout(r, 3000));
+      d = await getJson('/api/bench/hosts');
+      renderBench(d);
+    }
+  } catch (e) { testBanner('ag-test-banner', 'error', `❌ ${e.message}`); }
+  finally { btn.textContent = orig; btn.disabled = false; }
 }
 async function agBenchHosts(btn) {
   if (!confirm('将用当前账号向 3 个集群各发 2 次长文请求，约 2–4 分钟，会消耗少量额度。开始？')) return;

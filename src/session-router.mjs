@@ -60,7 +60,7 @@ const keyOf = (email, base) => `${email || ''}|${base}`;
 /**
  * 识别是否是旁路/辅助请求（如标题生成、上下文压缩、单步探测等），避免污染主对话缓存
  */
-function isAuxiliaryRequest(req) {
+export function isAuxiliaryRequest(req) {
   if (!req || !Array.isArray(req.messages) || req.messages.length === 0) return false;
   // 只有真正简短的探活/标题生成请求（<= 2 条消息）才作为旁路隔离；长对话中的总结/压缩必须保持主会话，以复用已有长缓存
   if (req.messages.length <= 2) {

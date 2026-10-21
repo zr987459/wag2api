@@ -45,4 +45,84 @@ console.log('1. 分段打点');
   });
 }
 
+console.log('2. 长上下文回放测速');
+{
+  const store = await import('../src/replay-store.mjs');
+  const { buildReplayPayload, summarizeReplay, parseLevels, parseSafety, hostBench, hostLabel, REPLAY_MAX_OUTPUT_TOKENS } = await import('../src/host-bench.mjs');
+  const { ANTIGRAVITY_ENDPOINTS } = await import('../src/constants.mjs');
+  const base = { model: 'gemini-3.8-flash-tiered', userAgent: 'antigravity', requestId: 'agent-1', project: 'p',
+    request: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }], generationConfig: { maxOutputTokens: 8192, temperature: 0.7, thinkingConfig: { includeThoughts: true, thinkingLevel: 'high' } },
+      safetySettings: [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' }], sessionId: '-123', systemInstruction: { parts: [{ text: 'sys' }] } } };
+
+  await ok('replay info 只给元信息，不含内容', () => {
+    store.clearReplay();
+    assert.equal(store.replayInfo().available, false);
+    store.rememberPayload(JSON.stringify(base), { email: 'a@x', model: 'gemini-3.8-flash-high' });
+    const info = store.replayInfo();
+    assert.equal(info.available, true);
+    assert.ok(!JSON.stringify(info).includes('hello'));
+    assert.ok(info.body_bytes > 0);
+  });
+  await ok('回放 payload：只改 requestId 与 maxOutputTokens(≤256)，sessionId/contents 原样', () => {
+    const p = buildReplayPayload(base);
+    assert.notEqual(p.requestId, base.requestId);
+    assert.equal(p.request.generationConfig.maxOutputTokens, REPLAY_MAX_OUTPUT_TOKENS);
+    assert.equal(p.request.sessionId, '-123');
+    assert.deepEqual(p.request.contents, base.request.contents);
+    assert.deepEqual(p.request.safetySettings, base.request.safetySettings);
+    assert.equal(base.request.generationConfig.maxOutputTokens, 8192, '不改原对象');
+  });
+  await ok('level / safety 变体', () => {
+    const low = buildReplayPayload(base, { level: 'low', safety: 'off' });
+    assert.equal(low.request.generationConfig.thinkingConfig.thinkingLevel, 'low');
+    assert.equal(low.request.generationConfig.thinkingConfig.thinkingBudget, 0);
+    assert.equal('safetySettings' in low.request, false);
+    const on = buildReplayPayload({ ...base, request: { ...base.request, safetySettings: undefined } }, { safety: 'on' });
+    assert.equal(on.request.safetySettings.length, 5);
+    assert.deepEqual(parseLevels('low,high,bogus'), ['low', 'high']);
+    assert.deepEqual(parseLevels(''), [null]);
+    assert.deepEqual(parseSafety('off'), ['off']);
+  });
+  await ok('hostLabel：自定义 URL 显示主机名，不再一律标成 prod', () => {
+    assert.deepEqual(ANTIGRAVITY_ENDPOINTS.map(hostLabel), ['daily', 'autopush', 'prod']);
+    assert.equal(hostLabel('https://my-proxy.example.com'), 'my-proxy.example.com');
+  });
+  await ok('startReplay：daily→autopush→prod 交替各 2 轮，同账号同 sessionId，汇总含缓存命中率', async () => {
+    const seen = [];
+    const enc = new TextEncoder();
+    const fetchImpl = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      seen.push({ host: hostLabel(url.split('/v1internal')[0]), sid: body.request.sessionId, max: body.request.generationConfig.maxOutputTokens, auth: opts.headers.Authorization });
+      const chunks = [
+        { candidates: [{ content: { parts: [{ text: 't', thought: true }] } }] },
+        { candidates: [{ content: { parts: [{ text: 'x' }] } }], usageMetadata: { promptTokenCount: 1000, cachedContentTokenCount: 990, candidatesTokenCount: 1 } },
+      ];
+      return { ok: true, status: 200, body: new ReadableStream({ start(c) { for (const ch of chunks) c.enqueue(enc.encode(`data: ${JSON.stringify({ response: ch })}\n\n`)); c.close(); } }) };
+    };
+    const mgr = { tokenData: { email: 'a@x' }, getValidAccessToken: async () => 'tok-a' };
+    const r = hostBench.startReplay(e => (e === 'a@x' ? mgr : null), { fetchImpl });
+    assert.equal(r.ok, true);
+    while (hostBench.status().running) await new Promise(x => setTimeout(x, 5));
+    assert.deepEqual(seen.map(x => x.host), ['daily', 'autopush', 'prod', 'daily', 'autopush', 'prod']);
+    assert.ok(seen.every(x => x.sid === '-123' && x.max <= 256 && x.auth === 'Bearer tok-a'));
+    const st = hostBench.status();
+    assert.equal(st.mode, 'replay');
+    assert.equal(st.summary.length, 3);
+    assert.equal(st.summary[0].cache_hit_rate, 0.99);
+  });
+  await ok('原账号不在池里时拒绝回放（不换号）', () => {
+    const r = hostBench.startReplay(() => null, {});
+    assert.equal(r.ok, false);
+  });
+  await ok('summarizeReplay 按 host×level×safety 分组', () => {
+    const s = summarizeReplay([
+      { host: 'daily', level: 'low', safety: 'off', ok: true, t_headers: 10, cache_hit_rate: 0.9 },
+      { host: 'daily', level: 'low', safety: 'off', ok: true, t_headers: 30, cache_hit_rate: 0.9 },
+      { host: 'daily', level: 'high', safety: 'off', ok: false, status: 500, error: 'x' },
+    ]);
+    assert.equal(s.length, 2);
+    assert.equal(s.find(x => x.level === 'low').t_headers, 20);
+  });
+}
+
 console.log(`\n${passed} passed`);

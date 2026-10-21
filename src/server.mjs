@@ -18,6 +18,7 @@ import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
 import { hostBench } from './host-bench.mjs';
 import { splitHeaderTiming, thinkingLevelOf } from './timing-split.mjs';
+import { rememberPayload } from './replay-store.mjs';
 import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
 import { prewarm, lastPrewarm } from './prewarm.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
@@ -45,7 +46,7 @@ import {
 } from './openai-ag-converter.mjs';
 import { cacheProbe } from './cache-probe.mjs';
 import { historyPin } from './history-pin.mjs';
-import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
+import { clientSessionKey, bumpSessionOnOverflow, sessionStats, isAuxiliaryRequest } from './session-router.mjs';
 import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
 
 let lastClientHeaders = null;
@@ -418,6 +419,11 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req).catch(() => ({}));
       const mgr = accountPool.getActiveManager();
       if (!mgr) { sendJson(res, 400, { ok: false, error: '账号池暂无可用 Google 账号' }); return; }
+      if (body.mode === 'replay') {
+        const r = hostBench.startReplay(email => accountPool.managers.get(email) || null, { rounds: body.rounds, levels: body.level, safety: body.safety });
+        sendJson(res, r.ok ? 200 : 409, { ...r, ...hostBench.status() });
+        return;
+      }
       const started = hostBench.start(mgr, { rounds: body.rounds, model: body.model || 'gemini-3.8-flash-high' });
       sendJson(res, started ? 200 : 409, { ok: started, ...(started ? {} : { error: '已有测速在进行' }), ...hostBench.status() });
       return;
@@ -637,6 +643,10 @@ const server = http.createServer(async (req, res) => {
           try {
             const bodyStr = JSON.stringify(payload);
             timing.body_bytes = Buffer.byteLength(bodyStr);
+            // 回放测速只要「正式」请求：主模型、非辅助请求；只在内存留最近一份
+            if (payload.model === mapToUpstreamModel(anthropicReq.model) && !isAuxiliaryRequest(anthropicReq)) {
+              rememberPayload(bodyStr, { email: mgr.tokenData.email, model: anthropicReq.model });
+            }
             timing.thinking_level = thinkingLevelOf(payload);
             const sentAt = Date.now();
             const r = await upstreamFetch(targetUrl, {
