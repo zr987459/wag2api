@@ -17,13 +17,30 @@ import https from 'https';
 
 const IS_BUN = typeof globalThis.Bun !== 'undefined';
 const NULL_BODY = new Set([101, 204, 205, 304]);
+const IDLE_MAX_MS = 4000; // 远低于运营商 NAT 回收时间（4秒无新请求自动销毁空闲连接，防僵尸 Socket）
 
-export const keepAliveAgent = IS_BUN ? null : new https.Agent({
+class IdleCappedAgent extends https.Agent {
+  keepSocketAlive(socket) {
+    if (!super.keepSocketAlive(socket)) return false;
+    socket.setKeepAlive(true, 1000);
+    const cur = socket.timeout || Infinity;
+    socket.setTimeout(Math.min(cur, IDLE_MAX_MS));
+    socket._idleSince = Date.now();
+    return true;
+  }
+  reuseSocket(socket, req) {
+    socket.setTimeout(0); // 请求进行中解除空闲超时
+    req._idleMs = Date.now() - (socket._idleSince || Date.now());
+    super.reuseSocket(socket, req);
+  }
+}
+
+export const keepAliveAgent = IS_BUN ? null : new IdleCappedAgent({
   keepAlive: true,
-  keepAliveMsecs: 30000,   // TCP keepalive 探测间隔，防 NAT/代理悄悄断开
+  keepAliveMsecs: 1000,
   maxSockets: 16,
   maxFreeSockets: 4,
-  scheduling: 'lifo',      // 优先用最近用过的连接，最热
+  scheduling: 'lifo', // 优先用最新的连接，旧连接自然过期
 });
 
 function abortError(signal) {
@@ -62,8 +79,15 @@ function nodeRequestOnce(url, opts, allowRetry) {
       if (settled) return;
       settled = true;
       cleanup();
-      // 复用的空闲连接已被对端关闭：请求根本没送达，安全重发一次
-      if (allowRetry && req.reusedSocket && (err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+      // 复用的空闲连接已被对端关闭或已是死连接：请求未送达，立即换新连接重试一次
+      const isStale = req.reusedSocket && (
+        err.code === 'ECONNRESET' ||
+        err.code === 'EPIPE' ||
+        err.code === 'ECONNABORTED' ||
+        err.code === 'ETIMEDOUT' ||
+        String(err.message || '').includes('hang up')
+      );
+      if (allowRetry && isStale) {
         nodeRequestOnce(url, opts, false).then(resolve, reject);
         return;
       }

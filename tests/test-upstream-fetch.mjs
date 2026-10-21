@@ -59,14 +59,18 @@ if (RUNTIME === 'node' && haveCert) {
     assert.strictEqual(await e.text(), 'RESOURCE_EXHAUSTED');
   });
 
-  await t('空闲后第二个请求复用同一条 TLS 连接', async () => {
+  await t('连续请求复用同一条 TLS 连接，空闲超 4s 安全回收防僵尸连接', async () => {
     const before = conns;
-    await sleep(5000);   // 超过 undici 默认 4 秒空闲关闭
-    const r = await upstreamFetch(base + '/echo', { method: 'POST', body: 'x' });
-    await r.text();
-    assert.strictEqual(r._gwReused, true);
-    assert.strictEqual(r._gwTlsMs, 0);
-    assert.strictEqual(conns, before);
+    await sleep(1500); // 1.5s 连续对话：完美复用
+    const r1 = await upstreamFetch(base + '/echo', { method: 'POST', body: 'x' });
+    await r1.text();
+    assert.strictEqual(r1._gwReused, true, '短间隔请求必须复用连接');
+    assert.strictEqual(r1._gwTlsMs, 0);
+
+    await sleep(4500); // 超过 4s 安全上限：自动销毁死连接，新建连接防僵尸阻塞
+    const r2 = await upstreamFetch(base + '/echo', { method: 'POST', body: 'y' });
+    await r2.text();
+    assert.strictEqual(r2._gwReused, false, '超 4s 必须新建连接防 NAT 回收死锁');
   });
 
   await t('reader.cancel() 销毁底层请求，服务端感知断开', async () => {
