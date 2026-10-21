@@ -29,6 +29,16 @@ export const TUNING_DEFS = {
     doc: 'safetySettings：block_none = 发送 5 条 BLOCK_NONE（原行为）；off = 不发送该字段（与官方 Antigravity 客户端一致）',
     validate: v => ['off', 'block_none'].includes(String(v)),
   },
+  AG_DEFAULT_THINKING_LEVEL: {
+    def: '',
+    doc: 'Gemini 3 默认思考档位 low / medium / high。只在模型名没带 -low/-medium/-high、客户端也没给 effort 或 thinking budget 时生效。空 = 原逻辑',
+    validate: v => ['', 'low', 'medium', 'high'].includes(String(v)),
+  },
+  AG_INCLUDE_THOUGHTS: {
+    def: '1',
+    doc: 'Gemini 3 是否把思考过程流式返回（includeThoughts）。0 = 不返回；注意这不会减少思考量，首个可见字反而可能更晚',
+    validate: v => ['0', '1'].includes(String(v)),
+  },
 };
 
 const DEFAULT_FILE = () => path.join(process.env.DATA_DIR || process.cwd(), 'ag-tuning.json');

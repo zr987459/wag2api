@@ -107,14 +107,19 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
   const budget = anthropicRequest.thinking?.type === 'enabled' ? Number(anthropicRequest.thinking.budget_tokens) || 0 : 0;
   const budgetLevel = budget >= 16384 ? 'high' : budget >= 4096 ? 'medium' : budget > 0 ? 'low' : null;
   const effort = ['low', 'medium', 'high'].includes(clientEffort) ? clientEffort : null;
+  // fix/ttft：AG_DEFAULT_THINKING_LEVEL 只替换「客户端什么都没指定」时的兜底档位，绝不改客户端显式指定的档位
+  const defaultLevel = tuning('AG_DEFAULT_THINKING_LEVEL');
   const resolvedLevel = levelMatch?.[1] || effort || budgetLevel
+    || defaultLevel
     || (isHighReasoning ? 'high' : isFlash ? 'low' : 'high');
+  // fix/ttft：AG_INCLUDE_THOUGHTS=0 时 Gemini 3 不回传思考过程（只影响 Gemini 3 / fast 两个分支）
+  const includeThoughts = tuning('AG_INCLUDE_THOUGHTS') !== '0';
 
   if (anthropicRequest.model && anthropicRequest.model.includes('fast')) {
     // fast 模式：配置最低思考等级（low），实现极速吐字
-    generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: 'low', thinkingBudget: 0 };
+    generationConfig.thinkingConfig = { includeThoughts, thinkingLevel: 'low', thinkingBudget: 0 };
   } else if (isGemini3) {
-    generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: resolvedLevel, ...(resolvedLevel === 'low' && isFlash ? { thinkingBudget: 0 } : {}) };
+    generationConfig.thinkingConfig = { includeThoughts, thinkingLevel: resolvedLevel, ...(resolvedLevel === 'low' && isFlash ? { thinkingBudget: 0 } : {}) };
   } else if (anthropicRequest.thinking && anthropicRequest.thinking.type === 'enabled') {
     generationConfig.thinkingConfig = { includeThoughts: true, thinkingBudget: anthropicRequest.thinking.budget_tokens || 2048 };
   } else if (hasTools) {

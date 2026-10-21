@@ -277,4 +277,35 @@ console.log('4. safetySettings 可选');
   });
 }
 
+console.log('5. 思考档位可覆盖');
+{
+  const { buildCloudCodePayload } = await import('../src/cloudcode.mjs');
+  const { setTuning } = await import('../src/ag-tuning.mjs');
+  const tc = (model, extra = {}) => buildCloudCodePayload({ model, max_tokens: 1000, messages: [{ role: 'user', content: 'hi' }], ...extra }, 'p').request.generationConfig.thinkingConfig;
+  await ok('默认（未设置）：与原逻辑一致', () => {
+    setTuning('AG_DEFAULT_THINKING_LEVEL', ''); setTuning('AG_INCLUDE_THOUGHTS', '');
+    assert.deepEqual(tc('gemini-3.8-flash-high'), { includeThoughts: true, thinkingLevel: 'high' });
+    assert.deepEqual(tc('gemini-3.8-flash'), { includeThoughts: true, thinkingLevel: 'low', thinkingBudget: 0 });
+    assert.equal(tc('gemini-3.1-pro').thinkingLevel, 'high');
+  });
+  await ok('AG_DEFAULT_THINKING_LEVEL 只在模型名/effort/budget 都没指定时生效', () => {
+    setTuning('AG_DEFAULT_THINKING_LEVEL', 'medium');
+    assert.equal(tc('gemini-3.1-pro').thinkingLevel, 'medium', '无指定 → 用默认');
+    assert.equal(tc('gemini-3.8-flash-high').thinkingLevel, 'high', '模型名 -high 不变');
+    assert.equal(tc('gemini-3.8-flash-low').thinkingLevel, 'low', '模型名 -low 不变');
+    assert.equal(tc('gemini-3.1-pro', { reasoning_effort: 'low' }).thinkingLevel, 'low', 'effort 不变');
+    assert.equal(tc('gemini-3.1-pro', { thinking: { type: 'enabled', budget_tokens: 20000 } }).thinkingLevel, 'high', 'budget 不变');
+    assert.equal(tc('gemini-3.8-flash-fast').thinkingLevel, 'low', 'fast 不变');
+    setTuning('AG_DEFAULT_THINKING_LEVEL', '');
+  });
+  await ok('AG_INCLUDE_THOUGHTS=0：Gemini 3 / fast 不回传思考；非 Gemini 3 的显式 thinking 不受影响', () => {
+    setTuning('AG_INCLUDE_THOUGHTS', '0');
+    assert.equal(tc('gemini-3.8-flash-high').includeThoughts, false);
+    assert.equal(tc('gemini-3.8-flash-fast').includeThoughts, false);
+    assert.equal(tc('claude-sonnet-4-6', { thinking: { type: 'enabled', budget_tokens: 2048 } }).includeThoughts, true);
+    setTuning('AG_INCLUDE_THOUGHTS', '');
+    assert.equal(tc('gemini-3.8-flash-high').includeThoughts, true);
+  });
+}
+
 console.log(`\n${passed} passed`);
