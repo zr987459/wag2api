@@ -24,6 +24,11 @@ export const TUNING_DEFS = {
     doc: 'host 健康度：某 host 最近 10 次等待头中位数（同体积档）持续 > 其他 host 2 倍时，新会话把它排到后面 10 分钟。1 = 开',
     validate: v => ['0', '1'].includes(String(v)),
   },
+  AG_SAFETY_SETTINGS: {
+    def: 'block_none',
+    doc: 'safetySettings：block_none = 发送 5 条 BLOCK_NONE（原行为）；off = 不发送该字段（与官方 Antigravity 客户端一致）',
+    validate: v => ['off', 'block_none'].includes(String(v)),
+  },
 };
 
 const DEFAULT_FILE = () => path.join(process.env.DATA_DIR || process.cwd(), 'ag-tuning.json');

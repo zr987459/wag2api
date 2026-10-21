@@ -116,6 +116,7 @@ WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/
 | --- | --- | --- |
 | `AG_ENDPOINTS` | `daily,autopush,prod` | 集群顺序，逗号分隔，取值 `daily` / `autopush` / `prod` 或完整 URL。正式请求走第 1 个；5xx / 超时 / 首块超时换第 2 个。默认与原行为一致 |
 | `AG_FIRST_CHUNK_FAILOVER_MS` | `0`（关） | 流式请求在这么多毫秒内**没收到响应头**就中止并换下一个 host 重发，只换一次；不换账号、不降级、不改 sessionId。拿到响应头后（开始吐字）绝不重发。第二个 host 也失败则直接返回错误。⚠️ 换过去的 host 很可能没有这个会话的缓存，长上下文会按全量 prefill，可能更慢、更费额度；被中止的请求上游也可能照常计费。先用回放测速确认再开 |
+| `AG_SAFETY_SETTINGS` | `block_none` | `block_none` = 发送 5 条 `BLOCK_NONE`（原行为）；`off` = 不发送 `safetySettings`，与官方 Antigravity 客户端一致。⚠️ 切换取值会改变请求序列化结果，**切换后的第一轮可能未命中缓存**；`off` 时上游按默认阈值过滤，个别回答可能以 `SAFETY` 结束 |
 | `AG_HOST_HEALTH` | `0`（关） | host 健康度：每个 host 记最近 10 次等待头时间，按请求体大小分档（<256KB / <1MB / ≥1MB）比较；某 host 同档中位数持续 > 其他 host 2 倍时，**新会话**把它排到后面 10 分钟 |
 
 **host 粘滞**（始终开启，不改 request）：会话第一次成功的 host 会被记住（会话 key → host，TTL 与账号亲和相同，30 分钟），之后同会话固定走它，避免因为缓存按 host 隔离而来回跳；只有换 host 成功后才重新绑定。辅助请求（标题生成等）不参与粘滞。

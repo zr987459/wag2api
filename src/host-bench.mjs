@@ -8,7 +8,7 @@
  * 只做测量，不改变正式请求的路由。后台异步执行，前端轮询 GET /api/bench/hosts 取结果。
  */
 
-import { buildAntigravityHeaders, buildCloudCodePayload } from './cloudcode.mjs';
+import { buildAntigravityHeaders, buildCloudCodePayload, SAFETY_BLOCK_NONE } from './cloudcode.mjs';
 import { ANTIGRAVITY_ENDPOINTS } from './constants.mjs';
 import { normalizeGeminiUsage, mergeRawUsage } from './usage.mjs';
 import { upstreamFetch } from './upstream-fetch.mjs';
@@ -16,8 +16,7 @@ import { takePayload, replayInfo } from './replay-store.mjs';
 import crypto from 'crypto';
 
 export const REPLAY_MAX_OUTPUT_TOKENS = 256;
-const SAFETY_BLOCK_NONE = ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT', 'HARM_CATEGORY_CIVIC_INTEGRITY']
-  .map(category => ({ category, threshold: 'BLOCK_NONE' }));
+
 
 const TOPICS = ['城市里的夜跑', '一座老火车站', '雨季的菜市场', '深夜的便利店', '山里的气象站', '旧书店的猫'];
 const PER_REQUEST_TIMEOUT_MS = 120000;

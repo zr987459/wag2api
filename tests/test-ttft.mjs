@@ -250,4 +250,31 @@ console.log('3. 集群顺序 / 首块超时切换 / host 粘滞与健康度');
   });
 }
 
+console.log('4. safetySettings 可选');
+{
+  const { buildCloudCodePayload } = await import('../src/cloudcode.mjs');
+  const { setTuning } = await import('../src/ag-tuning.mjs');
+  const req = { model: 'gemini-3.8-flash-high', max_tokens: 1000, messages: [{ role: 'user', content: 'hello' }] };
+  await ok('默认 block_none：与原来一样发送 5 条 BLOCK_NONE', () => {
+    setTuning('AG_SAFETY_SETTINGS', '');
+    const p = buildCloudCodePayload(req, 'proj');
+    assert.equal(p.request.safetySettings.length, 5);
+    assert.ok(p.request.safetySettings.every(x => x.threshold === 'BLOCK_NONE'));
+  });
+  await ok('off：payload 里没有 safetySettings（序列化后也没有）', () => {
+    setTuning('AG_SAFETY_SETTINGS', 'off');
+    const p = buildCloudCodePayload(req, 'proj');
+    assert.equal('safetySettings' in p.request, false);
+    assert.ok(!JSON.stringify(p).includes('safetySettings'));
+    setTuning('AG_SAFETY_SETTINGS', '');
+  });
+  await ok('环境变量生效，无效值回退默认', () => {
+    process.env.AG_SAFETY_SETTINGS = 'off';
+    assert.equal('safetySettings' in buildCloudCodePayload(req, 'proj').request, false);
+    process.env.AG_SAFETY_SETTINGS = 'weird';
+    assert.equal(buildCloudCodePayload(req, 'proj').request.safetySettings.length, 5);
+    delete process.env.AG_SAFETY_SETTINGS;
+  });
+}
+
 console.log(`\n${passed} passed`);
