@@ -308,4 +308,87 @@ console.log('5. 思考档位可覆盖');
   });
 }
 
+console.log('6. 账号亲和 key 与上游 sessionId 同源');
+{
+  const crypto = await import('crypto');
+  const fs = await import('fs'); const os = await import('os'); const path = await import('path');
+  const { sessionBase, resolveSessionId, bumpSessionOnOverflow, isAuxiliaryRequest } = await import('../src/session-router.mjs');
+  const { AccountPool } = await import('../src/account-pool.mjs');
+  const { buildCloudCodePayload } = await import('../src/cloudcode.mjs');
+  const { setTuning } = await import('../src/ag-tuning.mjs');
+  setTuning('AG_SAFETY_SETTINGS', ''); setTuning('AG_DEFAULT_THINKING_LEVEL', ''); setTuning('AG_INCLUDE_THOUGHTS', '');
+  // 改动前 resolveSessionId 的原始公式（逐字节对照用）
+  const oldSid = seed => '-' + (crypto.createHash('sha256').update(seed, 'utf8').digest().readBigUInt64BE(0) & 0x7fffffffffffffffn).toString();
+
+  const conv = n => {
+    const messages = [{ role: 'user', content: '帮我重构 server.mjs' }];
+    for (let i = 1; i < n; i++) { messages.push({ role: 'assistant', content: `第 ${i} 轮回答` }); messages.push({ role: 'user', content: `第 ${i + 1} 轮追问` }); }
+    return { model: 'gemini-3.8-flash-high', max_tokens: 8192, system: 'sys', messages };
+  };
+
+  await ok('sessionBase：带会话 ID 用它，不带则 derived:<首条文本 sid>', () => {
+    assert.equal(sessionBase({ _gwSessionKey: 'client:abc', messages: [] }), 'client:abc');
+    assert.equal(sessionBase(conv(1)), 'derived:' + oldSid('帮我重构 server.mjs'));
+    assert.equal(sessionBase(conv(1)), sessionBase(conv(5)), '同一对话各轮相同');
+    assert.equal(sessionBase({ system: 'S', messages: [] }), 'derived:' + oldSid(JSON.stringify('S')));
+  });
+  await ok('上游 sessionId 与改动前逐字节一致（带/不带会话 ID）', () => {
+    assert.equal(resolveSessionId(conv(3)), oldSid('帮我重构 server.mjs'));
+    assert.equal(resolveSessionId({ ...conv(3), _gwSessionKey: 'client:abc' }), oldSid('client:abc'));
+    const aux = { model: 'm', max_tokens: 50, messages: [{ role: 'user', content: 'title' }] };
+    assert.ok(isAuxiliaryRequest(aux));
+    assert.equal(resolveSessionId(aux), oldSid(`${oldSid('title')}:aux`));
+  });
+  await ok('溢出换代仍按同一个 base：换代后 sid 变化，同对话后续轮次一致', () => {
+    const r = { ...conv(2), _gwEmail: 'bump@x' };
+    const before = resolveSessionId(r, 'bump@x');
+    assert.equal(bumpSessionOnOverflow(r, 'bump@x', 'input exceeds the maximum number of tokens allowed'), true);
+    const after = resolveSessionId(r, 'bump@x');
+    assert.notEqual(after, before);
+    assert.equal(resolveSessionId(conv(6), 'bump@x'), after);
+  });
+  await ok('不带会话 ID：同一对话连续 5 轮都返回同一个账号（3 个账号的池）', () => {
+    const pool = new AccountPool(fs.mkdtempSync(path.join(os.tmpdir(), 'pool-')));
+    for (const e of ['a@x', 'b@x', 'c@x']) pool.managers.set(e, { tokenData: { email: e } });
+    const picked = [];
+    for (let i = 1; i <= 5; i++) picked.push(pool.pickManager(sessionBase(conv(i))).tokenData.email);
+    assert.equal(new Set(picked).size, 1, picked.join(','));
+    // 另一个对话会被分到别的号（负载均衡还在）
+    const other = { ...conv(1), messages: [{ role: 'user', content: '另一个话题' }] };
+    assert.notEqual(pool.pickManager(sessionBase(other)).tokenData.email, picked[0]);
+  });
+  await ok('辅助请求不写入亲和表（bind:false），但可读取已有绑定', () => {
+    const pool = new AccountPool(fs.mkdtempSync(path.join(os.tmpdir(), 'pool-')));
+    for (const e of ['a@x', 'b@x']) pool.managers.set(e, { tokenData: { email: e } });
+    const aux = { model: 'm', max_tokens: 50, messages: [{ role: 'user', content: 'title' }] };
+    pool.pickManager(sessionBase(aux), new Set(), { bind: false });
+    assert.equal(pool.sessionAffinity.has(sessionBase(aux)), false);
+  });
+  await ok('前缀稳定：同样历史两轮序列化 request 逐字节一致（除顶层 requestId）', () => {
+    const a = buildCloudCodePayload({ ...conv(4), _gwEmail: 'a@x' }, 'p');
+    const b = buildCloudCodePayload({ ...conv(4), _gwEmail: 'a@x' }, 'p');
+    assert.notEqual(a.requestId, b.requestId);
+    assert.equal(JSON.stringify(a.request), JSON.stringify(b.request));
+    assert.equal(JSON.stringify({ ...a, requestId: '' }), JSON.stringify({ ...b, requestId: '' }));
+  });
+  await ok('前缀稳定：第 N 轮的 contents 序列化是第 N+1 轮的字节前缀；system/tools/sessionId 不变', () => {
+    const tools = [{ name: 'read', description: 'read file', input_schema: { type: 'object', properties: { p: { type: 'string' } } } }];
+    const p3 = buildCloudCodePayload({ ...conv(3), tools, _gwEmail: 'a@x' }, 'p').request;
+    const p4 = buildCloudCodePayload({ ...conv(4), tools, _gwEmail: 'a@x' }, 'p').request;
+    const c3 = JSON.stringify(p3.contents), c4 = JSON.stringify(p4.contents);
+    assert.ok(c4.startsWith(c3.slice(0, -1)), 'contents 前缀');
+    assert.equal(JSON.stringify(p3.systemInstruction), JSON.stringify(p4.systemInstruction));
+    assert.equal(JSON.stringify(p3.tools), JSON.stringify(p4.tools));
+    assert.equal(p3.sessionId, p4.sessionId);
+    // request 键序固定，contents 在最前
+    assert.equal(Object.keys(p4)[0], 'contents');
+  });
+  await ok('前缀稳定：request 内没有随机或随时间变化的字段（隔 20ms 两次构建一致）', async () => {
+    const a = JSON.stringify(buildCloudCodePayload({ ...conv(2), _gwEmail: 'a@x' }, 'p').request);
+    await new Promise(r => setTimeout(r, 20));
+    const b = JSON.stringify(buildCloudCodePayload({ ...conv(2), _gwEmail: 'a@x' }, 'p').request);
+    assert.equal(a, b);
+  });
+}
+
 console.log(`\n${passed} passed`);

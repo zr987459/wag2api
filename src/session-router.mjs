@@ -76,10 +76,27 @@ export function isAuxiliaryRequest(req) {
   return false;
 }
 
+/**
+ * fix/ttft：会话的统一来源。账号亲和（pickManager / bindSession）、host 粘滞、上游 sessionId、
+ * 溢出换代都从这里取，保证「同一个对话」在这几处是同一个 key。
+ *  - 客户端带了会话标识：'client:<id>'（clientSessionKey 的结果，原样）
+ *  - 没带：'derived:' + toSid(首条 user 文本 || system)
+ * 以前客户端不带会话 ID 时 pickManager 拿到的是空串，按 LRU 每轮换号，而上游 sessionId 却是按首条文本算的。
+ */
+export function sessionBase(anthropicRequest) {
+  const clientKey = anthropicRequest?._gwSessionKey || '';
+  if (clientKey) return clientKey;
+  return 'derived:' + toSid(firstUserText(anthropicRequest || {}) || JSON.stringify(anthropicRequest?.system || ''));
+}
+
+/** sessionBase → 上游 sid 的种子。与改动前逐字节一致：client 走 toSid(clientKey)，derived 就是 toSid(首条文本)。 */
+function baseSid(sessionKey) {
+  return sessionKey.startsWith('derived:') ? sessionKey.slice('derived:'.length) : toSid(sessionKey);
+}
+
 /** 计算本次请求的 sessionId。anthropicRequest._gwSessionKey 由 server 预先填入（客户端标识）。 */
 export function resolveSessionId(anthropicRequest, email = '') {
-  const clientKey = anthropicRequest._gwSessionKey || '';
-  let base = clientKey ? toSid(clientKey) : toSid(firstUserText(anthropicRequest) || JSON.stringify(anthropicRequest.system || ''));
+  let base = baseSid(sessionBase(anthropicRequest));
   // 旁路请求强制使用独立分支 sessionId，避免和主会话互相覆盖上游缓存
   if (isAuxiliaryRequest(anthropicRequest)) {
     base = toSid(`${base}:aux`);
@@ -91,8 +108,7 @@ export function resolveSessionId(anthropicRequest, email = '') {
 /** 上游报"输入超过 1048576 token"时调用：该会话换新一代 ID。返回是否需要重试。 */
 export function bumpSessionOnOverflow(anthropicRequest, email, errorText) {
   if (!/exceeds the maximum number of tokens allowed/i.test(String(errorText || ''))) return false;
-  const clientKey = anthropicRequest._gwSessionKey || '';
-  const base = clientKey ? toSid(clientKey) : toSid(firstUserText(anthropicRequest) || JSON.stringify(anthropicRequest.system || ''));
+  const base = baseSid(sessionBase(anthropicRequest));
   const k = keyOf(email, base);
   generations.set(k, (generations.get(k) || 0) + 1);
   return true;

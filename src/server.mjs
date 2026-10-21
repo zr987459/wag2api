@@ -48,7 +48,7 @@ import {
 } from './openai-ag-converter.mjs';
 import { cacheProbe } from './cache-probe.mjs';
 import { historyPin } from './history-pin.mjs';
-import { clientSessionKey, bumpSessionOnOverflow, sessionStats, isAuxiliaryRequest } from './session-router.mjs';
+import { clientSessionKey, bumpSessionOnOverflow, sessionStats, isAuxiliaryRequest, sessionBase } from './session-router.mjs';
 import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
 
 let lastClientHeaders = null;
@@ -633,7 +633,10 @@ const server = http.createServer(async (req, res) => {
         };
 
         // 智能选号：优先命中会话亲和表（保持 KV-Cache），新会话按最小负载轮询分发，支持 429 冷却避障
-        let activeMgr = accountPool.pickManager(anthropicReq._gwSessionKey);
+        // fix/ttft：亲和 key 与上游 sessionId 同源（sessionBase）；客户端不带会话 ID 时不再每轮按 LRU 换号。辅助请求只读不写亲和表
+        const isAux = isAuxiliaryRequest(anthropicReq);
+        const convKey = sessionBase(anthropicReq);
+        let activeMgr = accountPool.pickManager(convKey, new Set(), { bind: !isAux });
         if (!activeMgr) {
           const errMsg = '账号池暂无可用 Google 账号，请在控制台添加账号';
           if (isOaiChat) {
@@ -649,8 +652,7 @@ const server = http.createServer(async (req, res) => {
 
         // PR1：失败处理收敛到 upstream-policy（400 直接返回；429 冷却换号；5xx/超时换 host 一次再换号一次；最后才降级）
         // fix/ttft：host 顺序 = AG_ENDPOINTS + 会话粘滞 + 健康度（辅助请求不参与粘滞）
-        const isAux = isAuxiliaryRequest(anthropicReq);
-        const hostKey = isAux ? '' : (anthropicReq._gwSessionKey || '');
+        const hostKey = isAux ? '' : convKey;
         const hostOrder = hostRouter.orderFor(hostKey);
         try { firstHost = new URL(hostOrder[0]).hostname; } catch (e) {}
         let lastHostBase = null;
@@ -666,7 +668,7 @@ const server = http.createServer(async (req, res) => {
             const bodyStr = JSON.stringify(payload);
             timing.body_bytes = Buffer.byteLength(bodyStr);
             // 回放测速只要「正式」请求：主模型、非辅助请求；只在内存留最近一份
-            if (payload.model === mapToUpstreamModel(anthropicReq.model) && !isAuxiliaryRequest(anthropicReq)) {
+            if (payload.model === mapToUpstreamModel(anthropicReq.model) && !isAux) {
               rememberPayload(bodyStr, { email: mgr.tokenData.email, model: anthropicReq.model });
             }
             timing.thinking_level = thinkingLevelOf(payload);
@@ -734,8 +736,8 @@ const server = http.createServer(async (req, res) => {
         if (result.mgr) {
           activeMgr = result.mgr;
           statsEmail = activeMgr.tokenData.email;
-          if (anthropicReq._gwSessionKey) {
-            accountPool.bindSession(anthropicReq._gwSessionKey, activeMgr.tokenData.email);
+          if (!isAux) {
+            accountPool.bindSession(convKey, activeMgr.tokenData.email);
           }
         }
         const modelUsed = result.modelUsed || anthropicReq.model;
