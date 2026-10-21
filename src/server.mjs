@@ -49,14 +49,12 @@ import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index
 
 let lastClientHeaders = null;
 
-// PR1：失败处理参数（环境变量可调）
+// 失败处理参数（默认关闭降级以保护前缀缓存，放宽超时避免长上下文误杀）
 const POLICY = {
-  allowDowngrade: !['0', 'false'].includes(String(process.env.ALLOW_DOWNGRADE ?? '1')),
-  // 实测上游拿到首块才回响应头（长上下文 High 已到 14s），流式响应头超时至少 60s；拿到响应头后不再限时
-  streamHeaderTimeoutMs: Number(process.env.UPSTREAM_HEADER_TIMEOUT_MS) || 60000,
-  nonStreamHeaderTimeoutMs: Number(process.env.UPSTREAM_NONSTREAM_TIMEOUT_MS) || 180000,
-  // 重试不再发起超过这个总时长（首次尝试不受限，仍按响应头超时）
-  retryDeadlineMs: Number(process.env.RETRY_DEADLINE_MS) || 45000,
+  allowDowngrade: ['1', 'true'].includes(String(process.env.ALLOW_DOWNGRADE ?? '0')),
+  streamHeaderTimeoutMs: Number(process.env.UPSTREAM_HEADER_TIMEOUT_MS) || 180000,
+  nonStreamHeaderTimeoutMs: Number(process.env.UPSTREAM_NONSTREAM_TIMEOUT_MS) || 300000,
+  retryDeadlineMs: Number(process.env.RETRY_DEADLINE_MS) || 90000,
 };
 const cooldowns = new Cooldowns();
 const quotaCache = new Map(); // email → Gemini 5h 剩余比例（来自 /api/gemini/quota），只用来决定换到哪个号
