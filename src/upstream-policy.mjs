@@ -146,11 +146,7 @@ export async function runWithPolicy(ctx) {
   let switchedAccount = false;
   const kinds = new Set();
 
-  const timeoutFor = () => {
-    if (attempts === 0 || !headerTimeoutMs) return headerTimeoutMs;
-    const left = startedAt + deadlineMs - now();
-    return Math.max(minAttemptMs, Math.min(headerTimeoutMs, left));
-  };
+  const timeoutFor = () => headerTimeoutMs;
   const pastDeadline = () => attempts > 0 && now() - startedAt >= deadlineMs;
 
   const order = (upModel, exclude) => {
