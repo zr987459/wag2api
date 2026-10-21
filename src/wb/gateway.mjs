@@ -15,7 +15,6 @@ import crypto from 'crypto';
 import {
   UPSTREAM_GLOBAL, UPSTREAM_CN, ORIGIN_CN, CLIENT_UA, DEFAULT_SYSTEM_PROMPT, DEFAULT_MODEL, MODEL_ALIASES,
 } from './constants.mjs';
-import { sanitizeWafPayload } from './waf-sanitizer.mjs';
 import { repairToolPairing } from './convert.mjs';
 
 const MAX_ACCOUNT_ATTEMPTS = 3;
@@ -252,10 +251,8 @@ export class TencentGateway {
   async streamChat(payload, convId, onLine, opts = {}) {
     const { realm, clean } = resolveModel(payload.model);
     const base = realm === 'global' ? UPSTREAM_GLOBAL : UPSTREAM_CN;
-    // Hark 审查加固：先执行 buildUpstreamPayload 补齐思考缓存与 system，再整体进行 WAF 路径脱敏
-    const upRaw = buildUpstreamPayload(payload, clean, id => this.getReasoningByToolId(id));
-    const { payload: up, restorer } = sanitizeWafPayload(upRaw);
-    const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, restorer, signal: opts.signal, used: opts.used, emittedAny: false };
+    const up = buildUpstreamPayload(payload, clean, id => this.getReasoningByToolId(id));
+    const ctx = { realm, base, body: JSON.stringify(up), convId: convId || hex32(), onLine, signal: opts.signal, used: opts.used, emittedAny: false };
 
     try {
       return await this._rotate(ctx, new Set());
@@ -320,22 +317,6 @@ export class TencentGateway {
       ctx.signal.addEventListener('abort', onClientAbort, { once: true });
     }
     const connectTimer = setTimeout(() => ctl.abort(new Error('upstream connect timeout')), CONNECT_MS + READ_IDLE_MS);
-    const flushRestorer = () => {
-      if (!ctx.restorer || !ctx.restorer.hasTokens) return;
-      const flContent = ctx.restorer.flushContent();
-      const flReasoning = ctx.restorer.flushReasoning();
-      const flArgsList = ctx.restorer.flushAllArgs();
-      if (flContent || flReasoning || flArgsList.length > 0) {
-        const flushDelta = {};
-        if (flContent) flushDelta.content = flContent;
-        if (flReasoning) flushDelta.reasoning_content = flReasoning;
-        if (flArgsList.length > 0) {
-          flushDelta.tool_calls = flArgsList.map(a => ({ index: a.index, function: { arguments: a.arguments } }));
-        }
-        const flushChunk = { choices: [{ delta: flushDelta, finish_reason: null }] };
-        ctx.onLine(`data: ${JSON.stringify(flushChunk)}\n\n`);
-      }
-    };
     try {
       let resp;
       try {
@@ -395,33 +376,16 @@ export class TencentGateway {
             if (s.startsWith('{')) {
               try {
                 const chunkObj = JSON.parse(s);
-                const choice = chunkObj.choices?.[0];
-                const d = choice?.delta;
+                const d = chunkObj.choices?.[0]?.delta;
                 if (d) {
-                  if (ctx.restorer && ctx.restorer.hasTokens) {
-                    if (d.content) d.content = ctx.restorer.processContent(d.content);
-                    if (d.reasoning_content) d.reasoning_content = ctx.restorer.processReasoning(d.reasoning_content);
-                  }
                   if (d.reasoning_content) reasoning += d.reasoning_content;
                   if (Array.isArray(d.tool_calls)) {
-                    for (let i = 0; i < d.tool_calls.length; i++) {
-                      const tc = d.tool_calls[i];
+                    for (const tc of d.tool_calls) {
                       if (tc && tc.id) toolIds.push(tc.id);
-                      const idx = Number.isInteger(tc.index) ? tc.index : i;
-                      if (ctx.restorer && ctx.restorer.hasTokens && tc?.function?.arguments) {
-                        tc.function.arguments = ctx.restorer.processArgs(tc.function.arguments, idx);
-                      }
                     }
                   }
-                  lineToSend = `data: ${JSON.stringify(chunkObj)}`;
-                }
-                // 看到 finish_reason 时立即 flush 暂存碎片，避免落到 finish_reason 之后被部分客户端丢弃
-                if (choice && choice.finish_reason) {
-                  flushRestorer();
                 }
               } catch (e) { /* 非 JSON 帧照样透传 */ }
-            } else if (s === '[DONE]') {
-              flushRestorer();
             }
           }
           ctx.emittedAny = true;
@@ -438,7 +402,6 @@ export class TencentGateway {
       this.scheduler.touch(uid);
       return { done: true };
     } finally {
-      flushRestorer();
       if (ctx.signal) ctx.signal.removeEventListener('abort', onClientAbort);
     }
   }

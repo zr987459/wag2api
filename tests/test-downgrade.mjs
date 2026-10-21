@@ -138,14 +138,14 @@ await ok('ALLOW_DOWNGRADE 关闭：全部 429 时返回 quota 错误，不试降
   assert.ok(h.calls.every(c => c.model === 'gemini-3.8-flash-tiered'));
 });
 
-await ok('上游全挂：超过总截止不再发起重试，后续尝试的超时被截短', async () => {
+await ok('上游全挂：超过总截止不再发起重试，单次尝试享有完整首包超时', async () => {
   let t = 0; const clock = () => t;
   const h = harness({ clock, deadlineMs: 45000, rule: () => { t += 30000; return 503; } });
   const r = await h.run();
   assert.equal(r.ok, false);
   assert.equal(h.calls.length, 2, '30s + 30s 后已过 45s 截止');
   assert.equal(h.calls[0].timeoutMs, 60000);
-  assert.ok(h.calls[1].timeoutMs <= 15000);
+  assert.equal(h.calls[1].timeoutMs, 60000, '重试享有完整 headerTimeoutMs，不被总期限截短');
 });
 
 await ok('只是凭据失效（401）：换号，全部失效时不降级', async () => {

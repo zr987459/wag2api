@@ -95,12 +95,20 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
   //    有无工具一致，不再在带工具时压低思考（无主流实现这样做）。
   //  - fast 模型（映射到 gemini-2.5-flash）保持 0 思考。
   const isGemini3 = /^gemini-3/.test(upstreamModel) || upstreamModel === 'gemini-pro-agent';
+  const isFlash = /flash/.test(upstreamModel);
   const levelMatch = String(anthropicRequest.model || '').match(/-(low|medium|high)\b/);
+  const clientEffort = anthropicRequest.reasoning_effort || anthropicRequest.output_config?.effort;
+  const budget = anthropicRequest.thinking?.type === 'enabled' ? Number(anthropicRequest.thinking.budget_tokens) || 0 : 0;
+  const budgetLevel = budget >= 16384 ? 'high' : budget >= 4096 ? 'medium' : budget > 0 ? 'low' : null;
+  const effort = ['low', 'medium', 'high'].includes(clientEffort) ? clientEffort : null;
+  const resolvedLevel = levelMatch?.[1] || effort || budgetLevel
+    || (isHighReasoning ? 'high' : isFlash ? 'low' : 'high');
+
   if (anthropicRequest.model && anthropicRequest.model.includes('fast')) {
-    // 3.8-flash fast 模式：保持 tiered 统一模型以复用长缓存，同时配置最低思考等级（low），实现极速吐字
+    // fast 模式：配置最低思考等级（low），实现极速吐字
     generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: 'low', thinkingBudget: 0 };
   } else if (isGemini3) {
-    generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: levelMatch ? levelMatch[1] : 'high' };
+    generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: resolvedLevel, ...(resolvedLevel === 'low' && isFlash ? { thinkingBudget: 0 } : {}) };
   } else if (anthropicRequest.thinking && anthropicRequest.thinking.type === 'enabled') {
     generationConfig.thinkingConfig = { includeThoughts: true, thinkingBudget: anthropicRequest.thinking.budget_tokens || 2048 };
   } else if (hasTools) {

@@ -136,7 +136,6 @@ export function convertAnthropicToGoogle(anthropicRequest) {
               name: actualName,
               response: {
                 output: responseContent,
-                content: responseContent,
               },
             },
           });
@@ -226,9 +225,6 @@ export function convertAnthropicToGoogle(anthropicRequest) {
       }
       if (part.functionResponse?.response && typeof part.functionResponse.response.output === 'string') {
         part.functionResponse.response.output = part.functionResponse.response.output.replace(/\r\n/g, '\n').trimEnd();
-        if (typeof part.functionResponse.response.content === 'string') {
-          part.functionResponse.response.content = part.functionResponse.response.content.replace(/\r\n/g, '\n').trimEnd();
-        }
       }
     }
     // 对既往模型回复结构体（c.parts）进行全量快照锁定：
