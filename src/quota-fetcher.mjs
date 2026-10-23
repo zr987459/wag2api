@@ -199,7 +199,6 @@ async function fetchQuotaSummary(accessToken, project) {
       const win = String(b.window || id.split('-').pop() || '').toLowerCase();
       const frac = b.remainingFraction ?? b.remaining_fraction ?? b.remaining?.remainingFraction;
       const resetTime = b.resetTime || b.reset_time || null;
-      console.log('[Quota Bucket]', id, win, frac, resetTime);
       if (typeof frac !== 'number') continue;
       const fam = /gemini/.test(id + b._group) ? 'gemini' : 'claude';
       const per = /week|7d|168h|wk/.test(win) ? '7d' : /5h|five|300m/.test(win) ? '5h' : null;

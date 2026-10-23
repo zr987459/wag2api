@@ -152,7 +152,10 @@ console.log('3. 集群顺序 / 首块超时切换 / host 粘滞与健康度');
     assert.deepEqual(configuredEndpoints(), [PROD, DAILY]);
     assert.equal(setTuning('AG_ENDPOINTS', 'autopush').ok, true);
     assert.deepEqual(configuredEndpoints(), [AUTO]);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 't.json'), 'utf8')).AG_ENDPOINTS, 'autopush');
+    // Hark 审查加固：控制台严禁注入非 googleapis.com 域名
+    assert.equal(setTuning('AG_ENDPOINTS', 'https://evil.example.com').ok, false);
+    assert.equal(setTuning('AG_ENDPOINTS', 'prod,https://daily-cloudcode-pa.sandbox.googleapis.com').ok, true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 't.json'), 'utf8')).AG_ENDPOINTS, 'prod,https://daily-cloudcode-pa.sandbox.googleapis.com');
     assert.equal(setTuning('AG_ENDPOINTS', 'nope').ok, false);
     setTuning('AG_ENDPOINTS', '');
     assert.deepEqual(configuredEndpoints(), [PROD, DAILY]);

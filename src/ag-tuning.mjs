@@ -81,6 +81,22 @@ export function setTuning(name, value) {
   else {
     const v = String(value).trim();
     if (d.validate && !d.validate(v)) return { ok: false, error: `${name} 取值无效：${v}` };
+
+    // Hark 安全加固：控制台覆盖 AG_ENDPOINTS 时，URL 必须是 https 且域名必须以 googleapis.com 结尾，防止 token 泄露到第三方恶意主机
+    if (name === 'AG_ENDPOINTS') {
+      const endpoints = parseEndpoints(v);
+      for (const ep of endpoints) {
+        try {
+          const u = new URL(ep);
+          if (u.protocol !== 'https:' || !u.hostname.endsWith('googleapis.com')) {
+            return { ok: false, error: `安全限制：控制台仅允许以 googleapis.com 结尾的官方端点，自定义反代端点请通过环境变量配置` };
+          }
+        } catch {
+          return { ok: false, error: `端点 URL 无效` };
+        }
+      }
+    }
+
     overrides[name] = v;
   }
   if (file) {
