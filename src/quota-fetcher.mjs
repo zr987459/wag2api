@@ -26,7 +26,7 @@ function parseResetTime(resetTimeStr) {
   }
 }
 
-const WEEKLY_THRESHOLD_HOURS = 6;
+const WEEKLY_THRESHOLD_HOURS = 5.5;
 
 function hoursUntil(resetTimeStr) {
   if (!resetTimeStr) return -1;
@@ -116,55 +116,63 @@ function toPublic(r) {
     percentage: typeof r.fraction === 'number' ? Math.round(r.fraction * 100) : null,
     inferred: !!r.inferred,
     reset_time: r.reset,
-    reset_text: parseResetTime(r.reset) || '动态自适应',
+    reset_text: r.status_text || parseResetTime(r.reset) || '动态自适应',
     source: r.source,
+    constrained_by_weekly: !!r.constrained_by_weekly,
   };
 }
 
 /** 官方 /usage 用的分组配额（含周额度）：groups[].buckets[] { bucketId: gemini-weekly / gemini-5h / 3p-weekly / 3p-5h } */
 async function fetchQuotaSummary(accessToken, project) {
-  // 必须优先使用 Google 官方生产端点，测试/金丝雀端点近期已被 Google 拆分，只返回 Claude 组缺失 Gemini 组
+  // 精简为两个有效端点，并发抓取（8s 超时防手机 WebView 超时）
   const bases = [
     'https://cloudcode-pa.googleapis.com',
-    'https://daily-cloudcode-pa.googleapis.com',
     'https://daily-cloudcode-pa.sandbox.googleapis.com'
   ];
+  const body = project ? JSON.stringify({ project }) : '{}';
+  const tasks = bases.map(base =>
+    fetch(`${base}/v1internal:retrieveUserQuotaSummary`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'antigravity/1.10.2 linux/arm64'
+      },
+      body,
+      signal: AbortSignal.timeout(8000),
+    }).then(res => (res.ok ? res.json() : null)).catch(() => null)
+  );
+
+  const settled = await Promise.allSettled(tasks);
   const out = {};
-  for (const base of bases) {
-    try {
-      const res = await fetch(`${base}/v1internal:retrieveUserQuotaSummary`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/1.10.2 linux/arm64'
-        },
-        body: JSON.stringify(project ? { project } : {}),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!res.ok) continue;
-      const d = await res.json();
-      const body = d?.response || d;
-      const buckets = [];
-      for (const g of body?.groups || []) for (const b of g?.buckets || []) buckets.push({ ...b, _group: String(g.displayName || '').toLowerCase() });
-      for (const b of body?.buckets || []) buckets.push(b);
-      for (const b of buckets) {
-        const id = String(b.bucketId || b.bucket_id || '').toLowerCase();
-        const win = String(b.window || id.split('-').pop() || '').toLowerCase();
-        const frac = b.remainingFraction ?? b.remaining_fraction ?? b.remaining?.remainingFraction;
-        if (typeof frac !== 'number') continue;
-        const fam = /gemini/.test(id + b._group) ? 'gemini' : 'claude';
-        const per = /week|7d|168h|wk/.test(win) ? '7d' : /5h|five|300m/.test(win) ? '5h' : null;
-        if (!per) continue;
-        const key = `${fam}_${per}`;
-        // 保留最权威/更紧配额，避免单端点缺失被空值覆盖
-        if (!out[key] || (out[key].fraction !== null && frac < out[key].fraction)) {
-          out[key] = { fraction: Math.max(0, Math.min(1, frac)), reset: b.resetTime || b.reset_time || null, source: 'summary' };
-        }
+  for (const s of settled) {
+    if (s.status !== 'fulfilled' || !s.value) continue;
+    const d = s.value;
+    const payload = d?.response || d;
+    const buckets = [];
+    for (const g of payload?.groups || []) {
+      const grp = String(g.displayName || '').toLowerCase();
+      for (const b of g?.buckets || []) buckets.push({ ...b, _group: grp });
+    }
+    for (const b of payload?.buckets || []) buckets.push(b);
+    for (const b of buckets) {
+      const id = String(b.bucketId || b.bucket_id || '').toLowerCase();
+      const win = String(b.window || id.split('-').pop() || '').toLowerCase();
+      const frac = b.remainingFraction ?? b.remaining_fraction ?? b.remaining?.remainingFraction;
+      const resetTime = b.resetTime || b.reset_time || null;
+      console.log('[Quota Bucket]', id, win, frac, resetTime);
+      if (typeof frac !== 'number') continue;
+      const fam = /gemini/.test(id + b._group) ? 'gemini' : 'claude';
+      const per = /week|7d|168h|wk/.test(win) ? '7d' : /5h|five|300m/.test(win) ? '5h' : null;
+      if (!per) continue;
+      const key = `${fam}_${per}`;
+      // 保留最权威/更紧配额，避免单端点缺失被空值覆盖
+      if (!out[key] || (out[key].fraction !== null && frac < out[key].fraction)) {
+        out[key] = { fraction: Math.max(0, Math.min(1, frac)), reset: resetTime || out[key]?.reset || null, source: 'summary' };
+      } else if (!out[key].reset && resetTime) {
+        out[key].reset = resetTime;
       }
-      // 只有当 4 个核心配额桶（Gemini 5H/7D + Claude 5H/7D）全部齐备才提前返回，否则继续向后补齐
-      if (out.gemini_5h && out.gemini_7d && out.claude_5h && out.claude_7d) return out;
-    } catch (e) {}
+    }
   }
   return Object.keys(out).length ? out : null;
 }
@@ -185,6 +193,16 @@ export async function fetchRealQuota(tokenManager) {
 
   try {
     const { CLOUDCODE_API_ENDPOINT, ANTIGRAVITY_ENDPOINT_DAILY } = await import('./constants.mjs');
+    // 【项目 ID 挪前】双端点都带 project，解析失败不阻塞
+    let project = tokenManager.tokenData.projectId || '';
+    if ((!project || project === 'pending_detection') && typeof tokenManager.ensureProjectId === 'function') {
+      try {
+        project = await Promise.resolve(tokenManager.ensureProjectId()).catch(() => '') || '';
+      } catch (_) { project = ''; }
+    }
+    if (project === 'pending_detection') project = '';
+    const reqBody = project ? JSON.stringify({ project }) : '{}';
+
     // 先试 DAILY(配额字段更全)，失败回退 PROD
     const endpoints = [ANTIGRAVITY_ENDPOINT_DAILY, CLOUDCODE_API_ENDPOINT];
     let data = null;
@@ -198,8 +216,8 @@ export async function fetchRealQuota(tokenManager) {
             'Content-Type': 'application/json',
             'User-Agent': 'antigravity/1.10.2 linux/arm64',
           },
-          body: JSON.stringify({}),
-          signal: AbortSignal.timeout(15000),
+          body: reqBody,
+          signal: AbortSignal.timeout(8000),
         });
         if (res.ok) { data = await res.json(); break; }
         lastErr = new Error(`Google HTTP ${res.status}`);
@@ -227,9 +245,7 @@ export async function fetchRealQuota(tokenManager) {
 
     // 周额度 / 5 小时额度以官方分组接口为准（fetchAvailableModels 不带周额度）
     try {
-      let project = tokenManager.tokenData.projectId || '';
-      if (!project && typeof tokenManager.ensureProjectId === 'function') project = await tokenManager.ensureProjectId().catch(() => '');
-      const sum = await fetchQuotaSummary(accessToken, project && project !== 'pending_detection' ? project : '');
+      const sum = await fetchQuotaSummary(accessToken, project);
       if (sum) {
         for (const k of Object.keys(sum)) {
           if (sum[k]) merged[k] = sum[k];
@@ -241,9 +257,23 @@ export async function fetchRealQuota(tokenManager) {
     merged.gemini_7d = rememberWeekly(email, 'gemini', merged.gemini_7d);
     merged.claude_7d = rememberWeekly(email, 'claude', merged.claude_7d);
 
+    // 【周额度约束状态】5h 无数据但周额度存在时明确标记受周限额约束，绝不显示空白 -- 或伪造假刷新
+    const weeklyConstrained = (shortKey, longKey) => {
+      if (!merged[shortKey] && merged[longKey]) {
+        merged[shortKey] = {
+          ...merged[longKey],
+          constrained_by_weekly: true,
+          status_text: parseResetTime(merged[longKey].reset) || '动态自适应',
+        };
+      }
+    };
+    weeklyConstrained('gemini_5h', 'gemini_7d');
+    weeklyConstrained('claude_5h', 'claude_7d');
+
     const result = {
       ok: true,
       email: tokenManager.tokenData.email,
+      project: project || null,
       gemini_5h: toPublic(merged.gemini_5h),
       gemini_7d: toPublic(merged.gemini_7d),
       claude_5h: toPublic(merged.claude_5h),
@@ -252,8 +282,16 @@ export async function fetchRealQuota(tokenManager) {
       updated_time: new Date().toLocaleTimeString(),
     };
     // 老界面字段兼容 —— 无数据时传 null 而非 100
-    result.five_hour = { percentage: result.gemini_5h?.percentage ?? null, reset_time: result.gemini_5h?.reset_time || null };
-    result.claude_five_hour = { percentage: result.claude_5h?.percentage ?? null, reset_time: result.claude_5h?.reset_time || null };
+    result.five_hour = {
+      percentage: result.gemini_5h?.percentage ?? null,
+      reset_time: result.gemini_5h?.reset_time || null,
+      constrained_by_weekly: !!result.gemini_5h?.constrained_by_weekly,
+    };
+    result.claude_five_hour = {
+      percentage: result.claude_5h?.percentage ?? null,
+      reset_time: result.claude_5h?.reset_time || null,
+      constrained_by_weekly: !!result.claude_5h?.constrained_by_weekly,
+    };
     result.weekly = { percentage: result.gemini_7d?.percentage ?? null };
     return result;
   } catch (err) {

@@ -733,11 +733,17 @@ function quotaHtml(q) {
   return rows.map(([name, b]) => {
     const p = b && typeof b.percentage === 'number' ? b.percentage : null;
     const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
+    const isConstrained = !!b?.constrained_by_weekly;
+    const pText = p === null ? '--' : `剩 ${p}%${isConstrained ? ' (周限额)' : ''}`;
+    let rText = '暂无数据';
+    if (b) {
+      rText = (b.reset_text || '') + (b.inferred ? '（推算）' : '') + (isConstrained ? '（受周额度约束）' : '');
+    }
     return `<div class="quota-row">
       <span class="qn">${name}</span>
       <div class="qbar"><i class="${cls}" style="width:${p ?? 0}%"></i></div>
-      <span class="qp">${p === null ? '--' : '剩 ' + p + '%'}</span>
-      <span class="qr">${b ? (b.reset_text || '') + (b.inferred ? '（推算）' : '') : '暂无数据'}</span>
+      <span class="qp">${pText}</span>
+      <span class="qr">${escapeHtml(rText)}</span>
     </div>`;
   }).join('') + `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time || '')}</div>`;
 }
