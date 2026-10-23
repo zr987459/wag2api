@@ -94,7 +94,8 @@ await ok('recordRequest 保存 timing，getTimingSummary 取最近 n 条成功�
   const log = st.getAllLogs(1)[0];
   assert.equal(log.timing, undefined);
   const withT = st.getAllLogs(100).find(l => l.timing && l.status === 200);
-  assert.deepEqual(Object.keys(withT.timing).sort(), ['attempts', 'conn_reused', 'host', 'switched_account', 'switched_host', 't_first_text', 't_first_thought', 't_headers', 't_payload', 't_tls', 't_token']);
+  assert.deepEqual(Object.keys(withT.timing).sort(), ['attempts', 'body_bytes', 'conn_reused', 'failover', 'first_chunk_ms', 'first_text_ms', 'first_thought_ms', 'host', 'switched_account', 'switched_host',
+    't_first_text', 't_first_thought', 't_headers', 't_payload', 't_tls', 't_token', 'thinking_level', 'upload_ms', 'wait_headers_ms']);
 
   const s = st.getTimingSummary(20); // 最近 20 条成功的：i = 5..24
   assert.equal(s.n, 20);

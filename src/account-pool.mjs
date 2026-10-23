@@ -206,8 +206,9 @@ export class AccountPool {
    * 核心：智能选号（会话粘滞 + 负载均衡 + 冷却避障）
    * @param {string} sessionKey 客户端会话标识
    * @param {Set<string>} exclude 需排除的邮箱
+   * @param {{bind?: boolean}} opts bind=false 时只查亲和表、不写入（辅助请求用）
    */
-  pickManager(sessionKey = '', exclude = new Set()) {
+  pickManager(sessionKey = '', exclude = new Set(), { bind = true } = {}) {
     if (this.managers.size === 0) return null;
 
     const allEmails = Array.from(this.managers.keys());
@@ -253,7 +254,7 @@ export class AccountPool {
 
     if (chosenEmail) {
       this.touch(chosenEmail);
-      if (sessionKey) {
+      if (sessionKey && bind) {
         this.bindSession(sessionKey, chosenEmail);
       }
       this.activeEmail = chosenEmail;

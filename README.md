@@ -82,6 +82,56 @@ WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/
 
 配置了 `GH_TOKEN` + `GH_REPO`（见 `src/persist.mjs`）时，AG 账号、WB 账号与设置、两边统计都会同步到仓库的 `state` 分支，重新部署后自动恢复。
 
+## AG 引擎首字延迟（TTFT）调优
+
+### 分段耗时
+
+每条 AG 请求日志都带分段打点（毫秒），控制台「分段耗时」面板显示最近 20 条的中位数：
+
+| 字段 | 含义 |
+| --- | --- |
+| `t_token` / `t_payload` | 取 token / 组包完成（相对请求开始） |
+| `upload_ms` | 本次尝试从发起请求到请求体全部写出（含建连/握手）。取自 Node `req.on('finish')`，表示数据已交给本机 socket 缓冲区，**是近似值、偏小**；Bun 下为 `null` |
+| `wait_headers_ms` | 响应头耗时 − `upload_ms`，即上游排队 + prefill（+ 首个思考块）的时间；Bun 下等于整段头耗时 |
+| `first_chunk_ms` / `first_thought_ms` / `first_text_ms` | 首个内容块 / 首个思考块 / 首个正文（相对请求开始） |
+| `body_bytes` | 发给上游的请求体字节数 |
+| `host` / `attempts` / `thinking_level` | 最终走的 host、尝试次数、思考档位 |
+
+日志卡片里「头」被拆成「上传 · 等待 · 首思考 · 首正文」，并显示请求体大小和 host。
+
+### 长上下文回放测速
+
+控制台 → AG 账号页 → 「🔁 长上下文回放」：用**最近一次正式 AG 请求**（同账号、同 sessionId、同上下文）按 daily → autopush → prod 交替各发 2 轮，输出每个组合的响应头 / 首思考 / 首正文中位数和缓存命中率。
+
+- payload 只在内存保留最近一份，不落盘、不进日志，接口只返回大小等元信息；
+- 回放只改顶层 `requestId` 和 `maxOutputTokens`（≤ 256），其余原样，所以能测到真实缓存命中；
+- 可选变体：思考 `low / high`，safety `on / off`，组合数 × 3 个集群 × 2 轮就是请求次数；
+- ⚠️ 每次都按完整上下文计输入，未命中缓存的集群按全价计；同一 sessionId 在上游有约 1,048,576 token 的累计上限，回放次数多了可能触发换代，下一轮正式对话会未命中缓存。按钮会先弹出预计 token 量让你确认。
+
+### 调优开关
+
+以下开关都可以用**环境变量**设置，也可以在控制台「AG 调优开关」卡片里改（控制台的值优先，保存在 `DATA_DIR/ag-tuning.json`，清空即恢复环境变量 / 默认值；安卓上只能用控制台）。改动从下一个请求开始生效。
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| `AG_ENDPOINTS` | `daily,autopush,prod` | 集群顺序，逗号分隔，取值 `daily` / `autopush` / `prod` 或完整 URL。正式请求走第 1 个；5xx / 超时 / 首块超时换第 2 个。默认与原行为一致 |
+| `AG_FIRST_CHUNK_FAILOVER_MS` | `0`（关） | 流式请求在这么多毫秒内**没收到响应头**就中止并换下一个 host 重发，只换一次；不换账号、不降级、不改 sessionId。拿到响应头后（开始吐字）绝不重发。第二个 host 也失败则直接返回错误。⚠️ 换过去的 host 很可能没有这个会话的缓存，长上下文会按全量 prefill，可能更慢、更费额度；被中止的请求上游也可能照常计费。先用回放测速确认再开 |
+| `AG_SAFETY_SETTINGS` | `block_none` | `block_none` = 发送 5 条 `BLOCK_NONE`（原行为）；`off` = 不发送 `safetySettings`，与官方 Antigravity 客户端一致。⚠️ 切换取值会改变请求序列化结果，**切换后的第一轮可能未命中缓存**；`off` 时上游按默认阈值过滤，个别回答可能以 `SAFETY` 结束 |
+| `AG_DEFAULT_THINKING_LEVEL` | 空（原逻辑） | Gemini 3 兜底思考档位 `low` / `medium` / `high`。**只在**模型名没带 `-low/-medium/-high`、客户端也没给 effort 或 thinking budget 时生效；客户端显式指定的档位一律不改（所以对 `xxx-high` 模型无效，想测 high 的影响请用回放测速的 level 变体） |
+| `AG_INCLUDE_THOUGHTS` | `1` | Gemini 3（含 fast）是否流式回传思考过程。`0` 不回传：思考量不变，只是看不到，**首个可见字反而可能更晚**；非 Gemini 3 模型的显式 thinking 不受影响 |
+| `AG_HOST_HEALTH` | `0`（关） | host 健康度：每个 host 记最近 10 次等待头时间，按请求体大小分档（<256KB / <1MB / ≥1MB）比较；某 host 同档中位数持续 > 其他 host 2 倍时，**新会话**把它排到后面 10 分钟 |
+
+**host 粘滞**（始终开启，不改 request）：会话第一次成功的 host 会被记住（会话 key → host，TTL 与账号亲和相同，30 分钟），之后同会话固定走它，避免因为缓存按 host 隔离而来回跳；只有换 host 成功后才重新绑定。辅助请求（标题生成等）不参与粘滞。
+
+> 已知：`UPSTREAM_HEADER_TIMEOUT_MS`（默认 180 秒）大于 `RETRY_DEADLINE_MS`（默认 90 秒），所以一次头超时之后不会再重试。开启 `AG_FIRST_CHUNK_FAILOVER_MS` 后，切换发生在截止时间之前，不受影响。
+
+### 会话与账号亲和
+
+账号亲和、host 粘滞、上游 `sessionId`、溢出换代统一用同一个会话 key：客户端带了会话 ID 就用它，否则用「首条 user 文本（没有则 system）」的哈希。以前客户端不带会话 ID 时选号用的是空串，会按 LRU 每轮换号、丢掉缓存；现在同一对话固定同一个账号。上游 `sessionId` 的算法没变（逐字节一致）。辅助请求（标题生成等）只读亲和表，不写入。
+
+> 已知限制：不带会话 ID、且不同对话的首条消息完全相同（例如固定的开场模板）时，这些对话会落到同一个账号和同一个 sessionId。
+
+
 ## 模型分流规则
 
 前门按三层顺序判断，**绝不靠模型名前缀猜**（两边都有 `claude-` 和 `gemini-` 家族，猜一定错）：

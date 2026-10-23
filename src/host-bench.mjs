@@ -8,10 +8,15 @@
  * 只做测量，不改变正式请求的路由。后台异步执行，前端轮询 GET /api/bench/hosts 取结果。
  */
 
-import { buildAntigravityHeaders, buildCloudCodePayload } from './cloudcode.mjs';
+import { buildAntigravityHeaders, buildCloudCodePayload, SAFETY_BLOCK_NONE } from './cloudcode.mjs';
 import { ANTIGRAVITY_ENDPOINTS } from './constants.mjs';
 import { normalizeGeminiUsage, mergeRawUsage } from './usage.mjs';
 import { upstreamFetch } from './upstream-fetch.mjs';
+import { takePayload, replayInfo } from './replay-store.mjs';
+import crypto from 'crypto';
+
+export const REPLAY_MAX_OUTPUT_TOKENS = 256;
+
 
 const TOPICS = ['城市里的夜跑', '一座老火车站', '雨季的菜市场', '深夜的便利店', '山里的气象站', '旧书店的猫'];
 const PER_REQUEST_TIMEOUT_MS = 120000;
@@ -19,9 +24,10 @@ const PER_REQUEST_TIMEOUT_MS = 120000;
 export function hostLabel(host) {
   try {
     const h = new URL(host).hostname;
-    if (h.startsWith('daily-')) return 'daily';
-    if (h.startsWith('autopush-')) return 'autopush';
-    return 'prod';
+    if (h.startsWith('daily-cloudcode-pa.')) return 'daily';
+    if (h.startsWith('autopush-cloudcode-pa.')) return 'autopush';
+    if (h === 'cloudcode-pa.googleapis.com') return 'prod';
+    return h; // 自定义完整 URL：直接显示主机名，不再一律标成 prod
   } catch { return String(host); }
 }
 
@@ -36,12 +42,13 @@ const median = (arr) => {
 export async function measureOnce({ host, payload, accessToken, fetchImpl = upstreamFetch, timeoutMs = PER_REQUEST_TIMEOUT_MS }) {
   const url = `${host}/v1internal:streamGenerateContent?alt=sse`;
   const t0 = Date.now();
-  const out = { host: hostLabel(host), ok: false, status: null, t_headers: null, t_first_chunk: null, t_first_thought: null, t_first_text: null, total_ms: null, output_tokens: 0, thoughts_tokens: 0, text_tokens: 0, gen_tps: null, text_tps: null, error: null };
+  const out = { host: hostLabel(host), ok: false, status: null, t_headers: null, t_upload: null, t_first_chunk: null, t_first_thought: null, t_first_text: null, total_ms: null, output_tokens: 0, thoughts_tokens: 0, text_tokens: 0, input_tokens: 0, cached_tokens: 0, cache_hit_rate: null, gen_tps: null, text_tps: null, error: null };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const r = await fetchImpl(url, { method: 'POST', headers: buildAntigravityHeaders(accessToken), body: JSON.stringify(payload), signal: controller.signal });
     out.t_headers = Date.now() - t0;
+    out.t_upload = r._gwUploadMs ?? null;
     out.status = r.status;
     if (!r.ok) {
       const txt = await r.text().catch(() => '');
@@ -84,6 +91,9 @@ export async function measureOnce({ host, payload, accessToken, fetchImpl = upst
     out.output_tokens = u.output_tokens;
     out.thoughts_tokens = u.thoughts_tokens;
     out.text_tokens = u.output_tokens - u.thoughts_tokens;
+    out.input_tokens = u.input_tokens;
+    out.cached_tokens = u.cached_tokens;
+    out.cache_hit_rate = u.input_tokens + u.cached_tokens > 0 ? Math.round((u.cached_tokens / (u.input_tokens + u.cached_tokens)) * 1000) / 1000 : null;
     if (out.t_first_chunk !== null && out.total_ms > out.t_first_chunk && u.output_tokens) {
       out.gen_tps = Math.round(u.output_tokens / ((out.total_ms - out.t_first_chunk) / 1000));
     }
@@ -121,16 +131,116 @@ export function summarize(runs) {
   });
 }
 
-class HostBench {
-  constructor() { this.state = { running: false, started_at: null, finished_at: null, account: null, model: null, rounds: 0, progress: '', runs: [], summary: [] }; }
+/**
+ * 回放变体：从最近一次正式请求派生测速 payload。
+ *  - 只改 requestId（顶层，本来就随机）、maxOutputTokens（≤256）、以及显式选择的 level / safety 变体；
+ *  - sessionId、contents、systemInstruction、tools 原样保留，才能测到真实的缓存命中。
+ *  - level / safety 为 null 表示「原样」。
+ */
+export function buildReplayPayload(base, { level = null, safety = null } = {}) {
+  const p = JSON.parse(JSON.stringify(base));
+  p.requestId = 'agent-' + crypto.randomUUID();
+  const req = p.request || (p.request = {});
+  const gc = req.generationConfig || (req.generationConfig = {});
+  gc.maxOutputTokens = Math.min(REPLAY_MAX_OUTPUT_TOKENS, Number(gc.maxOutputTokens) || REPLAY_MAX_OUTPUT_TOKENS);
+  if (level) {
+    const tc = gc.thinkingConfig || {};
+    const next = { ...tc, thinkingLevel: level };
+    delete next.thinkingBudget;
+    if (level === 'low' && /flash/.test(String(p.model || ''))) next.thinkingBudget = 0; // 与正式请求 low 档一致
+    if (next.includeThoughts === undefined) next.includeThoughts = true;
+    // 保持 canonical 键序
+    gc.thinkingConfig = Object.fromEntries(Object.keys(next).sort().map(k => [k, next[k]]));
+  }
+  if (safety === 'on') req.safetySettings = SAFETY_BLOCK_NONE.map(x => ({ ...x }));
+  else if (safety === 'off') delete req.safetySettings;
+  p.request = Object.fromEntries(Object.keys(req).sort().map(k => [k, req[k]]));
+  return p;
+}
 
-  status() { return { ...this.state, runs: this.state.runs.slice(), summary: summarize(this.state.runs) }; }
+const parseList = (v, allowed) => {
+  const arr = (Array.isArray(v) ? v : String(v ?? '').split(',')).map(x => String(x).trim().toLowerCase()).filter(x => allowed.includes(x));
+  return arr.length ? [...new Set(arr)] : [null];
+};
+export const parseLevels = v => parseList(v, ['low', 'medium', 'high']);
+export const parseSafety = v => parseList(v, ['on', 'off']);
+
+/** 回放汇总：host × level × safety 每个组合的中位数 */
+export function summarizeReplay(runs) {
+  const by = {};
+  for (const r of runs) (by[`${r.host}|${r.level || '原样'}|${r.safety || '原样'}`] ||= []).push(r);
+  return Object.entries(by).map(([k, rs]) => {
+    const [host, level, safety] = k.split('|');
+    const ok = rs.filter(r => r.ok);
+    return {
+      host, level, safety, ok: ok.length, total: rs.length,
+      statuses: [...new Set(rs.map(r => r.status ?? 'ERR'))].join(','),
+      t_headers: median(ok.map(r => r.t_headers)),
+      t_upload: median(ok.map(r => r.t_upload)),
+      t_first_thought: median(ok.map(r => r.t_first_thought)),
+      t_first_text: median(ok.map(r => r.t_first_text)),
+      cache_hit_rate: (() => { const v = ok.map(r => r.cache_hit_rate).filter(x => Number.isFinite(x)).sort((a, b) => a - b); return v.length ? v[Math.floor(v.length / 2)] : null; })(),
+      error: ok.length ? null : (rs.find(r => r.error)?.error || null),
+    };
+  });
+}
+
+class HostBench {
+  constructor() { this.state = { mode: 'short', running: false, started_at: null, finished_at: null, account: null, model: null, rounds: 0, progress: '', runs: [], summary: [] }; }
+
+  status() {
+    const replay = this.state.mode === 'replay';
+    return { ...this.state, runs: this.state.runs.slice(), summary: replay ? summarizeReplay(this.state.runs) : summarize(this.state.runs), replay_info: replayInfo() };
+  }
+
+  /**
+   * fix/ttft：长上下文回放测速。用最近一次正式请求的 payload（同账号、同 sessionId），
+   * 每轮按 hosts 顺序（daily→autopush→prod）交替发，每个 level×safety 组合各 rounds 轮。
+   * getManager(email) 返回该账号的 TokenManager；账号已不在池里时拒绝（不换号，换号就测不到缓存）。
+   */
+  startReplay(getManager, { rounds = 2, levels = null, safety = null, hosts = ANTIGRAVITY_ENDPOINTS, fetchImpl = upstreamFetch } = {}) {
+    if (this.state.running) return { ok: false, error: '已有测速在进行' };
+    const base = takePayload();
+    if (!base) return { ok: false, error: '还没有正式 AG 请求可回放，先用客户端发一轮对话' };
+    const mgr = getManager(base.email);
+    if (!mgr) return { ok: false, error: `原账号 ${base.email} 不在账号池里` };
+    rounds = Math.max(1, Math.min(3, Number(rounds) || 2));
+    const lv = parseLevels(levels), sf = parseSafety(safety);
+    this.state = { mode: 'replay', running: true, started_at: Date.now(), finished_at: null, account: base.email, model: base.payload.model, rounds,
+      variants: { levels: lv, safety: sf }, planned: rounds * lv.length * sf.length * hosts.length, progress: '准备中', runs: [], summary: [] };
+    this._runReplay(mgr, base.payload, { rounds, lv, sf, hosts, fetchImpl }).catch(e => { this.state.progress = '出错：' + e.message; }).finally(() => {
+      this.state.running = false;
+      this.state.finished_at = Date.now();
+    });
+    return { ok: true };
+  }
+
+  async _runReplay(mgr, base, { rounds, lv, sf, hosts, fetchImpl }) {
+    let n = 0;
+    const total = rounds * lv.length * sf.length * hosts.length;
+    for (let round = 0; round < rounds; round++) {
+      for (const level of lv) {
+        for (const safety of sf) {
+          for (const host of hosts) {
+            n++;
+            this.state.progress = `${n}/${total} · ${hostLabel(host)}${level ? ' · ' + level : ''}${safety ? ' · safety ' + safety : ''}`;
+            const token = await mgr.getValidAccessToken();
+            if (!token) { this.state.runs.push({ host: hostLabel(host), round: round + 1, level, safety, ok: false, status: null, error: 'token 刷新失败' }); continue; }
+            const payload = buildReplayPayload(base, { level, safety });
+            const r = await measureOnce({ host, payload, accessToken: token, fetchImpl });
+            this.state.runs.push({ ...r, round: round + 1, level, safety });
+          }
+        }
+      }
+    }
+    this.state.progress = '完成';
+  }
 
   /** 启动后台测速；已有任务在跑时返回 false */
   start(mgr, { rounds = 2, model = 'gemini-3.8-flash-high', hosts = ANTIGRAVITY_ENDPOINTS, fetchImpl = upstreamFetch } = {}) {
     if (this.state.running) return false;
     rounds = Math.max(1, Math.min(3, Number(rounds) || 2));
-    this.state = { running: true, started_at: Date.now(), finished_at: null, account: mgr?.tokenData?.email || null, model, rounds, progress: '准备中', runs: [], summary: [] };
+    this.state = { mode: 'short', running: true, started_at: Date.now(), finished_at: null, account: mgr?.tokenData?.email || null, model, rounds, progress: '准备中', runs: [], summary: [] };
     this._run(mgr, { rounds, model, hosts, fetchImpl }).catch(e => { this.state.progress = '出错：' + e.message; }).finally(() => {
       this.state.running = false;
       this.state.finished_at = Date.now();

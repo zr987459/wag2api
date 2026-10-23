@@ -84,6 +84,16 @@ if (RUNTIME === 'node' && haveCert) {
     assert.strictEqual(streamClosed, true);
   });
 
+  await t('fix/ttft：_gwUploadMs 记录请求体写出耗时（Node 下为数字，≤ 响应头耗时）', async () => {
+    const big = 'x'.repeat(512 * 1024);
+    const t0 = Date.now();
+    const r = await upstreamFetch(base + '/echo', { method: 'POST', body: big });
+    const headersMs = Date.now() - t0;
+    assert.equal(typeof r._gwUploadMs, 'number');
+    assert.ok(r._gwUploadMs >= 0 && r._gwUploadMs <= headersMs + 1, `upload ${r._gwUploadMs} headers ${headersMs}`);
+    assert.equal((await r.json()).body.length, big.length);
+  });
+
   await t('AbortSignal 中止', async () => {
     const ac = new AbortController();
     const p = upstreamFetch(base + '/stream', { method: 'POST', body: '{}', signal: ac.signal }).then(r => r.body.getReader().read());

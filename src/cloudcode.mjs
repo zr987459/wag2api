@@ -5,6 +5,12 @@
 import crypto from 'crypto';
 import { convertAnthropicToGoogle } from './content-converter.mjs';
 import { resolveSessionId } from './session-router.mjs';
+import { tuning } from './ag-tuning.mjs';
+
+export const SAFETY_BLOCK_NONE = Object.freeze([
+  'HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+  'HARM_CATEGORY_DANGEROUS_CONTENT', 'HARM_CATEGORY_CIVIC_INTEGRITY',
+].map(category => Object.freeze({ category, threshold: 'BLOCK_NONE' })));
 
 // 稳定会话 ID：Antigravity 的提示缓存按「账号 + sessionId」划分，同一对话必须每轮带同一个 sessionId 才能命中。
 // 与 CLIProxyAPI 一致：sha256(首条用户消息文本) 取前 8 字节，屏蔽符号位，前缀 "-"。
@@ -101,14 +107,19 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
   const budget = anthropicRequest.thinking?.type === 'enabled' ? Number(anthropicRequest.thinking.budget_tokens) || 0 : 0;
   const budgetLevel = budget >= 16384 ? 'high' : budget >= 4096 ? 'medium' : budget > 0 ? 'low' : null;
   const effort = ['low', 'medium', 'high'].includes(clientEffort) ? clientEffort : null;
+  // fix/ttft：AG_DEFAULT_THINKING_LEVEL 只替换「客户端什么都没指定」时的兜底档位，绝不改客户端显式指定的档位
+  const defaultLevel = tuning('AG_DEFAULT_THINKING_LEVEL');
   const resolvedLevel = levelMatch?.[1] || effort || budgetLevel
+    || defaultLevel
     || (isHighReasoning ? 'high' : isFlash ? 'low' : 'high');
+  // fix/ttft：AG_INCLUDE_THOUGHTS=0 时 Gemini 3 不回传思考过程（只影响 Gemini 3 / fast 两个分支）
+  const includeThoughts = tuning('AG_INCLUDE_THOUGHTS') !== '0';
 
   if (anthropicRequest.model && anthropicRequest.model.includes('fast')) {
     // fast 模式：配置最低思考等级（low），实现极速吐字
-    generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: 'low', thinkingBudget: 0 };
+    generationConfig.thinkingConfig = { includeThoughts, thinkingLevel: 'low', thinkingBudget: 0 };
   } else if (isGemini3) {
-    generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: resolvedLevel, ...(resolvedLevel === 'low' && isFlash ? { thinkingBudget: 0 } : {}) };
+    generationConfig.thinkingConfig = { includeThoughts, thinkingLevel: resolvedLevel, ...(resolvedLevel === 'low' && isFlash ? { thinkingBudget: 0 } : {}) };
   } else if (anthropicRequest.thinking && anthropicRequest.thinking.type === 'enabled') {
     generationConfig.thinkingConfig = { includeThoughts: true, thinkingBudget: anthropicRequest.thinking.budget_tokens || 2048 };
   } else if (hasTools) {
@@ -122,14 +133,12 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
   const request = {
     contents,
     generationConfig,
-    safetySettings: [
-      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
-    ],
   };
+  // fix/ttft：AG_SAFETY_SETTINGS=off 时不发送（官方客户端不发）；默认 block_none 保持原行为。
+  // 内容是常量，不随时间变化；但切换取值会改变序列化结果，切换后第一轮可能未命中缓存。
+  if (tuning('AG_SAFETY_SETTINGS') === 'block_none') {
+    request.safetySettings = SAFETY_BLOCK_NONE.map(x => ({ ...x }));
+  }
 
   if (systemInstruction) {
     request.systemInstruction = systemInstruction;

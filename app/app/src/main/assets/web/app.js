@@ -36,6 +36,7 @@ function fmtNum(n) {
 
 function fmtPct(r) { return r === null || r === undefined ? '--' : (r * 100).toFixed(1) + '%'; }
 function fmtMs(ms) { return ms === null || ms === undefined || ms === 0 ? '--' : ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
+function fmtBytes(b) { if (b === null || b === undefined || !Number.isFinite(Number(b))) return "--"; b = Number(b); return b >= 1048576 ? (b / 1048576).toFixed(2) + " MB" : b >= 1024 ? Math.round(b / 1024) + " KB" : b + " B"; }
 
 // 独立运行：standalone=只有 AG（WB_ENGINE=0）；dual=Linux / 源码版双引擎（没有安卓宿主）。
 // 设置了 ADMIN_KEY 时管理接口需带密钥
@@ -267,6 +268,7 @@ async function loadOverview() {
   }
   renderStats(lastStats[engine]);
   renderTiming(lastStats[engine]);
+  loadAgTuning();
   renderTrend(lastStats[engine]);
 }
 
@@ -282,8 +284,10 @@ function renderTiming(st) {
     ['Token / 组包', `${ms(t.t_token)} / ${ms(t.t_payload)}`],
     ['握手', ms(t.t_tls)],
     ['响应头', ms(t.t_headers)],
-    ['首个思考', ms(t.t_first_thought)],
-    ['首个正文', ms(t.t_first_text)],
+    ['上传 / 等待', `${t.upload_ms === null || t.upload_ms === undefined ? '--' : ms(t.upload_ms)} / ${ms(t.wait_headers_ms)}`],
+    ['首个思考', ms(t.first_thought_ms ?? t.t_first_thought)],
+    ['首个正文', ms(t.first_text_ms ?? t.t_first_text)],
+    ['请求体', fmtBytes(t.body_bytes)],
     ['总耗时', ms(t.latency_ms)],
     ['尝试次数', t.attempts ?? '--'],
     ['缓存 / 未命中', `${fmtNum(t.cached_tokens)} / ${fmtNum(t.input_tokens)}`],
@@ -298,7 +302,46 @@ function renderTiming(st) {
     const rs = Object.entries(dg?.reasons || {}).map(([k, v]) => `${labels[k] || escapeHtml(k)} ${v}`).join('，');
     dgEl.textContent = dg ? `近 24 小时降级 ${dg.count} 次 · 降级率 ${dg.rate === null ? '--' : fmtPct(dg.rate)}${rs ? ' · ' + rs : ''}` : '';
   }
-  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次 · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
+  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次${t.failover ? ` · 首块超时切换 ${t.failover} 次` : ''} · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
+}
+
+// fix/ttft：AG 调优开关（/api/ag/tuning）
+let agTuningAt = 0;
+async function loadAgTuning(force) {
+  const card = $('agTuningCard');
+  if (!card) return;
+  if (engine !== 'ag') { card.style.display = 'none'; return; }
+  if (!force && Date.now() - agTuningAt < 30000) return;
+  if (!force && card.contains(document.activeElement)) return; // 正在编辑时不刷新
+  agTuningAt = Date.now();
+  let d;
+  try { d = await getJson('/api/ag/tuning'); } catch (e) { return; }
+  if (!d || !d.items) return;
+  card.style.display = '';
+  const src = { console: '控制台', env: '环境变量', default: '默认' };
+  $('agTuningList').innerHTML = d.items.map(it => `
+    <div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div class="row-between"><span class="mono" style="font-size:12px;font-weight:600;">${escapeHtml(it.name)}</span><span class="muted" style="font-size:11px;">${src[it.source] || it.source} · 默认 ${escapeHtml(it.default || '空')}</span></div>
+      <div class="muted" style="font-size:11px;margin:2px 0 4px;">${escapeHtml(it.doc)}</div>
+      <div style="display:flex;gap:6px;">
+        <input class="input-field mono" style="margin-bottom:0;flex:1;font-size:12px;" id="tune-${it.name}" value="${escapeHtml(it.source === 'console' ? it.value : '')}" placeholder="${escapeHtml(it.value)}">
+        <button class="btn btn-primary btn-sm" onclick="saveAgTuning('${it.name}')">保存</button>
+      </div>
+    </div>`).join('');
+  const hh = Object.entries(d.health?.hosts || {}).map(([h, v]) => {
+    let name = h; try { name = new URL(h).hostname.split('.')[0]; } catch (e) {}
+    return `${escapeHtml(name)} 样本 ${v.samples} 等待中位 ${fmtMs(v.median_wait_ms)}${v.demoted_until ? ' · 已降权' : ''}`;
+  });
+  $('agHostHealth').textContent = hh.length ? `host 健康度：${hh.join('；')} · 粘滞会话 ${d.health.sticky_sessions}` : '';
+}
+async function saveAgTuning(name) {
+  const v = $('tune-' + name)?.value ?? '';
+  try {
+    const d = await postJson('/api/ag/tuning', { name, value: v.trim() });
+    if (!d.ok) throw new Error(d.error || '保存失败');
+    showToast(v.trim() ? `${name} 已保存` : `${name} 已恢复默认`, 'success');
+  } catch (e) { showToast(e.message, 'error'); }
+  loadAgTuning(true);
 }
 
 function renderStats(st) {
@@ -628,6 +671,15 @@ async function loadAgAccounts() {
         <button class="btn btn-outline" style="flex: 1;" onclick="agTestActive(this)">⚡ 测试当前账号</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="agBenchHosts(this)">🏁 集群测速</button>
       </div>
+      <div style="display: flex; gap: 6px; margin-top: 8px; align-items: center;">
+        <select id="replayLevel" class="input-field" style="margin-bottom: 0; flex: 1;" title="思考档位变体">
+          <option value="">思考：原样</option><option value="low">low</option><option value="high">high</option><option value="low,high">low + high</option>
+        </select>
+        <select id="replaySafety" class="input-field" style="margin-bottom: 0; flex: 1;" title="safetySettings 变体">
+          <option value="">safety：原样</option><option value="on">on</option><option value="off">off</option><option value="on,off">on + off</option>
+        </select>
+        <button class="btn btn-outline" style="flex: 1.3;" onclick="agBenchReplay(this)">🔁 长上下文回放</button>
+      </div>
       <div class="account-test-banner" id="ag-test-banner"></div>`;
 
     if (!accs.length) { box.innerHTML = '<div class="empty">还没有 Google 账号，点右上角「+ 添加」登录，或「导入」Refresh Token</div>'; return; }
@@ -677,15 +729,33 @@ const agId = email => email.replace(/[^a-zA-Z0-9]/g, '_');
 function quotaHtml(q) {
   if (!q) return '<div class="muted">额度加载中…</div>';
   if (!q.ok) return `<div class="muted" style="color:var(--warning)">额度读取失败：${escapeHtml(q.message || q.error || '未知')}</div>`;
-  const rows = [['Gemini 5h', q.gemini_5h], ['Gemini 7天', q.gemini_7d], ['Claude 5h', q.claude_5h], ['Claude 7天', q.claude_7d]];
+  const rows = [['Gemini 5h', q.gemini_5h], ['Gemini 周限', q.gemini_7d], ['Claude 5h', q.claude_5h], ['Claude 周限', q.claude_7d]];
   return rows.map(([name, b]) => {
     const p = b && typeof b.percentage === 'number' ? b.percentage : null;
     const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
+    const isGte = b?.bound === 'gte';
+    const isConstrained = b?.bound === 'constrained' || !!b?.constrained_by_weekly;
+    let pText = '--';
+    if (p !== null) {
+      if (isGte) pText = `≥${p}%`;
+      else if (isConstrained) pText = `剩 ${p}% (周限额)`;
+      else pText = `剩 ${p}%`;
+    }
+    let rText = '暂无数据';
+    if (b) {
+      if (b.reset_text) {
+        rText = b.reset_text + (b.inferred && !isGte && !isConstrained ? '（推算）' : '');
+      } else if (isGte) {
+        rText = '未触发周限';
+      } else if (isConstrained) {
+        rText = '受周额度约束';
+      }
+    }
     return `<div class="quota-row">
       <span class="qn">${name}</span>
       <div class="qbar"><i class="${cls}" style="width:${p ?? 0}%"></i></div>
-      <span class="qp">${p === null ? '--' : '剩 ' + p + '%'}</span>
-      <span class="qr">${b ? (b.reset_text || '') + (b.inferred ? '（推算）' : '') : '暂无数据'}</span>
+      <span class="qp">${pText}</span>
+      <span class="qr">${escapeHtml(rText)}</span>
     </div>`;
   }).join('') + `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time || '')}</div>`;
 }
@@ -745,6 +815,7 @@ async function agTestActive(btn) {
 // 集群测速：同一提示词交替发给 daily / autopush / prod，各 2 轮，比较首字与真实生成速度
 function fmtS(ms) { return ms == null ? '—' : (ms / 1000).toFixed(1) + 's'; }
 function renderBench(d) {
+  if (d.mode === 'replay') return renderReplay(d);
   const lines = [`${d.account || ''} · ${d.model || ''} · ${d.running ? '进行中 ' + (d.progress || '') : '完成'}`];
   for (const s of d.summary || []) {
     if (!s.ok) { lines.push(`❌ ${s.host} · ${s.statuses} · ${s.error || '失败'}`); continue; }
@@ -755,6 +826,49 @@ function renderBench(d) {
   }
   testBanner('ag-test-banner', d.running ? '' : ((d.summary || []).some(s => s.ok) ? 'success' : 'error'), lines.join('\n'));
   $('ag-test-banner').style.whiteSpace = 'pre-line';
+}
+// fix/ttft：长上下文回放。用最近一次正式请求（同账号、同 sessionId）按 daily→autopush→prod 交替各发 N 轮
+function renderReplay(d) {
+  const pct = v => (v == null ? '—' : Math.round(v * 100) + '%');
+  const lines = [`回放 · ${d.account || ''} · ${d.model || ''} · ${d.running ? '进行中 ' + (d.progress || '') : '完成'}`];
+  lines.push('host · 思考 · safety → 响应头 / 首思考 / 首正文 · 缓存命中（中位数）');
+  for (const s of d.summary || []) {
+    if (!s.ok) { lines.push(`❌ ${s.host} · ${s.level} · ${s.safety} · ${s.statuses} · ${s.error || '失败'}`); continue; }
+    lines.push(`✅ ${s.host} · ${s.level} · ${s.safety} (${s.ok}/${s.total}) → ${fmtS(s.t_headers)} / ${fmtS(s.t_first_thought)} / ${fmtS(s.t_first_text)} · ${pct(s.cache_hit_rate)}`);
+  }
+  for (const r of d.runs || []) {
+    lines.push(`  #${r.round} ${r.host}${r.level ? ' ' + r.level : ''}${r.safety ? ' safety ' + r.safety : ''} ${r.status ?? 'ERR'} 头 ${fmtS(r.t_headers)} 思考 ${fmtS(r.t_first_thought)} 正文 ${fmtS(r.t_first_text)} 命中 ${pct(r.cache_hit_rate)}${r.error ? ' · ' + r.error : ''}`);
+  }
+  testBanner('ag-test-banner', d.running ? '' : ((d.summary || []).some(s => s.ok) ? 'success' : 'error'), lines.join('\n'));
+  $('ag-test-banner').style.whiteSpace = 'pre-line';
+}
+async function agBenchReplay(btn) {
+  const level = $('replayLevel')?.value || '';
+  const safety = $('replaySafety')?.value || '';
+  let info;
+  try { info = (await getJson('/api/bench/hosts')).replay_info; } catch (e) { info = null; }
+  if (!info || !info.available) { testBanner('ag-test-banner', 'error', '❌ 还没有正式 AG 请求可回放，先用客户端发一轮对话'); return; }
+  const combos = (level ? level.split(',').length : 1) * (safety ? safety.split(',').length : 1);
+  const n = combos * 3 * 2;
+  const estTok = info.est_input_tokens * n;
+  const msg = `将用 ${info.email} 回放最近一次请求（约 ${fmtNum(info.est_input_tokens)} 输入 token，${info.age_s}s 前）。\n`
+    + `3 个集群 × 2 轮 × ${combos} 个组合 = ${n} 次请求，输出限 256 token。\n`
+    + `预计输入合计约 ${fmtNum(estTok)} token；未命中缓存的集群按全价计。\n`
+    + `注意：同一 sessionId 在上游有约 104 万 token 的累计上限，次数越多越可能触发换代（下一轮正式对话缓存未命中）。开始？`;
+  if (!confirm(msg)) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '回放中…';
+  try {
+    let d = await postJson('/api/bench/hosts', { mode: 'replay', rounds: 2, level, safety });
+    if (!d.ok && !d.running) throw new Error(d.error || '启动失败');
+    renderBench(d);
+    while (d.running) {
+      await new Promise(r => setTimeout(r, 3000));
+      d = await getJson('/api/bench/hosts');
+      renderBench(d);
+    }
+  } catch (e) { testBanner('ag-test-banner', 'error', `❌ ${e.message}`); }
+  finally { btn.textContent = orig; btn.disabled = false; }
 }
 async function agBenchHosts(btn) {
   if (!confirm('将用当前账号向 3 个集群各发 2 次长文请求，约 2–4 分钟，会消耗少量额度。开始？')) return;
@@ -1167,9 +1281,13 @@ async function loadLogs() {
           </div>
           <div class="log-tokens">${tok}</div>
           ${l.timing ? `<div class="muted mono" style="font-size:11px;">${[
-            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['握手', l.timing.conn_reused === false ? l.timing.t_tls : null], ['头', l.timing.t_headers],
-            ['思考', l.timing.t_first_thought], ['正文', l.timing.t_first_text],
-          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
+            ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['握手', l.timing.conn_reused === false ? l.timing.t_tls : null],
+            // fix/ttft：「头」拆成 上传 · 等待；旧日志没有拆分字段时仍显示「头」
+            ...(l.timing.wait_headers_ms !== null && l.timing.wait_headers_ms !== undefined
+              ? [['上传', l.timing.upload_ms], ['等待', l.timing.wait_headers_ms]]
+              : [['头', l.timing.t_headers]]),
+            ['首思考', l.timing.first_thought_ms ?? l.timing.t_first_thought], ['首正文', l.timing.first_text_ms ?? l.timing.t_first_text],
+          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.body_bytes ? ` · 体 ${fmtBytes(l.timing.body_bytes)}` : ''}${l.timing.thinking_level ? ` · 思考 ${escapeHtml(l.timing.thinking_level)}` : ''}${l.timing.failover ? ' · 超时换 host' : ''}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
           ${l.who ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(l.who)}</div>` : ''}
           ${l.note ? `<div class="log-note-box">⚠️ ${escapeHtml(l.note)}</div>` : ''}
         </div>`;

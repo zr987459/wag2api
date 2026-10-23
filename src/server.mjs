@@ -17,6 +17,10 @@ import { signatureCache } from './signature-cache.mjs';
 import { OAuthFlowManager } from './oauth-flow.mjs';
 import { runConnectivityTest } from './test-runner.mjs';
 import { hostBench } from './host-bench.mjs';
+import { splitHeaderTiming, thinkingLevelOf } from './timing-split.mjs';
+import { rememberPayload } from './replay-store.mjs';
+import { loadTuning, describeTuning, setTuning, tuningNumber } from './ag-tuning.mjs';
+import { hostRouter } from './host-router.mjs';
 import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
 import { prewarm, lastPrewarm } from './prewarm.mjs';
 import { fetchRealQuota } from './quota-fetcher.mjs';
@@ -44,7 +48,7 @@ import {
 } from './openai-ag-converter.mjs';
 import { cacheProbe } from './cache-probe.mjs';
 import { historyPin } from './history-pin.mjs';
-import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
+import { clientSessionKey, bumpSessionOnOverflow, sessionStats, isAuxiliaryRequest, sessionBase } from './session-router.mjs';
 import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
 
 let lastClientHeaders = null;
@@ -66,6 +70,7 @@ import os from 'os';
 let EMBED = {};
 try { EMBED = (await import('./embedded.mjs')).default || {}; } catch (e) {}
 fs.mkdirSync(path.join(DATA_DIR, 'accounts'), { recursive: true });
+loadTuning(path.join(DATA_DIR, 'ag-tuning.json'));
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8790;
 
 // 状态持久化
@@ -332,6 +337,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // fix/ttft：AG 调优开关（环境变量为默认，控制台可覆盖并持久化到 DATA_DIR/ag-tuning.json）
+  if (url.pathname === '/api/ag/tuning') {
+    if (!access.isAdmin(req)) { denyAdmin(res); return; }
+    if (req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const r = setTuning(String(body.name || ''), body.value);
+      sendJson(res, r.ok ? 200 : 400, { ...r, items: describeTuning(), health: hostRouter.health() });
+      return;
+    }
+    sendJson(res, 200, { ok: true, items: describeTuning(), health: hostRouter.health() });
+    return;
+  }
+
   if (url.pathname === '/api/stats/timing') {
     sendJson(res, 200, statsTracker.getTimingSummary(Number(url.searchParams.get('n')) || 20));
     return;
@@ -417,6 +435,11 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req).catch(() => ({}));
       const mgr = accountPool.getActiveManager();
       if (!mgr) { sendJson(res, 400, { ok: false, error: '账号池暂无可用 Google 账号' }); return; }
+      if (body.mode === 'replay') {
+        const r = hostBench.startReplay(email => accountPool.managers.get(email) || null, { rounds: body.rounds, levels: body.level, safety: body.safety });
+        sendJson(res, r.ok ? 200 : 409, { ...r, ...hostBench.status() });
+        return;
+      }
       const started = hostBench.start(mgr, { rounds: body.rounds, model: body.model || 'gemini-3.8-flash-high' });
       sendJson(res, started ? 200 : 409, { ok: started, ...(started ? {} : { error: '已有测速在进行' }), ...hostBench.status() });
       return;
@@ -568,10 +591,18 @@ const server = http.createServer(async (req, res) => {
     readRawBody(req).then(async (body) => {
       const startTime = Date.now();
       // PR2 分段打点：各时间点均为相对 startTime 的毫秒数；多次尝试时保留最后一次（即最终生效的那次）
-      const timing = { t_token: null, t_payload: null, t_headers: null, t_tls: null, conn_reused: null, host: null, attempts: 0, switched_account: false, switched_host: false };
+      const timing = { t_token: null, t_payload: null, t_headers: null, t_tls: null, conn_reused: null, host: null, attempts: 0, switched_account: false, switched_host: false,
+        upload_ms: null, wait_headers_ms: null, body_bytes: null, thinking_level: null, failover: false };
       const mark = (k) => { timing[k] = Date.now() - startTime; };
-      const markHeaders = (u, r) => { mark('t_headers'); try { timing.host = new URL(u).hostname; } catch (e) {} if (r) { timing.conn_reused = r._gwReused ?? null; timing.t_tls = r._gwTlsMs ?? null; } };
-      const timingOut = (extra = {}) => ({ ...timing, switched_host: Boolean(timing.host && timing.host !== DAILY_HOST), ...extra });
+      const markHeaders = (u, r, sentAt) => {
+        mark('t_headers');
+        try { timing.host = new URL(u).hostname; } catch (e) {}
+        if (r) { timing.conn_reused = r._gwReused ?? null; timing.t_tls = r._gwTlsMs ?? null; }
+        Object.assign(timing, splitHeaderTiming(Date.now() - sentAt, r?._gwUploadMs));
+      };
+      // 首个 host 不再写死为 daily：以本次请求排在第一位的 host 为准
+      let firstHost = DAILY_HOST;
+      const timingOut = (extra = {}) => ({ ...timing, switched_host: Boolean(timing.host && timing.host !== firstHost), ...extra });
       let statsRecorded = false;
       let statsEmail = null;
       let statsModel = null;
@@ -602,7 +633,10 @@ const server = http.createServer(async (req, res) => {
         };
 
         // 智能选号：优先命中会话亲和表（保持 KV-Cache），新会话按最小负载轮询分发，支持 429 冷却避障
-        let activeMgr = accountPool.pickManager(anthropicReq._gwSessionKey);
+        // fix/ttft：亲和 key 与上游 sessionId 同源（sessionBase）；客户端不带会话 ID 时不再每轮按 LRU 换号。辅助请求只读不写亲和表
+        const isAux = isAuxiliaryRequest(anthropicReq);
+        const convKey = sessionBase(anthropicReq);
+        let activeMgr = accountPool.pickManager(convKey, new Set(), { bind: !isAux });
         if (!activeMgr) {
           const errMsg = '账号池暂无可用 Google 账号，请在控制台添加账号';
           if (isOaiChat) {
@@ -617,6 +651,11 @@ const server = http.createServer(async (req, res) => {
         const isStreaming = Boolean(anthropicReq.stream);
 
         // PR1：失败处理收敛到 upstream-policy（400 直接返回；429 冷却换号；5xx/超时换 host 一次再换号一次；最后才降级）
+        // fix/ttft：host 顺序 = AG_ENDPOINTS + 会话粘滞 + 健康度（辅助请求不参与粘滞）
+        const hostKey = isAux ? '' : convKey;
+        const hostOrder = hostRouter.orderFor(hostKey);
+        try { firstHost = new URL(hostOrder[0]).hostname; } catch (e) {}
+        let lastHostBase = null;
         const send = async (payload, mgr, host, timeoutMs) => {
           const tok = await mgr.getValidAccessToken();
           const targetUrl = isStreaming ? `${host}/v1internal:streamGenerateContent?alt=sse` : `${host}/v1internal:generateContent`;
@@ -626,13 +665,23 @@ const server = http.createServer(async (req, res) => {
             const e = new Error(`upstream header timeout ${timeoutMs}ms`); e.name = 'TimeoutError'; ac.abort(e);
           }, timeoutMs) : null;
           try {
+            const bodyStr = JSON.stringify(payload);
+            timing.body_bytes = Buffer.byteLength(bodyStr);
+            // 回放测速只要「正式」请求：主模型、非辅助请求；只在内存留最近一份
+            if (payload.model === mapToUpstreamModel(anthropicReq.model) && !isAux) {
+              rememberPayload(bodyStr, { email: mgr.tokenData.email, model: anthropicReq.model });
+            }
+            timing.thinking_level = thinkingLevelOf(payload);
+            const sentAt = Date.now();
             const r = await upstreamFetch(targetUrl, {
               method: 'POST',
               headers: buildAntigravityHeaders(tok),
-              body: JSON.stringify(payload),
+              body: bodyStr,
               ...(ac ? { signal: ac.signal } : {}),
             });
-            markHeaders(targetUrl, r);
+            markHeaders(targetUrl, r, sentAt);
+            lastHostBase = host;
+            if (r && r.ok) hostRouter.record(host, timing.wait_headers_ms, timing.body_bytes);
             return r;
           } finally {
             if (timer) clearTimeout(timer);
@@ -670,7 +719,8 @@ const server = http.createServer(async (req, res) => {
           },
           onBadRequest: (body, mgr) => bumpSessionOnOverflow(anthropicReq, mgr.tokenData.email, body),
           send,
-          hosts: [ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_AUTOPUSH],
+          hosts: hostOrder,
+          failoverMs: isStreaming ? tuningNumber('AG_FIRST_CHUNK_FAILOVER_MS') : 0,
           chain: MODEL_FALLBACK_CHAINS[anthropicReq.model] || [],
           allowDowngrade: POLICY.allowDowngrade,
           headerTimeoutMs: isStreaming ? POLICY.streamHeaderTimeoutMs : POLICY.nonStreamHeaderTimeoutMs,
@@ -680,11 +730,14 @@ const server = http.createServer(async (req, res) => {
         });
 
         timing.switched_account = result.switchedAccount;
+        timing.failover = Boolean(result.failover);
+        // 只在成功换到别的 host 后才重新绑定；首次成功也绑定，之后同会话固定走这个 host
+        if (result.ok && hostKey && lastHostBase && hostRouter.stickyHost(hostKey) !== lastHostBase) hostRouter.bind(hostKey, lastHostBase);
         if (result.mgr) {
           activeMgr = result.mgr;
           statsEmail = activeMgr.tokenData.email;
-          if (anthropicReq._gwSessionKey) {
-            accountPool.bindSession(anthropicReq._gwSessionKey, activeMgr.tokenData.email);
+          if (!isAux) {
+            accountPool.bindSession(convKey, activeMgr.tokenData.email);
           }
         }
         const modelUsed = result.modelUsed || anthropicReq.model;
@@ -744,7 +797,10 @@ const server = http.createServer(async (req, res) => {
               cached_tokens: usage.cached_tokens,
               thoughts_tokens: usage.thoughts_tokens,
               error: usage.error || null,
-              timing: timingOut({ t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null }),
+              timing: timingOut({
+                t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null,
+                first_chunk_ms: usage.ttft_ms ?? null, first_thought_ms: usage.t_first_thought ?? null, first_text_ms: usage.t_first_text ?? null,
+              }),
               ...dg,
             });
           }, startTime, { notice });

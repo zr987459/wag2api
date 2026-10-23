@@ -146,7 +146,11 @@ export async function runWithPolicy(ctx) {
   let switchedAccount = false;
   const kinds = new Set();
 
-  const timeoutFor = () => headerTimeoutMs;
+  // fix/ttft：首块超时切换。只对第一次 host 尝试用较短的超时；切过一次之后恢复正常超时
+  const failoverMs = Number(ctx.failoverMs) > 0 ? Number(ctx.failoverMs) : 0;
+  let failedOver = false;
+  const failoverArmed = () => failoverMs > 0 && !hostSwitched && hosts.length > 1;
+  const timeoutFor = () => (failoverArmed() ? Math.min(failoverMs, headerTimeoutMs) : headerTimeoutMs);
   const pastDeadline = () => attempts > 0 && now() - startedAt >= deadlineMs;
 
   const order = (upModel, exclude) => {
@@ -174,7 +178,7 @@ export async function runWithPolicy(ctx) {
 
   const success = (response, mgr, modelUsed, reason) => ({
     ok: true, response, mgr, modelUsed, downgraded: modelUsed !== ctx.model, reason: modelUsed !== ctx.model ? reason : null,
-    switchedAccount, attempts, error: null,
+    switchedAccount, attempts, error: null, failover: failedOver,
   });
 
   // ---------- 主模型 ----------
@@ -207,6 +211,7 @@ export async function runWithPolicy(ctx) {
       continue;
     }
     payload = payload ? swapAccountInPayload(payload, ctx.anthropicReq || {}, mgr.tokenData.email, mgr.tokenData.projectId) : ctx.buildPayload(ctx.model, mgr);
+    const armed = failoverArmed();
     const r = await attempt(payload, mgr, host);
     if (r.ok) return success(r.response, mgr, ctx.model, null);
     lastError = { kind: r.kind, status: r.status, body: r.body };
@@ -234,6 +239,16 @@ export async function runWithPolicy(ctx) {
       continue;
     }
     if (r.kind === 'auth') { authFailed.add(mgr.tokenData.email); nextAccount(); continue; }
+    // fix/ttft：首块超时 → 同账号、同 payload（sessionId 不变）换下一个 host，只换一次
+    if (armed && r.kind === 'timeout') {
+      hostSwitched = true;
+      failedOver = true;
+      host = hosts[1];
+      log(`[Policy] ${failoverMs}ms 未收到响应头，换 host 重发（不换号、不降级）`);
+      continue;
+    }
+    // 已经做过首块超时切换：第二个 host 也失败就直接返回真实错误，不再换号、不降级
+    if (failedOver) break;
     // server / network / timeout：换 host 一次，再换账号一次
     if (!hostSwitched && hosts.length > 1) {
       hostSwitched = true;
@@ -261,7 +276,7 @@ export async function runWithPolicy(ctx) {
 
   // 只是凭据问题时换模型没用，不降级
   const onlyAuth = kinds.size > 0 && [...kinds].every(k => k === 'auth');
-  if (allowDowngrade && !onlyAuth && !pastDeadline()) {
+  if (allowDowngrade && !onlyAuth && !failedOver && !pastDeadline()) {
     for (const dm of ctx.chain || []) {
       if (pastDeadline()) break;
       const up = ctx.upstreamOf(dm);
@@ -279,5 +294,5 @@ export async function runWithPolicy(ctx) {
     }
   }
 
-  return { ok: false, mgr, modelUsed: ctx.model, downgraded: false, reason, switchedAccount, attempts, error: lastError || { kind: 'unknown', status: 502, body: 'Google 集群无响应' } };
+  return { ok: false, mgr, modelUsed: ctx.model, downgraded: false, reason, switchedAccount, attempts, failover: failedOver, error: lastError || { kind: 'unknown', status: 502, body: 'Google 集群无响应' } };
 }
