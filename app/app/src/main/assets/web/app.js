@@ -733,11 +733,23 @@ function quotaHtml(q) {
   return rows.map(([name, b]) => {
     const p = b && typeof b.percentage === 'number' ? b.percentage : null;
     const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
-    const isConstrained = !!b?.constrained_by_weekly;
-    const pText = p === null ? '--' : `剩 ${p}%${isConstrained ? ' (周限额)' : ''}`;
+    const isGte = b?.bound === 'gte';
+    const isConstrained = b?.bound === 'constrained' || !!b?.constrained_by_weekly;
+    let pText = '--';
+    if (p !== null) {
+      if (isGte) pText = `≥${p}%`;
+      else if (isConstrained) pText = `剩 ${p}% (周限额)`;
+      else pText = `剩 ${p}%`;
+    }
     let rText = '暂无数据';
     if (b) {
-      rText = (b.reset_text || '') + (b.inferred ? '（推算）' : '') + (isConstrained ? '（受周额度约束）' : '');
+      if (b.reset_text) {
+        rText = b.reset_text + (b.inferred && !isGte && !isConstrained ? '（推算）' : '');
+      } else if (isGte) {
+        rText = '未触发周限';
+      } else if (isConstrained) {
+        rText = '受周额度约束';
+      }
     }
     return `<div class="quota-row">
       <span class="qn">${name}</span>

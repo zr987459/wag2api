@@ -109,16 +109,55 @@ function collectModelQuotas(model, family) {
   return out;
 }
 
+function applyWindowFallbacks(merged) {
+  const pairs = [
+    ['gemini_5h', 'gemini_7d'],
+    ['claude_5h', 'claude_7d'],
+  ];
+  for (const [shortKey, longKey] of pairs) {
+    const short = merged[shortKey];
+    const long = merged[longKey];
+
+    // 1) 7d 缺失、5h 存在且 > 0 → 7d 真实剩余至少 >= 5h（未触发周限）
+    if (!long && short && typeof short.fraction === 'number' && short.fraction > 0) {
+      merged[longKey] = {
+        fraction: short.fraction,
+        reset: null, // 绝不抄短窗口的 4小时59分 重置时间
+        source: 'inferred-gte',
+        bound: 'gte',
+        status_text: '未触发周限',
+        note: '未触发周限',
+      };
+    }
+
+    // 2) 5h 缺失、7d 存在 → 5h 受周额度约束，无独立短窗口刷新
+    if (!short && long) {
+      merged[shortKey] = {
+        fraction: long.fraction,
+        reset: null, // 绝不抄 7d 的 24 小时重置时间
+        source: 'inferred-constrained',
+        bound: 'constrained',
+        constrained_by_weekly: true,
+        status_text: '受周限额约束',
+        note: '受周限额约束',
+      };
+    }
+  }
+}
+
 function toPublic(r) {
   if (!r) return null;
+  const bound = r.bound || null;
   return {
     remaining_fraction: r.fraction,
     percentage: typeof r.fraction === 'number' ? Math.round(r.fraction * 100) : null,
-    inferred: !!r.inferred,
+    bound,
+    note: r.note || null,
+    inferred: !!r.inferred || bound === 'gte' || bound === 'constrained',
     reset_time: r.reset,
     reset_text: r.status_text || parseResetTime(r.reset) || '动态自适应',
     source: r.source,
-    constrained_by_weekly: !!r.constrained_by_weekly,
+    constrained_by_weekly: bound === 'constrained' || !!r.constrained_by_weekly,
   };
 }
 
@@ -257,18 +296,8 @@ export async function fetchRealQuota(tokenManager) {
     merged.gemini_7d = rememberWeekly(email, 'gemini', merged.gemini_7d);
     merged.claude_7d = rememberWeekly(email, 'claude', merged.claude_7d);
 
-    // 【周额度约束状态】5h 无数据但周额度存在时明确标记受周限额约束，绝不显示空白 -- 或伪造假刷新
-    const weeklyConstrained = (shortKey, longKey) => {
-      if (!merged[shortKey] && merged[longKey]) {
-        merged[shortKey] = {
-          ...merged[longKey],
-          constrained_by_weekly: true,
-          status_text: parseResetTime(merged[longKey].reset) || '动态自适应',
-        };
-      }
-    };
-    weeklyConstrained('gemini_5h', 'gemini_7d');
-    weeklyConstrained('claude_5h', 'claude_7d');
+    // 【缺失窗口兜底：下限推断与周约束】
+    applyWindowFallbacks(merged);
 
     const result = {
       ok: true,
@@ -285,14 +314,19 @@ export async function fetchRealQuota(tokenManager) {
     result.five_hour = {
       percentage: result.gemini_5h?.percentage ?? null,
       reset_time: result.gemini_5h?.reset_time || null,
+      bound: result.gemini_5h?.bound || null,
       constrained_by_weekly: !!result.gemini_5h?.constrained_by_weekly,
     };
     result.claude_five_hour = {
       percentage: result.claude_5h?.percentage ?? null,
       reset_time: result.claude_5h?.reset_time || null,
+      bound: result.claude_5h?.bound || null,
       constrained_by_weekly: !!result.claude_5h?.constrained_by_weekly,
     };
-    result.weekly = { percentage: result.gemini_7d?.percentage ?? null };
+    result.weekly = {
+      percentage: result.gemini_7d?.percentage ?? null,
+      bound: result.gemini_7d?.bound || null,
+    };
     return result;
   } catch (err) {
     console.error('[Quota Fetch Error]:', err.message);
