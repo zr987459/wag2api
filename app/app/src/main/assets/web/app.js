@@ -729,7 +729,7 @@ const agId = email => email.replace(/[^a-zA-Z0-9]/g, '_');
 function quotaHtml(q) {
   if (!q) return '<div class="muted">额度加载中…</div>';
   if (!q.ok) return `<div class="muted" style="color:var(--warning)">额度读取失败：${escapeHtml(q.message || q.error || '未知')}</div>`;
-  const rows = [['Gemini 5h', q.gemini_5h], ['Gemini 7天', q.gemini_7d], ['Claude 5h', q.claude_5h], ['Claude 7天', q.claude_7d]];
+  const rows = [['Gemini 5h', q.gemini_5h], ['Gemini 周限', q.gemini_7d], ['Claude 5h', q.claude_5h], ['Claude 周限', q.claude_7d]];
   return rows.map(([name, b]) => {
     const p = b && typeof b.percentage === 'number' ? b.percentage : null;
     const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
