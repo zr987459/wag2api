@@ -34,7 +34,7 @@ import {
   MODEL_FALLBACK_CHAINS,
   mapToUpstreamModel,
 } from './cloudcode.mjs';
-import { runWithPolicy, Cooldowns, shouldInsertNotice, buildDowngradeNotice } from './upstream-policy.mjs';
+import { runWithPolicy, Cooldowns, shouldInsertNotice, buildDowngradeNotice, extractValidationUrl } from './upstream-policy.mjs';
 import { convertGoogleToAnthropic } from './content-converter.mjs';
 import { handleStreamConversion } from './sse-streamer.mjs';
 import {
@@ -43,6 +43,7 @@ import {
   handleOpenAIStreamConversion,
 } from './openai-ag-converter.mjs';
 import { cacheProbe } from './cache-probe.mjs';
+import { estimateAnthropicInputTokens } from './token-estimate.mjs';
 import { historyPin } from './history-pin.mjs';
 import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
 import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
@@ -123,9 +124,10 @@ function denyAdmin(res) {
 
 // 仅管理员可访问的内部接口
 const ADMIN_PATHS = new Set([
-  '/api/status', '/api/stats', '/api/logs', '/api/logs/clear', '/api/gemini/test', '/api/gemini/auth',
+  '/api/status', '/api/stats', '/api/token-stats', '/api/logs', '/api/logs/clear', '/api/gemini/test', '/api/gemini/auth',
   '/api/oauth/exchange', '/api/oauth/token-exchange', '/api/accounts/add-token', '/api/accounts/switch',
   '/api/accounts/remove', '/api/accounts/export', '/api/accounts/import', '/api/trend', '/api/stats/timing',
+  '/api/accounts/clear-validation',
 ]);
 
 
@@ -203,7 +205,8 @@ const server = http.createServer(async (req, res) => {
   }
   {
     let p = url.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/';
-    if (/(^|\/)messages$/.test(p) && !p.startsWith('/api/')) p = '/v1/messages';
+    if (/(^|\/)messages\/count_tokens$/.test(p) && !p.startsWith('/api/')) p = '/v1/messages/count_tokens';
+    else if (/(^|\/)messages$/.test(p) && !p.startsWith('/api/')) p = '/v1/messages';
     else if (/(^|\/)chat\/completions$/.test(p) && !p.startsWith('/api/')) p = '/v1/chat/completions';
     else if (/(^|\/)v1\/models$/.test(p)) p = '/v1/models';
     url.pathname = p;
@@ -320,10 +323,23 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, { ok: true, message: 'AG 账号池冷却已全部清除' });
     return;
   }
+  if (url.pathname === '/api/accounts/clear-validation' && req.method === 'POST') {
+    const { email } = await readBody(req);
+    if (email) accountPool.clearValidationBlocked(email);
+    else accountPool.clearAllValidationBlocks();
+    sendJson(res, 200, { ok: true, message: email ? `账号 ${email} 验证封禁已清除` : '所有账号验证封禁已清除' });
+    return;
+  }
 
   // 3. 统计数据与日志
   if (url.pathname === '/api/stats') {
     sendJson(res, 200, { ...statsTracker.getStats(), cooldowns: cooldowns.list() });
+    return;
+  }
+
+  if (url.pathname === '/api/token-stats') {
+    const range = url.searchParams.get('range') || 'day';
+    sendJson(res, 200, statsTracker.getTokenStats({ range }));
     return;
   }
 
@@ -561,6 +577,22 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 9.5 Anthropic count_tokens：本地估算，不打上游（此前 404，Claude Code 等客户端会报错或回退）
+  if (url.pathname === '/v1/messages/count_tokens' && req.method === 'POST') {
+    if (access.enabled && !access.isAdmin(req)) {
+      sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'API Key 无效或缺失 (x-api-key)' } });
+      return;
+    }
+    let body;
+    try { body = JSON.parse((await readRawBody(req)) || '{}'); } catch (e) { body = null; }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: '请求体不是合法 JSON 对象' } });
+      return;
+    }
+    sendJson(res, 200, { input_tokens: estimateAnthropicInputTokens(body) });
+    return;
+  }
+
   // 10. 核心推理接口：OpenAI (/v1/chat/completions) 与 Anthropic (/v1/messages) 双协议兼容
   const isOaiChat = url.pathname === '/v1/chat/completions';
   const isAnthropicMsg = url.pathname === '/v1/messages';
@@ -585,7 +617,15 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        const rawParsed = JSON.parse(body || '{}');
+        let rawParsed;
+        try { rawParsed = JSON.parse(body || '{}'); } catch (e) { rawParsed = undefined; }
+        if (!rawParsed || typeof rawParsed !== 'object' || Array.isArray(rawParsed)) {
+          // 非法 JSON 属于客户端错误：400 + 各协议标准错误体（此前抛异常走 500）
+          const msg = '请求体不是合法 JSON 对象';
+          if (isOaiChat) sendJson(res, 400, { error: { message: msg, type: 'invalid_request_error', code: null } });
+          else sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: msg } });
+          return;
+        }
         const anthropicReq = isOaiChat ? openaiRequestToAnthropic(rawParsed) : rawParsed;
         if (isOaiChat && rawParsed.stream !== undefined) {
           anthropicReq.stream = Boolean(rawParsed.stream);
@@ -608,7 +648,7 @@ const server = http.createServer(async (req, res) => {
           if (isOaiChat) {
             sendJson(res, 503, { error: { message: errMsg, type: 'server_error' } });
           } else {
-            sendJson(res, 401, { error: { type: 'authentication_error', message: errMsg } });
+            sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: errMsg } });
           }
           return;
         }
@@ -669,6 +709,8 @@ const server = http.createServer(async (req, res) => {
             return p;
           },
           onBadRequest: (body, mgr) => bumpSessionOnOverflow(anthropicReq, mgr.tokenData.email, body),
+          onValidationRequired: (mgr, body) => accountPool.markValidationBlocked(mgr.tokenData.email, String(body).slice(0, 300), extractValidationUrl(body)),
+          isBlocked: e => accountPool.isValidationBlocked(e),
           send,
           hosts: [ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_AUTOPUSH],
           chain: MODEL_FALLBACK_CHAINS[anthropicReq.model] || [],
@@ -680,6 +722,9 @@ const server = http.createServer(async (req, res) => {
         });
 
         timing.switched_account = result.switchedAccount;
+        if (result.ok && result.mgr?.tokenData?.email) {
+          accountPool.clearValidationBlocked(result.mgr.tokenData.email);
+        }
         if (result.mgr) {
           activeMgr = result.mgr;
           statsEmail = activeMgr.tokenData.email;
@@ -712,7 +757,8 @@ const server = http.createServer(async (req, res) => {
           if (isOaiChat) {
             sendJson(res, status, { error: { message: errDetail, type, code: status } });
           } else {
-            sendJson(res, status, { type: 'error', error: { type, message: errDetail } });
+            // Anthropic 错误类型里没有 upstream_error，统一用 api_error
+            sendJson(res, status, { type: 'error', error: { type: type === 'upstream_error' ? 'api_error' : type, message: errDetail } });
           }
           statsTracker.recordRequest({
             email: activeMgr.tokenData.email,
@@ -747,7 +793,7 @@ const server = http.createServer(async (req, res) => {
               timing: timingOut({ t_first_thought: usage.t_first_thought ?? null, t_first_text: usage.t_first_text ?? null }),
               ...dg,
             });
-          }, startTime, { notice });
+          }, startTime, { notice, ...(isOaiChat ? { includeUsage: rawParsed.stream_options?.include_usage === true } : {}) });
         } else {
           const googleData = await response.json();
           if (isOaiChat) {
@@ -818,6 +864,7 @@ const server = http.createServer(async (req, res) => {
             });
           } else {
             sendJson(res, 500, {
+              type: 'error',
               error: {
                 type: 'api_error',
                 message: err.message,

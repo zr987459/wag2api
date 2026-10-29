@@ -1,13 +1,17 @@
 /**
- * Real-time Google Antigravity Quota Telemetry Fetcher (v2 - strict)
+ * Real-time Google Antigravity Quota Telemetry Fetcher (v3 - enhanced)
  *
  * 核心原则：宁可显示 '--'，也绝不伪造 100%。
  * 1. 遍历全部模型条目，收集所有能识别到的真实配额数据（兼容多种字段形态）；
  * 2. 从 {limit, usage} / {remaining, total} / remainingFraction 精确计算百分比；
- * 3. Google 某桶无数据时返回 null，前端渲染为 '--'。
+ * 3. Protobuf JSON 省略值为 0 的字段：有 resetTime 缺 remainingFraction 时视为 0；
+ * 4. retrieveUserQuotaSummary 拿到第一个 2xx 即返回；
+ * 5. 分组识别：argon -> 'argon', claude/gpt/3p -> 'claude', gemini -> 'gemini'；
+ * 6. 动态 buckets 列表只含真实有数据的桶，并按 gemini, claude, argon (5h 在前) 排序；
+ * 7. loadCodeAssist 查询订阅等级 (ULTRA/PRO/FREE)，按 email 缓存 6 小时。
  */
 
-function parseResetTime(resetTimeStr) {
+export function parseResetTime(resetTimeStr) {
   if (!resetTimeStr) return null;
   try {
     const target = new Date(resetTimeStr).getTime();
@@ -28,7 +32,7 @@ function parseResetTime(resetTimeStr) {
 
 const WEEKLY_THRESHOLD_HOURS = 6;
 
-function hoursUntil(resetTimeStr) {
+export function hoursUntil(resetTimeStr) {
   if (!resetTimeStr) return -1;
   const t = new Date(resetTimeStr).getTime();
   return Number.isNaN(t) ? -1 : (t - Date.now()) / 3600000;
@@ -51,30 +55,35 @@ function rememberWeekly(email, family, bucket) {
 }
 
 /** 从一个 quota 条目里抽取数值。支持三种形态，找不到返回 null */
-function extractFromEntry(entry) {
+export function extractFromEntry(entry) {
   if (!entry || typeof entry !== 'object') return null;
   // 形态 A: remainingFraction
   if (typeof entry.remainingFraction === 'number' && entry.remainingFraction >= 0) {
     return { fraction: entry.remainingFraction, reset: entry.resetTime || entry.reset_time || null, source: 'remainingFraction' };
+  }
+  // 缺 remainingFraction 但有 resetTime 时视为 0（Protobuf JSON 耗尽时省略 0）
+  const reset = entry.resetTime || entry.reset_time || null;
+  if (reset && (entry.remainingFraction === undefined || entry.remainingFraction === null)) {
+    return { fraction: 0, reset, source: 'remainingFraction' };
   }
   // 形态 B: limit/usage
   const limit = entry.limit ?? entry.quotaLimit ?? entry.max;
   const usage = entry.usage ?? entry.consumed ?? entry.used;
   if (typeof limit === 'number' && limit > 0) {
     const u = typeof usage === 'number' ? usage : 0;
-    return { fraction: Math.max(0, Math.min(1, 1 - u / limit)), reset: entry.resetTime || entry.reset_time || null, source: 'limit-usage' };
+    return { fraction: Math.max(0, Math.min(1, 1 - u / limit)), reset, source: 'limit-usage' };
   }
   // 形态 C: remaining/total
   const total = entry.total ?? entry.quotaTotal;
   const remaining = entry.remaining ?? entry.remainingQuota;
   if (typeof total === 'number' && total > 0 && typeof remaining === 'number') {
-    return { fraction: Math.max(0, Math.min(1, remaining / total)), reset: entry.resetTime || entry.reset_time || null, source: 'remaining-total' };
+    return { fraction: Math.max(0, Math.min(1, remaining / total)), reset, source: 'remaining-total' };
   }
   return null;
 }
 
 /** 判断一个 limit 条目属于周窗口还是短窗口 */
-function isWeeklyEntry(entry) {
+export function isWeeklyEntry(entry) {
   const text = JSON.stringify({
     name: entry?.name, type: entry?.type, window: entry?.window,
     period: entry?.period, interval: entry?.interval, id: entry?.id,
@@ -83,10 +92,10 @@ function isWeeklyEntry(entry) {
 }
 
 /** 收集一个模型条目下所有真实配额 */
-function collectModelQuotas(model, family) {
+export function collectModelQuotas(model, family) {
   const out = {
-    [family === 'gemini' ? 'gemini_5h' : 'claude_5h']: null,
-    [family === 'gemini' ? 'gemini_7d' : 'claude_7d']: null,
+    [`${family}_5h`]: null,
+    [`${family}_7d`]: null,
   };
   const consider = (entry, forcedWeekly) => {
     if (!entry) return;
@@ -95,7 +104,7 @@ function collectModelQuotas(model, family) {
     let weekly = forcedWeekly ?? (entry && typeof entry === 'object' ? isWeeklyEntry(entry) : false);
     // 推算：短窗口最长 5 小时，若 resetTime 超过 6 小时，说明触发了周限额，按周窗口处理
     if (!weekly && hoursUntil(r.reset) > WEEKLY_THRESHOLD_HOURS) weekly = true;
-    const key = weekly ? (family === 'gemini' ? 'gemini_7d' : 'claude_7d') : (family === 'gemini' ? 'gemini_5h' : 'claude_5h');
+    const key = `${family}_${weekly ? '7d' : '5h'}`;
     // 同桶多窗口取"最紧"的 (remaining 最小的)，防止高估
     if (!out[key] || r.fraction < out[key].fraction) out[key] = r;
   };
@@ -109,27 +118,206 @@ function collectModelQuotas(model, family) {
   return out;
 }
 
-function toPublic(r) {
+/** 将模型列表中的 quota 合并，忽略 chat_xxx、tab_xxx 等内部条目 */
+export function mergeModelQuotas(models) {
+  const merged = {
+    gemini_5h: null, gemini_7d: null,
+    claude_5h: null, claude_7d: null,
+    argon_5h: null, argon_7d: null,
+  };
+  if (!models || typeof models !== 'object') return merged;
+
+  const entries = Array.isArray(models) ? models.entries() : Object.entries(models);
+  for (const [modelKey, model] of entries) {
+    if (!model || typeof model !== 'object') continue;
+    const name = String(model?.name || modelKey || '').toLowerCase();
+    // 忽略 chat_xxx、tab_xxx 内部条目
+    if (/^(chat_|tab_)/.test(name)) continue;
+
+    let family = null;
+    if (name.includes('argon')) family = 'argon';
+    else if (/claude|gpt|3p/.test(name)) family = 'claude';
+    else if (name.includes('gemini')) family = 'gemini';
+    if (!family) continue;
+
+    const found = collectModelQuotas(model, family);
+    for (const key of Object.keys(merged)) {
+      if (found[key]) {
+        if (!merged[key] || found[key].fraction < merged[key].fraction) merged[key] = found[key];
+      }
+    }
+  }
+  return merged;
+}
+
+/** 解析 retrieveUserQuotaSummary 响应 */
+export function parseSummary(body) {
+  const d = body?.response || body || {};
+  const out = {};
+  const buckets = [];
+  for (const g of d?.groups || []) {
+    for (const b of g?.buckets || []) {
+      buckets.push({ ...b, _group: String(g.displayName || '').toLowerCase() });
+    }
+  }
+  for (const b of d?.buckets || []) {
+    buckets.push(b);
+  }
+  for (const b of buckets) {
+    const id = String(b.bucketId || b.bucket_id || '').toLowerCase();
+    const groupName = String(b._group || '').toLowerCase();
+    const combined = `${groupName} ${id}`;
+
+    // 分组识别：组名/bucketId 含 argon → 'argon'；含 claude|gpt|3p → 'claude'；否则含 gemini 或其它 → 'gemini'
+    let family = 'gemini';
+    if (combined.includes('argon')) {
+      family = 'argon';
+    } else if (/claude|gpt|3p/.test(combined)) {
+      family = 'claude';
+    } else {
+      family = 'gemini';
+    }
+
+    const win = String(b.window || id.split('-').pop() || '').toLowerCase();
+    let per = /week|7d|168h|wk/.test(win) ? '7d' : /5h|five|300m/.test(win) ? '5h' : null;
+    const reset = b.resetTime || b.reset_time || null;
+    if (!per && reset) {
+      const hrs = hoursUntil(reset);
+      if (hrs > WEEKLY_THRESHOLD_HOURS) per = '7d';
+      else if (hrs >= 0) per = '5h';
+    }
+    if (!per) continue;
+
+    // 有 resetTime 但缺 remainingFraction 时视为 0
+    let frac = b.remainingFraction ?? b.remaining_fraction ?? b.remaining?.remainingFraction;
+    if (frac === undefined || frac === null) {
+      if (reset) {
+        frac = 0;
+      }
+    }
+    if (typeof frac !== 'number') continue;
+
+    const fraction = Math.max(0, Math.min(1, frac));
+    const key = `${family}_${per}`;
+    // 保留最紧配额，避免单端点缺失被空值覆盖
+    if (!out[key] || (out[key].fraction !== null && fraction < out[key].fraction)) {
+      out[key] = { fraction, reset, source: 'summary' };
+    }
+  }
+  return out;
+}
+
+export function toPublic(r) {
   if (!r) return null;
   return {
     remaining_fraction: r.fraction,
     percentage: typeof r.fraction === 'number' ? Math.round(r.fraction * 100) : null,
-    inferred: !!r.inferred,
-    reset_time: r.reset,
-    reset_text: parseResetTime(r.reset) || '动态自适应',
-    source: r.source,
+    inferred: !r.inferred ? false : true,
+    reset_time: r.reset || null,
+    reset_text: parseResetTime(r.reset) || '',
+    source: r.source || null,
   };
 }
 
-/** 官方 /usage 用的分组配额（含周额度）：groups[].buckets[] { bucketId: gemini-weekly / gemini-5h / 3p-weekly / 3p-5h } */
-async function fetchQuotaSummary(accessToken, project) {
-  // 必须优先使用 Google 官方生产端点，测试/金丝雀端点近期已被 Google 拆分，只返回 Claude 组缺失 Gemini 组
+const BUCKET_SPECS = [
+  { key: 'gemini_5h', group: 'gemini', label: 'Gemini', window: '5h' },
+  { key: 'gemini_7d', group: 'gemini', label: 'Gemini', window: '7d' },
+  { key: 'claude_5h', group: 'claude', label: 'Claude / GPT', window: '5h' },
+  { key: 'claude_7d', group: 'claude', label: 'Claude / GPT', window: '7d' },
+  { key: 'argon_5h',  group: 'argon',  label: 'Argon', window: '5h' },
+  { key: 'argon_7d',  group: 'argon',  label: 'Argon', window: '7d' },
+];
+
+/** 构建动态 buckets 列表：只包含真实拿到数据的桶，按 gemini, claude, argon，5h 在前排序 */
+export function buildBuckets(merged) {
+  if (!merged || typeof merged !== 'object') return [];
+  const buckets = [];
+  for (const spec of BUCKET_SPECS) {
+    const item = merged[spec.key];
+    if (!item || typeof item !== 'object') continue;
+    const fraction = item.remaining_fraction !== undefined ? item.remaining_fraction : item.fraction;
+    if (typeof fraction !== 'number') continue;
+
+    const percentage = item.percentage !== undefined
+      ? item.percentage
+      : Math.round(fraction * 100);
+    const resetTime = item.reset_time !== undefined ? item.reset_time : (item.reset || null);
+    const resetText = item.reset_text !== undefined ? item.reset_text : (parseResetTime(resetTime) || '');
+    const source = item.source || null;
+    const inferred = Boolean(item.inferred);
+
+    buckets.push({
+      group: spec.group,
+      label: spec.label,
+      window: spec.window,
+      percentage,
+      remaining_fraction: fraction,
+      reset_time: resetTime,
+      reset_text: resetText,
+      source,
+      inferred,
+    });
+  }
+  return buckets;
+}
+
+/** 归一化订阅等级：ULTRA | PRO | FREE | null */
+export function normalizeTier(id) {
+  if (!id || typeof id !== 'string') return null;
+  const s = id.toLowerCase();
+  if (s.includes('ultra')) return 'ULTRA';
+  if (s.includes('pro')) return 'PRO';
+  if (s.includes('free') || s.includes('standard') || s.includes('legacy')) return 'FREE';
+  return null;
+}
+
+const TIER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+export const tierCache = new Map(); // email -> { tier, expireAt }
+
+export async function fetchSubscriptionTier(accessToken, email) {
+  if (!accessToken) return null;
+  if (email && tierCache.has(email)) {
+    const cached = tierCache.get(email);
+    if (cached && cached.expireAt > Date.now()) return cached.tier;
+  }
   const bases = [
     'https://cloudcode-pa.googleapis.com',
     'https://daily-cloudcode-pa.googleapis.com',
-    'https://daily-cloudcode-pa.sandbox.googleapis.com'
   ];
-  const out = {};
+  for (const base of bases) {
+    try {
+      const res = await fetch(`${base}/v1internal:loadCodeAssist`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'antigravity/1.10.2 linux/arm64',
+        },
+        body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) continue;
+      const d = await res.json();
+      const body = d?.response || d;
+      const rawId = body?.paidTier?.id || body?.currentTier?.id || body?.tier?.id || '';
+      const tier = normalizeTier(rawId);
+      if (email) {
+        tierCache.set(email, { tier, expireAt: Date.now() + TIER_CACHE_TTL_MS });
+      }
+      return tier;
+    } catch (e) {}
+  }
+  return null;
+}
+
+/** 官方 /usage 用的分组配额（含周额度）：groups[].buckets[] */
+export async function fetchQuotaSummary(accessToken, project) {
+  // 端点顺序：daily → prod → sandbox；拿到第一个 2xx 即返回
+  const bases = [
+    'https://daily-cloudcode-pa.googleapis.com',
+    'https://cloudcode-pa.googleapis.com',
+    'https://daily-cloudcode-pa.sandbox.googleapis.com',
+  ];
   for (const base of bases) {
     try {
       const res = await fetch(`${base}/v1internal:retrieveUserQuotaSummary`, {
@@ -137,54 +325,58 @@ async function fetchQuotaSummary(accessToken, project) {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/1.10.2 linux/arm64'
+          'User-Agent': 'antigravity/1.10.2 linux/arm64',
         },
         body: JSON.stringify(project ? { project } : {}),
         signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) continue;
       const d = await res.json();
-      const body = d?.response || d;
-      const buckets = [];
-      for (const g of body?.groups || []) for (const b of g?.buckets || []) buckets.push({ ...b, _group: String(g.displayName || '').toLowerCase() });
-      for (const b of body?.buckets || []) buckets.push(b);
-      for (const b of buckets) {
-        const id = String(b.bucketId || b.bucket_id || '').toLowerCase();
-        const win = String(b.window || id.split('-').pop() || '').toLowerCase();
-        const frac = b.remainingFraction ?? b.remaining_fraction ?? b.remaining?.remainingFraction;
-        if (typeof frac !== 'number') continue;
-        const fam = /gemini/.test(id + b._group) ? 'gemini' : 'claude';
-        const per = /week|7d|168h|wk/.test(win) ? '7d' : /5h|five|300m/.test(win) ? '5h' : null;
-        if (!per) continue;
-        const key = `${fam}_${per}`;
-        // 保留最权威/更紧配额，避免单端点缺失被空值覆盖
-        if (!out[key] || (out[key].fraction !== null && frac < out[key].fraction)) {
-          out[key] = { fraction: Math.max(0, Math.min(1, frac)), reset: b.resetTime || b.reset_time || null, source: 'summary' };
-        }
-      }
-      // 只有当 4 个核心配额桶（Gemini 5H/7D + Claude 5H/7D）全部齐备才提前返回，否则继续向后补齐
-      if (out.gemini_5h && out.gemini_7d && out.claude_5h && out.claude_7d) return out;
+      const summary = parseSummary(d);
+      return Object.keys(summary).length ? summary : null;
     } catch (e) {}
   }
-  return Object.keys(out).length ? out : null;
+  return null;
 }
 
 export async function fetchRealQuota(tokenManager) {
   if (!tokenManager || !tokenManager.tokenData?.refreshToken) {
-    return { ok: false, message: '尚未配置 Google 账号', email: '未登录',
-      gemini_5h: null, gemini_7d: null, claude_5h: null, claude_7d: null,
-      updated_time: new Date().toLocaleTimeString() };
+    return {
+      ok: false,
+      message: '尚未配置 Google 账号',
+      email: '未登录',
+      tier: null,
+      gemini_5h: null, gemini_7d: null,
+      claude_5h: null, claude_7d: null,
+      argon_5h: null, argon_7d: null,
+      buckets: [],
+      updated_time: new Date().toLocaleTimeString(),
+    };
   }
 
   const accessToken = await tokenManager.getValidAccessToken();
   if (!accessToken) {
-    return { ok: false, message: 'Google 凭据失效', email: tokenManager.tokenData.email,
-      gemini_5h: null, gemini_7d: null, claude_5h: null, claude_7d: null,
-      updated_time: new Date().toLocaleTimeString() };
+    return {
+      ok: false,
+      message: 'Google 凭据失效',
+      email: tokenManager.tokenData.email,
+      tier: null,
+      gemini_5h: null, gemini_7d: null,
+      claude_5h: null, claude_7d: null,
+      argon_5h: null, argon_7d: null,
+      buckets: [],
+      updated_time: new Date().toLocaleTimeString(),
+    };
   }
 
   try {
     const { CLOUDCODE_API_ENDPOINT, ANTIGRAVITY_ENDPOINT_DAILY } = await import('./constants.mjs');
+    let project = tokenManager.tokenData.projectId || '';
+    if (!project && typeof tokenManager.ensureProjectId === 'function') {
+      project = await tokenManager.ensureProjectId().catch(() => '');
+    }
+    const validProj = (project && project !== 'pending_detection') ? project : '';
+
     // 先试 DAILY(配额字段更全)，失败回退 PROD
     const endpoints = [ANTIGRAVITY_ENDPOINT_DAILY, CLOUDCODE_API_ENDPOINT];
     let data = null;
@@ -198,7 +390,7 @@ export async function fetchRealQuota(tokenManager) {
             'Content-Type': 'application/json',
             'User-Agent': 'antigravity/1.10.2 linux/arm64',
           },
-          body: JSON.stringify({}),
+          body: JSON.stringify(validProj ? { project: validProj } : {}),
           signal: AbortSignal.timeout(15000),
         });
         if (res.ok) { data = await res.json(); break; }
@@ -208,28 +400,11 @@ export async function fetchRealQuota(tokenManager) {
     if (!data) throw lastErr || new Error('all quota endpoints unreachable');
 
     const models = data?.models || data || {};
-    const merged = { gemini_5h: null, gemini_7d: null, claude_5h: null, claude_7d: null };
-
-    // 遍历全部模型条目，同家族多模型取"最紧"窗口
-    for (const [modelKey, model] of Object.entries(models)) {
-      const name = String(model?.name || modelKey || '').toLowerCase();
-      let family = null;
-      if (name.includes('gemini')) family = 'gemini';
-      else if (name.includes('claude')) family = 'claude';
-      if (!family) continue;
-      const found = collectModelQuotas(model, family);
-      for (const key of Object.keys(merged)) {
-        if (found[key]) {
-          if (!merged[key] || found[key].fraction < merged[key].fraction) merged[key] = found[key];
-        }
-      }
-    }
+    const merged = mergeModelQuotas(models);
 
     // 周额度 / 5 小时额度以官方分组接口为准（fetchAvailableModels 不带周额度）
     try {
-      let project = tokenManager.tokenData.projectId || '';
-      if (!project && typeof tokenManager.ensureProjectId === 'function') project = await tokenManager.ensureProjectId().catch(() => '');
-      const sum = await fetchQuotaSummary(accessToken, project && project !== 'pending_detection' ? project : '');
+      const sum = await fetchQuotaSummary(accessToken, validProj);
       if (sum) {
         for (const k of Object.keys(sum)) {
           if (sum[k]) merged[k] = sum[k];
@@ -240,14 +415,25 @@ export async function fetchRealQuota(tokenManager) {
     const email = tokenManager.tokenData.email || 'default';
     merged.gemini_7d = rememberWeekly(email, 'gemini', merged.gemini_7d);
     merged.claude_7d = rememberWeekly(email, 'claude', merged.claude_7d);
+    merged.argon_7d = rememberWeekly(email, 'argon', merged.argon_7d);
+
+    // 订阅等级：异步非阻塞，失败不影响额度
+    let tier = null;
+    try {
+      tier = await fetchSubscriptionTier(accessToken, email);
+    } catch (e) {}
 
     const result = {
       ok: true,
       email: tokenManager.tokenData.email,
+      tier,
       gemini_5h: toPublic(merged.gemini_5h),
       gemini_7d: toPublic(merged.gemini_7d),
       claude_5h: toPublic(merged.claude_5h),
       claude_7d: toPublic(merged.claude_7d),
+      argon_5h: toPublic(merged.argon_5h),
+      argon_7d: toPublic(merged.argon_7d),
+      buckets: buildBuckets(merged),
       updated_unix: Math.floor(Date.now() / 1000),
       updated_time: new Date().toLocaleTimeString(),
     };
@@ -262,7 +448,11 @@ export async function fetchRealQuota(tokenManager) {
       ok: false,
       message: err.message,
       email: tokenManager.tokenData.email,
-      gemini_5h: null, gemini_7d: null, claude_5h: null, claude_7d: null,
+      tier: null,
+      gemini_5h: null, gemini_7d: null,
+      claude_5h: null, claude_7d: null,
+      argon_5h: null, argon_7d: null,
+      buckets: [],
       five_hour: { percentage: null, reset_time: null },
       claude_five_hour: { percentage: null, reset_time: null },
       weekly: { percentage: null },

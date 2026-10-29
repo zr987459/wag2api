@@ -25,11 +25,17 @@ function partToAnthropic(p) {
   if (p.type === 'image_url') {
     const url = isObj(p.image_url) ? str(p.image_url, 'url') : str(p, 'image_url');
     if (!url) return null;
-    const m = /^data:([^;]+);base64,(.+)$/i.exec(url);
+    // data URI 允许 base64 前带其它参数（如 data:image/png;name=a.png;base64,...）
+    const m = /^data:([^;,]+)(?:;[^,]*)?;base64,(.+)$/is.exec(url);
     if (m) {
       return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
     }
     return { type: 'image', source: { type: 'url', url } };
+  }
+  // OpenAI 文件块（PDF 等）：file.file_data 为 data URI → Anthropic document 块
+  if (p.type === 'file' && isObj(p.file)) {
+    const m = /^data:([^;,]+)(?:;[^,]*)?;base64,(.+)$/is.exec(str(p.file, 'file_data'));
+    if (m) return { type: 'document', source: { type: 'base64', media_type: m[1], data: m[2] } };
   }
   return null;
 }
@@ -96,8 +102,9 @@ export function openaiRequestToAnthropic(oai) {
   else if (typeof oai.stop === 'string' && oai.stop) out.stop_sequences = [oai.stop];
 
   // 思考预算映射 (reasoning_effort: low / medium / high)
-  if (oai.reasoning_effort) {
-    const budgetMap = { low: 2048, medium: 8192, high: 24576 };
+  // none：不开启思考；minimal：最低档（映射到 low 档，而不是落到默认的 medium 档）
+  if (oai.reasoning_effort && String(oai.reasoning_effort) !== 'none') {
+    const budgetMap = { minimal: 1024, low: 2048, medium: 8192, high: 24576, xhigh: 24576 };
     const budget = budgetMap[String(oai.reasoning_effort)] || 4096;
     out.thinking = { type: 'enabled', budget_tokens: budget };
     if (out.max_tokens && out.max_tokens <= budget) {
@@ -130,7 +137,10 @@ export function openaiRequestToAnthropic(oai) {
     if (role === 'tool' || role === 'function') {
       const id = str(m, 'tool_call_id') || str(m, 'name');
       let result = m.content;
-      if (typeof result !== 'string') {
+      // content 为分段数组时只拼接文本段，而不是把整个数组 JSON 序列化给模型
+      if (Array.isArray(result) && result.every(p => typeof p === 'string' || (isObj(p) && p.type === 'text'))) {
+        result = result.map(p => (typeof p === 'string' ? p : str(p, 'text'))).join('\n');
+      } else if (typeof result !== 'string') {
         try { result = JSON.stringify(result); } catch (e) { result = String(result); }
       }
       const block = { type: 'tool_result', tool_use_id: id || newId('toolu_'), content: result == null ? '' : result };
@@ -178,12 +188,19 @@ export function openaiRequestToAnthropic(oai) {
       if (tc === 'auto') out.tool_choice = { type: 'auto' };
       else if (tc === 'required') out.tool_choice = { type: 'any' };
       else if (tc === 'none') out.tool_choice = { type: 'none' };
-    } else if (isObj(tc) && tc.type === 'function' && isObj(tc.function)) {
-      out.tool_choice = { type: 'tool', name: str(tc.function, 'name') };
+    } else if (isObj(tc) && tc.type === 'function' && (isObj(tc.function) || tc.name)) {
+      out.tool_choice = { type: 'tool', name: isObj(tc.function) ? str(tc.function, 'name') : str(tc, 'name') };
     }
   }
 
   return out;
+}
+
+/** Gemini finishReason → OpenAI finish_reason（工具调用优先，由调用方处理） */
+function mapFinishReason(fr) {
+  if (fr === 'MAX_TOKENS') return 'length';
+  if (fr === 'SAFETY' || fr === 'RECITATION' || fr === 'PROHIBITED_CONTENT' || fr === 'BLOCKLIST' || fr === 'SPII') return 'content_filter';
+  return null;
 }
 
 /**
@@ -191,13 +208,14 @@ export function openaiRequestToAnthropic(oai) {
  */
 function toOpenAIUsage(normUsage) {
   const input = normUsage?.input_tokens || 0;
+  // 注意：normalizeGeminiUsage 的 output_tokens 已经【包含】思考 token，不能再加一次 reasoning
   const output = normUsage?.output_tokens || 0;
   const cached = normUsage?.cached_tokens || 0;
   const reasoning = normUsage?.thoughts_tokens || 0;
   return {
     prompt_tokens: input + cached,
-    completion_tokens: output + reasoning,
-    total_tokens: input + cached + output + reasoning,
+    completion_tokens: output,
+    total_tokens: input + cached + output,
     prompt_tokens_details: { cached_tokens: cached },
     completion_tokens_details: { reasoning_tokens: reasoning },
   };
@@ -254,7 +272,7 @@ export function convertGoogleToOpenAI(googleResponse, clientModel) {
 
   let finishReason = 'stop';
   if (toolCalls.length) finishReason = 'tool_calls';
-  else if (candidate?.finishReason === 'MAX_TOKENS') finishReason = 'length';
+  else finishReason = mapFinishReason(candidate?.finishReason) || 'stop';
 
   const normUsage = normalizeGeminiUsage(inner.usageMetadata);
   const response = {
@@ -277,7 +295,7 @@ export function convertGoogleToOpenAI(googleResponse, clientModel) {
 /**
  * 将 Google 原生 SSE 流实时转换为标准 OpenAI SSE 流（支持 delta.reasoning_content 与真实的签名继承）
  */
-export async function handleOpenAIStreamConversion(upstreamRes, clientRes, originalModel, onFinish = null, startTime = Date.now(), { notice = null } = {}) {
+export async function handleOpenAIStreamConversion(upstreamRes, clientRes, originalModel, onFinish = null, startTime = Date.now(), { notice = null, includeUsage = true } = {}) {
   let noticePending = Boolean(notice);
   clientRes.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   clientRes.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -382,8 +400,9 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
         }
 
         const candidate = inner?.candidates?.[0];
-        if (candidate?.finishReason === 'MAX_TOKENS') {
-          stopReason = 'length';
+        const mappedFinish = mapFinishReason(candidate?.finishReason);
+        if (mappedFinish && stopReason !== 'tool_calls') {
+          stopReason = mappedFinish;
         }
         const parts = candidate?.content?.parts || [];
 
@@ -460,12 +479,15 @@ export async function handleOpenAIStreamConversion(upstreamRes, clientRes, origi
       sendChunk({ role: 'assistant', content: '' }, null);
     }
 
-    // 发送带有 finish_reason 的闭合 chunk
-    sendChunk({}, stopReason);
-
-    // 发送最终的 usage 帧
     const norm = usageNow();
-    if (!clientGone) {
+    // stream_options.include_usage=true：按 OpenAI 规范单独发一个 choices:[] 的 usage 帧；
+    // 未要求时不发空 choices 帧（部分客户端会直接取 choices[0] 崩溃），usage 挂在 finish_reason 帧上
+    sendChunk({}, stopReason, includeUsage ? {} : { usage: toOpenAIUsage(norm) });
+
+    if (!clientGone && !includeUsage) {
+      clientRes.write('data: [DONE]\n\n');
+      clientRes.flush?.();
+    } else if (!clientGone) {
       const usagePayload = {
         id: completionId,
         object: 'chat.completion.chunk',

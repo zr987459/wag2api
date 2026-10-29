@@ -23,6 +23,7 @@ export class AccountPool {
     this.activeEmail = '';     // 兼容老字段
     this.selectedEmail = '';   // 手动指定的账号，为空表示自动智能调度
     this.cooldownUntil = new Map(); // email -> expireTimestamp
+    this.validationBlocks = new Map(); // email -> { reason, url, until }
     this.sessionAffinity = new Map(); // sessionKey -> { email, expireAt }
     this.lastUsed = new Map(); // email -> timestamp
     this.init();
@@ -99,6 +100,7 @@ export class AccountPool {
       try { this.managers.get(clean).stopKeepAlive?.(); } catch (e) {}
       this.managers.delete(clean);
       this.cooldownUntil.delete(clean);
+      this.validationBlocks.delete(clean);
       this.lastUsed.delete(clean);
 
       // 清理 sessionAffinity 中的该账号
@@ -131,6 +133,7 @@ export class AccountPool {
     this.activeEmail = '';
     this.selectedEmail = '';
     this.cooldownUntil.clear();
+    this.validationBlocks.clear();
     this.sessionAffinity.clear();
     this.lastUsed.clear();
     if (fs.existsSync(this.accountsDir)) {
@@ -173,6 +176,54 @@ export class AccountPool {
     this.cooldownUntil.clear();
   }
 
+  // 验证封禁管理
+  markValidationBlocked(email, reason = '', url = '', ms = 10 * 60 * 1000) {
+    const clean = (email || '').trim();
+    if (!clean) return;
+    const until = Date.now() + ms;
+    this.validationBlocks.set(clean, {
+      reason: String(reason || ''),
+      url: String(url || ''),
+      until,
+    });
+    console.warn(`[AccountPool] 账号 ${clean} 进入人工验证封禁 (${Math.round(ms / 1000)}秒)`);
+  }
+
+  isValidationBlocked(email) {
+    const clean = (email || '').trim();
+    const info = this.validationBlocks.get(clean);
+    if (!info) return false;
+    if (Date.now() >= info.until) {
+      this.validationBlocks.delete(clean);
+      return false;
+    }
+    return true;
+  }
+
+  clearValidationBlocked(email) {
+    const clean = (email || '').trim();
+    this.validationBlocks.delete(clean);
+  }
+
+  validationInfo(email) {
+    const clean = (email || '').trim();
+    const info = this.validationBlocks.get(clean);
+    if (!info || Date.now() >= info.until) {
+      if (info) this.validationBlocks.delete(clean);
+      return { blocked: false, reason: '', url: '', until: 0 };
+    }
+    return {
+      blocked: true,
+      reason: info.reason,
+      url: info.url,
+      until: info.until,
+    };
+  }
+
+  clearAllValidationBlocks() {
+    this.validationBlocks.clear();
+  }
+
   // 调度设置
   getSelectedEmail() { return this.selectedEmail; }
   setSelectedEmail(email) {
@@ -211,7 +262,7 @@ export class AccountPool {
     if (this.managers.size === 0) return null;
 
     const allEmails = Array.from(this.managers.keys());
-    const usableEmails = allEmails.filter(e => !exclude.has(e));
+    const usableEmails = allEmails.filter(e => !exclude.has(e) && !this.isValidationBlocked(e));
     if (!usableEmails.length) return null;
 
     // 1. 如果管理员手动锁定了某账号，且该账号未被排除、未冷却：优先使用
@@ -260,7 +311,7 @@ export class AccountPool {
       return this.managers.get(chosenEmail);
     }
 
-    return this.getActiveManager();
+    return null;
   }
 
   getActiveManager() {
@@ -299,14 +350,20 @@ export class AccountPool {
   }
 
   poolStatus() {
-    return Array.from(this.managers.entries()).map(([email, tm]) => ({
-      email,
-      cooling: this.isCooling(email),
-      cooldown_sec: this.cooldownRemainSec(email),
-      last_used: this.lastUsed.get(email) || 0,
-      isActive: email === (this.selectedEmail || this.activeEmail),
-      ...tm.getStatus(),
-    }));
+    return Array.from(this.managers.entries()).map(([email, tm]) => {
+      const vInfo = this.validationInfo(email);
+      return {
+        email,
+        cooling: this.isCooling(email),
+        cooldown_sec: this.cooldownRemainSec(email),
+        last_used: this.lastUsed.get(email) || 0,
+        isActive: email === (this.selectedEmail || this.activeEmail),
+        validation_blocked: vInfo.blocked,
+        validation_url: vInfo.url,
+        validation_reason: vInfo.reason,
+        ...tm.getStatus(),
+      };
+    });
   }
 
   getAllStatus() {

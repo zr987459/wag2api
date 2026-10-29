@@ -23,7 +23,77 @@ function toGoogleType(type) {
   return typeMap[type.toLowerCase()] || type.toUpperCase();
 }
 
-export function sanitizeSchema(schema) {
+const isPlainObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** 解析 #/$defs/X、#/definitions/X 这类本地 $ref；解析不到返回 undefined */
+function resolveRef(ref, root) {
+  if (typeof ref !== 'string' || !ref.startsWith('#/')) return undefined;
+  let cur = root;
+  for (const seg of ref.slice(2).split('/')) {
+    const key = seg.replace(/~1/g, '/').replace(/~0/g, '~');
+    if (!isPlainObj(cur) || !(key in cur)) return undefined;
+    cur = cur[key];
+  }
+  return isPlainObj(cur) ? cur : undefined;
+}
+
+/**
+ * 预展开 Gemini 不支持的组合语法（只在出现这些关键字时改写，其它 schema 输出与之前逐字节一致）：
+ *  - $ref → 内联 $defs / definitions 中的定义（循环引用降级为 object，解析不到降级为 string）
+ *  - allOf → 合并各分支的 properties / required / type
+ *  - anyOf / oneOf（且无 type）→ 取第一个非 null 分支（如 Optional[str] 的 [{type:string},{type:null}] → string）
+ *  - type: ["string","null"] → 第一个非 null 类型
+ * 此前这些写法会被白名单直接丢掉，字段退化成带 _empty 占位的 OBJECT，模型会传错类型。
+ */
+function flattenCombinators(schema, root, refStack) {
+  let node = schema;
+  if (typeof node.$ref === 'string') {
+    const { $ref, ...rest } = node;
+    if (refStack.includes($ref)) {
+      node = { type: 'object', ...(rest.description ? { description: rest.description } : {}) };
+    } else {
+      const target = resolveRef($ref, root);
+      if (!target) {
+        node = { type: 'string', description: rest.description || `(Unresolved $ref: ${$ref})` };
+      } else {
+        refStack = [...refStack, $ref];
+        node = flattenCombinators({ ...target, ...rest }, root, refStack).node;
+      }
+    }
+  }
+  if (Array.isArray(node.allOf)) {
+    const { allOf, ...rest } = node;
+    const merged = { ...rest };
+    for (const branch of allOf) {
+      if (!isPlainObj(branch)) continue;
+      const b = flattenCombinators(branch, root, refStack).node;
+      if (isPlainObj(b.properties)) merged.properties = { ...(merged.properties || {}), ...b.properties };
+      if (Array.isArray(b.required)) merged.required = [...new Set([...(merged.required || []), ...b.required])];
+      for (const [k, v] of Object.entries(b)) {
+        if (k !== 'properties' && k !== 'required' && merged[k] === undefined) merged[k] = v;
+      }
+    }
+    node = merged;
+  }
+  const union = Array.isArray(node.anyOf) ? node.anyOf : Array.isArray(node.oneOf) ? node.oneOf : null;
+  if (union) {
+    const { anyOf, oneOf, ...rest } = node;
+    node = rest;
+    if (rest.type === undefined) {
+      const branches = union.filter(isPlainObj).map(b => flattenCombinators(b, root, refStack).node);
+      const pick = branches.find(b => b.type !== 'null' && !(Array.isArray(b.type) && b.type.every(t => t === 'null')));
+      if (pick) {
+        node = { ...pick, ...rest };
+      }
+    }
+  }
+  if (Array.isArray(node.type)) {
+    node = { ...node, type: node.type.find(t => typeof t === 'string' && t !== 'null') || 'string' };
+  }
+  return { node, refStack };
+}
+
+export function sanitizeSchema(schema, _root = schema, _refStack = []) {
   if (!schema || typeof schema !== 'object') {
     return {
       type: 'OBJECT',
@@ -44,6 +114,10 @@ export function sanitizeSchema(schema) {
     'title'
   ]);
 
+  if ('$ref' in schema || 'allOf' in schema || 'anyOf' in schema || 'oneOf' in schema || Array.isArray(schema.type)) {
+    ({ node: schema, refStack: _refStack } = flattenCombinators(schema, _root, _refStack));
+  }
+
   const sanitized = {};
 
   for (const [key, value] of Object.entries(schema)) {
@@ -63,16 +137,16 @@ export function sanitizeSchema(schema) {
       sanitized.properties = {};
       const sortedPropKeys = Object.keys(value).sort();
       for (const propKey of sortedPropKeys) {
-        sanitized.properties[propKey] = sanitizeSchema(value[propKey]);
+        sanitized.properties[propKey] = sanitizeSchema(value[propKey], _root, _refStack);
       }
     } else if (key === 'items' && value && typeof value === 'object') {
       if (Array.isArray(value)) {
-        sanitized.items = value.map(item => sanitizeSchema(item));
+        sanitized.items = value.map(item => sanitizeSchema(item, _root, _refStack));
       } else {
-        sanitized.items = sanitizeSchema(value);
+        sanitized.items = sanitizeSchema(value, _root, _refStack);
       }
     } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      sanitized[key] = sanitizeSchema(value);
+      sanitized[key] = sanitizeSchema(value, _root, _refStack);
     } else {
       sanitized[key] = value;
     }

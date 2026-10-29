@@ -4,6 +4,7 @@
 
 import crypto from 'crypto';
 import { convertAnthropicToGoogle } from './content-converter.mjs';
+import { sanitizeSchema } from './schema-sanitizer.mjs';
 import { resolveSessionId } from './session-router.mjs';
 
 // 稳定会话 ID：Antigravity 的提示缓存按「账号 + sessionId」划分，同一对话必须每轮带同一个 sessionId 才能命中。
@@ -80,6 +81,27 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
     maxOutputTokens: anthropicRequest.max_tokens || 8192,
     temperature: anthropicRequest.temperature ?? 0.7,
   };
+  const isClaudeUpstream = /claude/i.test(upstreamModel);
+  // 采样参数：客户端有就传，没有就不传（不传时 payload 与之前字节一致）
+  if (typeof anthropicRequest.top_p === 'number') generationConfig.topP = anthropicRequest.top_p;
+  if (typeof anthropicRequest.top_k === 'number') generationConfig.topK = anthropicRequest.top_k;
+  // 停止序列：Gemini 最多 5 个；Claude-on-AG 不下发（与 Antigravity-Manager 一致）
+  if (!isClaudeUpstream && Array.isArray(anthropicRequest.stop_sequences)) {
+    const stops = anthropicRequest.stop_sequences.filter(x => typeof x === 'string' && x).slice(0, 5);
+    if (stops.length) generationConfig.stopSequences = stops;
+  }
+  // 结构化输出：OpenAI response_format / Anthropic output_format(output_config.format) → responseMimeType + responseSchema
+  // Claude-on-AG 不支持 responseMimeType，跳过
+  const fmt = anthropicRequest.response_format || anthropicRequest.output_format || anthropicRequest.output_config?.format;
+  if (!isClaudeUpstream && fmt && typeof fmt === 'object') {
+    if (fmt.type === 'json_object') {
+      generationConfig.responseMimeType = 'application/json';
+    } else if (fmt.type === 'json_schema') {
+      generationConfig.responseMimeType = 'application/json';
+      const schema = fmt.json_schema?.schema || fmt.schema;
+      if (schema && typeof schema === 'object') generationConfig.responseSchema = sanitizeSchema(schema);
+    }
+  }
 
   // 思考模式配置 (支持 Anthropic Extended Thinking 规范及模型自带思考)
   const isHighReasoning = anthropicRequest.model && (
@@ -143,6 +165,16 @@ export function buildCloudCodePayload(anthropicRequest, project = '') {
         mode: isClaude ? 'VALIDATED' : 'AUTO',
       },
     };
+    // tool_choice（Anthropic 结构；OpenAI 的已在转换器里归一）：none/any/tool 显式映射，auto 或未传保持默认
+    const tc = anthropicRequest.tool_choice;
+    const tcType = typeof tc === 'string' ? tc : tc?.type;
+    if (tcType === 'none') {
+      request.toolConfig.functionCallingConfig = { mode: 'NONE' };
+    } else if (tcType === 'any' || tcType === 'required') {
+      request.toolConfig.functionCallingConfig = { mode: 'ANY' };
+    } else if (tcType === 'tool' && tc.name) {
+      request.toolConfig.functionCallingConfig = { mode: 'ANY', allowedFunctionNames: [String(tc.name)] };
+    }
   }
 
   request.sessionId = resolveSessionId(anthropicRequest, anthropicRequest._gwEmail || '');

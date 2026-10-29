@@ -134,6 +134,11 @@
     </div>
   </main>
 
+  <!-- 1.5. 统计 (仅 AG 引擎) -->
+  <main id="view-stats" class="tab-content">
+    <div id="statsContent"></div>
+  </main>
+
   <!-- 2. 账号 -->
   <main id="view-accounts" class="tab-content">
     <div class="section-title" style="flex-wrap: wrap; gap: 8px;">
@@ -194,6 +199,7 @@
   <nav class="bottom-nav">
     <div class="nav-brand">wag2api<span id="navEngine"></span></div>
     <div class="nav-item active" data-tab="overview" onclick="switchTab('overview')"><div class="nav-icon">📊</div><div>概览</div></div>
+    <div class="nav-item" data-tab="stats" onclick="switchTab('stats')"><div class="nav-icon">📈</div><div>统计</div></div>
     <div class="nav-item" data-tab="accounts" onclick="switchTab('accounts')"><div class="nav-icon">👤</div><div>账号</div></div>
     <div class="nav-item" data-tab="keys" onclick="switchTab('keys')"><div class="nav-icon">🔑</div><div>接入</div></div>
     <div class="nav-item" data-tab="chat" onclick="switchTab('chat')"><div class="nav-icon">💬</div><div>对话</div></div>
@@ -250,6 +256,26 @@
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-primary" style="flex: 1;" onclick="copyText(document.getElementById('textOutput').value)">📋 复制全部</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('textModal')">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模型定价表 -->
+  <div class="modal-overlay" id="priceModal">
+    <div class="modal-sheet">
+      <div class="sheet-handle"></div>
+      <div class="section-title">
+        <span>模型定价（$/1M Token）</span>
+      </div>
+      <p class="muted" style="margin-bottom: 12px;">前缀最长匹配（忽略大小写及 -high/-tiered 等后缀）。无匹配项走 default。</p>
+      <div id="priceRulesTable" class="price-rules-list"></div>
+      <div style="display: flex; gap: 8px; margin-top: 12px; margin-bottom: 14px;">
+        <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="addPriceRuleRow()">+ 添加模型</button>
+        <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="resetDefaultPriceRules()">恢复默认价格</button>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-primary" style="flex: 1;" onclick="savePriceRules()">保存设置</button>
+        <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('priceModal')">取消</button>
       </div>
     </div>
   </div>

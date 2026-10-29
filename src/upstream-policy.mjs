@@ -21,7 +21,54 @@ export const DEFAULT_COOLDOWN_MS = 60000;
 
 // ---------- 错误分类 ----------
 
-/** 返回 'bad_request' | 'quota' | 'auth' | 'server' | 'network' | 'timeout' */
+/** 判断是否为人工验证封禁 */
+export function isValidationRequired(body) {
+  const text = typeof body === 'string' ? body : (body ? JSON.stringify(body) : '');
+  if (!text) return false;
+  return /Verify your account|further action is required|validation_url|appeal_url|VALIDATION_REQUIRED/i.test(text);
+}
+
+/**
+ * 提取人工验证 URL（优先 details metadata validation_url/appeal_url，其次 links[0].url，最后正则匹配 https URL，把 \u0026 还原为 &）
+ */
+export function extractValidationUrl(body) {
+  if (!body) return '';
+  const unescapeUrl = u => {
+    if (!u || typeof u !== 'string') return '';
+    return u.replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+  };
+
+  let parsed = null;
+  const rawText = typeof body === 'string' ? body : JSON.stringify(body);
+  if (typeof body === 'object') {
+    parsed = body;
+  } else {
+    try { parsed = JSON.parse(body); } catch (e) {}
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    const details = parsed?.error?.details || parsed?.details;
+    if (Array.isArray(details)) {
+      for (const d of details) {
+        const u = d?.metadata?.validation_url || d?.metadata?.appeal_url || d?.validation_url || d?.appeal_url;
+        if (u) return unescapeUrl(u);
+      }
+      for (const d of details) {
+        if (Array.isArray(d?.links) && d.links[0]?.url) return unescapeUrl(d.links[0].url);
+      }
+    }
+    if (Array.isArray(parsed?.links) && parsed.links[0]?.url) return unescapeUrl(parsed.links[0].url);
+  }
+
+  const text = rawText.replace(/\\u0026/g, '&');
+  const m = text.match(/https:\/\/[^\s"'\\<>{}]*/);
+  if (m) {
+    return unescapeUrl(m[0]);
+  }
+  return '';
+}
+
+/** 返回 'bad_request' | 'quota' | 'auth' | 'validation' | 'server' | 'network' | 'timeout' */
 export function classifyFailure({ status = 0, body = '', error = null } = {}) {
   if (error) {
     const name = String(error.name || '');
@@ -30,6 +77,7 @@ export function classifyFailure({ status = 0, body = '', error = null } = {}) {
     return 'network';
   }
   const text = String(body || '');
+  if (isValidationRequired(text)) return 'validation';
   if (status === 429 || /RESOURCE_EXHAUSTED/.test(text)) return 'quota';
   if (status === 401 || status === 403) return /RESOURCE_EXHAUSTED|quota/i.test(text) ? 'quota' : 'auth';
   if (status >= 500) return 'server';
@@ -150,7 +198,13 @@ export async function runWithPolicy(ctx) {
   const pastDeadline = () => attempts > 0 && now() - startedAt >= deadlineMs;
 
   const order = (upModel, exclude) => {
-    const all = ctx.accounts().filter(m => m?.tokenData?.email && !exclude.has(m.tokenData.email));
+    const all = ctx.accounts().filter(m => {
+      const email = m?.tokenData?.email;
+      if (!email) return false;
+      if (exclude.has(email)) return false;
+      if (ctx.isBlocked && ctx.isBlocked(email)) return false;
+      return true;
+    });
     const free = all.filter(m => !ctx.cooldowns.isCooling(m.tokenData.email, upModel));
     const active = free.find(m => m.tokenData.email === ctx.activeEmail);
     const q = m => { const v = ctx.quotaOf ? ctx.quotaOf(m.tokenData.email) : null; return typeof v === 'number' ? v : -1; };
@@ -233,6 +287,13 @@ export async function runWithPolicy(ctx) {
       nextAccount();
       continue;
     }
+    if (r.kind === 'validation') {
+      authFailed.add(mgr.tokenData.email);
+      try { ctx.onValidationRequired?.(mgr, r.body); } catch (e) {}
+      log(`[Policy] ${mgr.tokenData.email} 触发人工验证封禁，换号`);
+      nextAccount();
+      continue;
+    }
     if (r.kind === 'auth') { authFailed.add(mgr.tokenData.email); nextAccount(); continue; }
     // server / network / timeout：换 host 一次，再换账号一次
     if (!hostSwitched && hosts.length > 1) {
@@ -256,12 +317,13 @@ export async function runWithPolicy(ctx) {
       : kinds.has('server') ? 'upstream_5xx'
         : kinds.has('network') ? 'network'
           : kinds.has('quota') ? 'quota'
-            : kinds.has('auth') ? 'auth' : 'unknown';
+            : kinds.has('validation') ? 'validation'
+              : kinds.has('auth') ? 'auth' : 'unknown';
   if (allCoolingAtStart && !lastError) lastError = { kind: 'quota', status: 429, body: '所有账号对该模型都在冷却中' };
 
-  // 只是凭据问题时换模型没用，不降级
-  const onlyAuth = kinds.size > 0 && [...kinds].every(k => k === 'auth');
-  if (allowDowngrade && !onlyAuth && !pastDeadline()) {
+  // 只是凭据或验证问题时换模型没用，不降级
+  const onlyAuthOrValidation = kinds.size > 0 && [...kinds].every(k => k === 'auth' || k === 'validation');
+  if (allowDowngrade && !onlyAuthOrValidation && !pastDeadline()) {
     for (const dm of ctx.chain || []) {
       if (pastDeadline()) break;
       const up = ctx.upstreamOf(dm);

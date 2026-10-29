@@ -22,16 +22,20 @@ import { fileURLToPath } from 'url';
 import { cacheHitRate } from './usage.mjs';
 
 export const STATS_SCHEMA = 2;
+const MINUTELY_KEEP_MS = 120 * 60 * 1000;
 const HOURLY_KEEP_MS = 48 * 3600 * 1000;
-const DAILY_KEEP_DAYS = 35;
+const DAILY_KEEP_DAYS = 92;
 const SAVE_DEBOUNCE_MS = 2000;
 
 const pad = v => String(v).padStart(2, '0');
+export const utcMinuteKey = d => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 export const utcHourKey = d => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}`;
 export const utcDayKey = d => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+const minuteKeyToMs = k => Date.parse(k.replace(' ', 'T') + ':00Z');
 const hourKeyToMs = k => Date.parse(k.replace(' ', 'T') + ':00:00Z');
 const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const isOk = s => s >= 200 && s < 300;
+const SLOT_FIELDS = ['requests', 'errors', 'input', 'cached', 'output', 'tokens', 'thoughts', 'lat_sum', 'lat_n', 'ttft_sum', 'ttft_n'];
 
 function emptyBucket() {
   return {
@@ -52,12 +56,13 @@ function emptyBucket() {
     avg_ttft_ms: 0,
     logs: [],
     downgrades: [], // PR1：最近 48h 的降级记录 { ts, from, to, reason }
+    minutely: {}, // 新增分钟桶（key 'YYYY-MM-DDTHH:MM' UTC），只保留最近 120 分钟
     hourly: {}, // { 'YYYY-MM-DDTHH' (UTC): {requests, errors, input, cached, output, tokens} }
     daily: {},  // { 'YYYY-MM-DD'  (UTC): 同上 }
   };
 }
 
-function emptySlot() { return { requests: 0, errors: 0, input: 0, cached: 0, output: 0, tokens: 0, thoughts: 0, lat_sum: 0, lat_n: 0, ttft_sum: 0, ttft_n: 0 }; }
+function emptySlot() { return { requests: 0, errors: 0, input: 0, cached: 0, output: 0, tokens: 0, thoughts: 0, lat_sum: 0, lat_n: 0, ttft_sum: 0, ttft_n: 0, models: {} }; }
 
 /** 旧版 user_stats.json → schema 2（就地迁移，幂等） */
 export function migrateBucket(b) {
@@ -66,6 +71,18 @@ export function migrateBucket(b) {
   const base = emptyBucket();
   for (const k of Object.keys(base)) if (b[k] === undefined) b[k] = base[k];
   if (!Array.isArray(b.logs)) b.logs = [];
+  if (!b.minutely || typeof b.minutely !== 'object') b.minutely = {};
+  if (!b.hourly || typeof b.hourly !== 'object') b.hourly = {};
+  if (!b.daily || typeof b.daily !== 'object') b.daily = {};
+
+  for (const map of [b.minutely, b.hourly, b.daily]) {
+    for (const slot of Object.values(map)) {
+      if (slot && typeof slot === 'object' && (!slot.models || typeof slot.models !== 'object')) {
+        slot.models = {};
+      }
+    }
+  }
+
   if (wasCurrent) return b;
 
   // 旧版 total_tokens = input + output，漏算了缓存 token
@@ -237,6 +254,7 @@ export class StatsTracker {
       bucket.avg_ttft_ms = Math.round(bucket.ttft_sum_ms / bucket.ttft_count);
     }
 
+    const targetModel = String(model_used || model || 'unknown');
     const addSlot = (map, key) => {
       const s = map[key] || emptySlot();
       s.requests++;
@@ -247,8 +265,20 @@ export class StatsTracker {
       if (ok && ttft_ms !== null && ttft_ms !== undefined && num(ttft_ms) >= 0) {
         s.ttft_sum = num(s.ttft_sum) + Math.round(num(ttft_ms)); s.ttft_n = num(s.ttft_n) + 1;
       }
+      if (!s.models || typeof s.models !== 'object') s.models = {};
+      const m = s.models[targetModel] || { requests: 0, errors: 0, input: 0, cached: 0, output: 0, thoughts: 0, tokens: 0 };
+      m.requests++;
+      if (!ok) m.errors++;
+      m.input += inp;
+      m.cached += cac;
+      m.output += out;
+      m.thoughts += thk;
+      m.tokens += tot;
+      s.models[targetModel] = m;
       map[key] = s;
     };
+    if (!bucket.minutely) bucket.minutely = {};
+    addSlot(bucket.minutely, utcMinuteKey(now));
     addSlot(bucket.hourly, utcHourKey(now));
     addSlot(bucket.daily, utcDayKey(now));
     this.prune(bucket, now);
@@ -279,8 +309,15 @@ export class StatsTracker {
     this.save();
   }
 
-  /** 按时间而非个数修剪：小时桶保留 48h，日桶保留 35 天 */
+  /** 按时间而非个数修剪：分钟桶保留 120m，小时桶保留 48h，日桶保留 92 天 */
   prune(bucket, now = new Date()) {
+    const mCut = now.getTime() - MINUTELY_KEEP_MS;
+    if (bucket.minutely) {
+      for (const k of Object.keys(bucket.minutely)) {
+        const t = minuteKeyToMs(k);
+        if (!Number.isFinite(t) || t < mCut) delete bucket.minutely[k];
+      }
+    }
     const hCut = now.getTime() - HOURLY_KEEP_MS;
     for (const k of Object.keys(bucket.hourly)) {
       const t = hourKeyToMs(k);
@@ -298,7 +335,7 @@ export class StatsTracker {
     const last24 = emptySlot();
     const cut = now.getTime() - 24 * 3600 * 1000;
     for (const [k, v] of Object.entries(b.hourly || {})) {
-      if (hourKeyToMs(k) + 3600 * 1000 > cut) for (const f of Object.keys(last24)) last24[f] += num(v[f]);
+      if (hourKeyToMs(k) + 3600 * 1000 > cut) for (const f of SLOT_FIELDS) last24[f] += num(v[f]);
     }
     last24.cache_hit_rate = cacheHitRate(last24.input, last24.cached);
     return {
@@ -330,7 +367,16 @@ export class StatsTracker {
       for (const f of ['total_requests', 'success_requests', 'error_requests', 'input_tokens', 'cached_tokens', 'output_tokens', 'thoughts_tokens', 'latency_sum_ms', 'latency_count', 'ttft_sum_ms', 'ttft_count']) agg[f] += num(b[f]);
       for (const [k, v] of Object.entries(b.hourly || {})) {
         const s = agg.hourly[k] || emptySlot();
-        for (const f of Object.keys(s)) s[f] += num(v[f]);
+        for (const f of SLOT_FIELDS) s[f] += num(v[f]);
+        if (v.models && typeof v.models === 'object') {
+          for (const [mName, mData] of Object.entries(v.models)) {
+            const ms = s.models[mName] || { requests: 0, errors: 0, input: 0, cached: 0, output: 0, thoughts: 0, tokens: 0 };
+            for (const mf of ['requests', 'errors', 'input', 'cached', 'output', 'thoughts', 'tokens']) {
+              ms[mf] += num(mData[mf]);
+            }
+            s.models[mName] = ms;
+          }
+        }
         agg.hourly[k] = s;
       }
       accounts.push({ email: key, ...this.summarize(b) });
@@ -388,7 +434,7 @@ export class StatsTracker {
     for (const b of Object.values(this.userStats)) {
       for (const [k, v] of Object.entries(b.hourly || {})) {
         if (hourKeyToMs(k) + 3600 * 1000 <= mid.getTime()) continue;
-        for (const f of Object.keys(t)) t[f] += num(v[f]);
+        for (const f of SLOT_FIELDS) t[f] += num(v[f]);
       }
     }
     return {
@@ -415,7 +461,7 @@ export class StatsTracker {
       const p = { key: k, ts: hourKeyToMs(k), ...emptySlot() };
       for (const b of Object.values(this.userStats)) {
         const v = b.hourly?.[k];
-        if (v) for (const f of Object.keys(emptySlot())) p[f] += num(v[f]);
+        if (v) for (const f of SLOT_FIELDS) p[f] += num(v[f]);
       }
       points.push(p);
     }
@@ -433,6 +479,329 @@ export class StatsTracker {
     }
     const today = bucket.daily?.[utcDayKey(now)];
     return { requests_7d: requests, tokens_7d: tokens, requests_today: today?.requests || 0, tokens_today: today?.tokens || 0 };
+  }
+
+  /**
+   * Token 消费统计：按时间粒度、按模型、按账号聚合，峰值时段，91 天活跃热力图
+   */
+  getTokenStats({ range = 'day', now = new Date() } = {}) {
+    const validRanges = ['hour', 'day', 'week', 'month', 'all'];
+    const r = validRanges.includes(range) ? range : 'day';
+    const nowDate = (now instanceof Date && !isNaN(now.getTime())) ? now : new Date(now);
+    const safeNow = isNaN(nowDate.getTime()) ? new Date() : nowDate;
+    const nowMs = safeNow.getTime();
+
+    // 1. 生成 91 天全账号日热力图（包含今天，旧日补 0）
+    const heatmap = [];
+    const todayMid = Date.parse(utcDayKey(safeNow) + 'T00:00:00Z');
+    for (let i = 90; i >= 0; i--) {
+      const dayKey = utcDayKey(new Date(todayMid - i * 86400000));
+      let dayTokens = 0;
+      let dayRequests = 0;
+      for (const b of Object.values(this.userStats)) {
+        const slot = b.daily?.[dayKey];
+        if (slot) {
+          dayTokens += num(slot.tokens);
+          dayRequests += num(slot.requests);
+        }
+      }
+      heatmap.push({ day: dayKey, tokens: dayTokens, requests: dayRequests });
+    }
+
+    // 2. 根据 range 确定 series 桶与对应槽数据源
+    let intervals = [];
+    if (r === 'hour') {
+      const current5mStart = Math.floor(nowMs / 300000) * 300000;
+      for (let i = 11; i >= 0; i--) {
+        const ts = current5mStart - i * 300000;
+        const keys = [];
+        for (let m = 0; m < 5; m++) {
+          keys.push(utcMinuteKey(new Date(ts + m * 60000)));
+        }
+        intervals.push({ ts, keys, mapName: 'minutely' });
+      }
+    } else if (r === 'day') {
+      const currentHourStart = Math.floor(nowMs / 3600000) * 3600000;
+      for (let i = 23; i >= 0; i--) {
+        const ts = currentHourStart - i * 3600000;
+        intervals.push({ ts, keys: [utcHourKey(new Date(ts))], mapName: 'hourly' });
+      }
+    } else if (r === 'week') {
+      const todayStart = Date.parse(utcDayKey(safeNow) + 'T00:00:00Z');
+      for (let i = 6; i >= 0; i--) {
+        const ts = todayStart - i * 86400000;
+        intervals.push({ ts, keys: [utcDayKey(new Date(ts))], mapName: 'daily' });
+      }
+    } else if (r === 'month') {
+      const todayStart = Date.parse(utcDayKey(safeNow) + 'T00:00:00Z');
+      for (let i = 29; i >= 0; i--) {
+        const ts = todayStart - i * 86400000;
+        intervals.push({ ts, keys: [utcDayKey(new Date(ts))], mapName: 'daily' });
+      }
+    } else if (r === 'all') {
+      const daySet = new Set();
+      for (const b of Object.values(this.userStats)) {
+        if (b.daily) {
+          for (const k of Object.keys(b.daily)) daySet.add(k);
+        }
+      }
+      const allDays = Array.from(daySet).sort().slice(-92);
+      intervals = allDays.map(k => ({
+        ts: Date.parse(k + 'T00:00:00Z'),
+        keys: [k],
+        mapName: 'daily',
+      }));
+    }
+
+    // 3. 构建 series 骨架
+    const series = intervals.map(iv => ({
+      ts: iv.ts,
+      requests: 0,
+      errors: 0,
+      input: 0,
+      cached: 0,
+      output: 0,
+      thoughts: 0,
+      tokens: 0,
+    }));
+
+    // 4. 聚合账号、模型、series、时延
+    const allModels = {};
+    const accountsMap = {};
+    let windowLatSum = 0, windowLatN = 0;
+    let windowTtftSum = 0, windowTtftN = 0;
+
+    for (const [email, b] of Object.entries(this.userStats)) {
+      migrateBucket(b);
+      const acc = {
+        email,
+        requests: 0,
+        errors: 0,
+        input: 0,
+        cached: 0,
+        output: 0,
+        thoughts: 0,
+        tokens: 0,
+        accModels: {},
+      };
+
+      for (let idx = 0; idx < intervals.length; idx++) {
+        const iv = intervals[idx];
+        const point = series[idx];
+        const map = b[iv.mapName] || {};
+        for (const k of iv.keys) {
+          const slot = map[k];
+          if (!slot) continue;
+
+          const reqs = num(slot.requests);
+          const errs = num(slot.errors);
+          const inp = num(slot.input);
+          const cac = num(slot.cached);
+          const out = num(slot.output);
+          const thk = num(slot.thoughts);
+          const tok = num(slot.tokens) || (inp + cac + out);
+
+          acc.requests += reqs;
+          acc.errors += errs;
+          acc.input += inp;
+          acc.cached += cac;
+          acc.output += out;
+          acc.thoughts += thk;
+          acc.tokens += tok;
+
+          point.requests += reqs;
+          point.errors += errs;
+          point.input += inp;
+          point.cached += cac;
+          point.output += out;
+          point.thoughts += thk;
+          point.tokens += tok;
+
+          if (num(slot.lat_n) > 0) {
+            windowLatSum += num(slot.lat_sum);
+            windowLatN += num(slot.lat_n);
+          }
+          if (num(slot.ttft_n) > 0) {
+            windowTtftSum += num(slot.ttft_sum);
+            windowTtftN += num(slot.ttft_n);
+          }
+
+          if (slot.models && typeof slot.models === 'object') {
+            for (const [mName, mData] of Object.entries(slot.models)) {
+              if (!mData) continue;
+              const am = acc.accModels[mName] || { requests: 0, errors: 0, input: 0, cached: 0, output: 0, thoughts: 0, tokens: 0 };
+              am.requests += num(mData.requests);
+              am.errors += num(mData.errors);
+              am.input += num(mData.input);
+              am.cached += num(mData.cached);
+              am.output += num(mData.output);
+              am.thoughts += num(mData.thoughts);
+              am.tokens += num(mData.tokens);
+              acc.accModels[mName] = am;
+
+              const gm = allModels[mName] || { requests: 0, errors: 0, input: 0, cached: 0, output: 0, thoughts: 0, tokens: 0 };
+              gm.requests += num(mData.requests);
+              gm.errors += num(mData.errors);
+              gm.input += num(mData.input);
+              gm.cached += num(mData.cached);
+              gm.output += num(mData.output);
+              gm.thoughts += num(mData.thoughts);
+              gm.tokens += num(mData.tokens);
+              allModels[mName] = gm;
+            }
+          }
+        }
+      }
+
+      if (r === 'all') {
+        // all 的账号汇总使用账号桶累计总数
+        acc.requests = num(b.total_requests);
+        acc.errors = num(b.error_requests);
+        acc.input = num(b.input_tokens);
+        acc.cached = num(b.cached_tokens);
+        acc.output = num(b.output_tokens);
+        acc.thoughts = num(b.thoughts_tokens);
+        acc.tokens = num(b.total_tokens) || (acc.input + acc.cached + acc.output);
+      }
+
+      accountsMap[email] = acc;
+    }
+
+    // 5. 汇总 summary
+    let summary;
+    if (r === 'all') {
+      let totalReqs = 0, totalSucc = 0, totalErrs = 0;
+      let totalInp = 0, totalCac = 0, totalOut = 0, totalThk = 0, totalTok = 0;
+      let totalLatSum = 0, totalLatN = 0, totalTtftSum = 0, totalTtftN = 0;
+      for (const b of Object.values(this.userStats)) {
+        totalReqs += num(b.total_requests);
+        totalSucc += num(b.success_requests);
+        totalErrs += num(b.error_requests);
+        totalInp += num(b.input_tokens);
+        totalCac += num(b.cached_tokens);
+        totalOut += num(b.output_tokens);
+        totalThk += num(b.thoughts_tokens);
+        totalTok += num(b.total_tokens) || (num(b.input_tokens) + num(b.cached_tokens) + num(b.output_tokens));
+        totalLatSum += num(b.latency_sum_ms);
+        totalLatN += num(b.latency_count);
+        totalTtftSum += num(b.ttft_sum_ms);
+        totalTtftN += num(b.ttft_count);
+      }
+      summary = {
+        requests: totalReqs,
+        success: totalSucc,
+        errors: totalErrs,
+        input: totalInp,
+        cached: totalCac,
+        output: totalOut,
+        thoughts: totalThk,
+        tokens: totalTok,
+        cache_hit_rate: cacheHitRate(totalInp, totalCac),
+        avg_latency_ms: totalLatN ? Math.round(totalLatSum / totalLatN) : 0,
+        avg_ttft_ms: totalTtftN ? Math.round(totalTtftSum / totalTtftN) : null,
+      };
+    } else {
+      let winReqs = 0, winErrs = 0, winInp = 0, winCac = 0, winOut = 0, winThk = 0, winTok = 0;
+      for (const p of series) {
+        winReqs += p.requests;
+        winErrs += p.errors;
+        winInp += p.input;
+        winCac += p.cached;
+        winOut += p.output;
+        winThk += p.thoughts;
+        winTok += p.tokens;
+      }
+      summary = {
+        requests: winReqs,
+        success: Math.max(0, winReqs - winErrs),
+        errors: winErrs,
+        input: winInp,
+        cached: winCac,
+        output: winOut,
+        thoughts: winThk,
+        tokens: winTok,
+        cache_hit_rate: cacheHitRate(winInp, winCac),
+        avg_latency_ms: windowLatN ? Math.round(windowLatSum / windowLatN) : 0,
+        avg_ttft_ms: windowTtftN ? Math.round(windowTtftSum / windowTtftN) : null,
+      };
+    }
+
+    // 6. 模型列表（按 tokens 降序）
+    const totalTokens = summary.tokens;
+    const modelsList = [];
+    for (const [model, m] of Object.entries(allModels)) {
+      if (m.requests <= 0 && m.tokens <= 0) continue;
+      modelsList.push({
+        model,
+        requests: m.requests,
+        errors: m.errors,
+        input: m.input,
+        cached: m.cached,
+        output: m.output,
+        thoughts: m.thoughts,
+        tokens: m.tokens,
+        share: totalTokens > 0 ? Math.round((m.tokens / totalTokens) * 10000) / 10000 : 0,
+      });
+    }
+    modelsList.sort((a, b) => b.tokens - a.tokens || b.requests - a.requests);
+
+    // 7. 账号列表（按 tokens 降序）
+    const accountsList = [];
+    for (const acc of Object.values(accountsMap)) {
+      if (acc.requests <= 0 && acc.tokens <= 0) continue;
+      let topModel = null;
+      let maxTokens = -1;
+      let maxReqs = -1;
+      for (const [mName, mData] of Object.entries(acc.accModels)) {
+        const mTok = num(mData.tokens);
+        const mReq = num(mData.requests);
+        if (mTok > maxTokens || (mTok === maxTokens && mReq > maxReqs)) {
+          maxTokens = mTok;
+          maxReqs = mReq;
+          topModel = mName;
+        }
+      }
+
+      accountsList.push({
+        email: acc.email,
+        requests: acc.requests,
+        errors: acc.errors,
+        input: acc.input,
+        cached: acc.cached,
+        output: acc.output,
+        thoughts: acc.thoughts,
+        tokens: acc.tokens,
+        share: totalTokens > 0 ? Math.round((acc.tokens / totalTokens) * 10000) / 10000 : 0,
+        cache_hit_rate: cacheHitRate(acc.input, acc.cached),
+        top_model: topModel,
+      });
+    }
+    accountsList.sort((a, b) => b.tokens - a.tokens || b.requests - a.requests);
+
+    summary.active_accounts = accountsList.length;
+    summary.active_models = modelsList.length;
+
+    // 8. 峰值时段 (peak)
+    let peak = null;
+    for (const p of series) {
+      if (p.tokens > 0 || p.requests > 0) {
+        if (!peak || p.tokens > peak.tokens || (p.tokens === peak.tokens && p.requests > peak.requests)) {
+          peak = { ts: p.ts, tokens: p.tokens, requests: p.requests };
+        }
+      }
+    }
+
+    return {
+      range: r,
+      timezone: 'UTC',
+      generated_at: nowMs,
+      summary,
+      series,
+      models: modelsList,
+      accounts: accountsList,
+      peak,
+      heatmap,
+    };
   }
 
   /**

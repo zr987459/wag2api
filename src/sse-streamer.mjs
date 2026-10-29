@@ -25,9 +25,10 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
 
   const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
   let blockIndex = 0;
-  let currentBlockType = null; // 'thinking' | 'text' | null
+  let currentBlockType = null; // 'thinking' | 'text' | 'tool_use' | null
   let hasEmittedStart = false;
   let stopReason = 'end_turn';
+  let sawToolUse = false;
 
   let rawUsage = null;         // 合并后的原始 usageMetadata（累计值取最大）
   let firstTokenAt = 0;        // 首个内容 token 到达时间（TTFT）
@@ -147,6 +148,8 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
         }
 
         const candidate = inner?.candidates?.[0];
+        // MAX_TOKENS → max_tokens（工具调用优先，与非流式一致）
+        if (candidate?.finishReason === 'MAX_TOKENS' && !sawToolUse) stopReason = 'max_tokens';
         const parts = candidate?.content?.parts || [];
 
         // 1. 发送 message_start 事件
@@ -211,11 +214,15 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
           } else if (part.functionCall) {
             closeCurrentBlock();
             stopReason = 'tool_use';
+            sawToolUse = true;
             const callId = part.functionCall.id || `toolu_${crypto.randomBytes(12).toString('hex')}`;
             const actualSig = sig || latestSeenSignature || FALLBACK_THOUGHT_SIGNATURE;
 
             signatureCache.set(callId, actualSig, part.functionCall.name);
 
+            // 必须标记当前块类型，否则下面的 closeCurrentBlock 是空操作：
+            // tool_use 块永远收不到 content_block_stop，且下一个块会复用同一个 index
+            currentBlockType = 'tool_use';
             sendEvent('content_block_start', {
               type: 'content_block_start',
               index: blockIndex,
@@ -274,6 +281,10 @@ export async function handleStreamConversion(upstreamRes, clientRes, originalMod
     } else {
       console.error('[Stream Processing Error]', err);
       finish('stream_error', String(err?.message || err).slice(0, 100));
+      // 按 Anthropic 规范下发 error 事件，避免客户端只看到被截断、没有 message_stop 的流
+      try {
+        sendEvent('error', { type: 'error', error: { type: 'api_error', message: String(err?.message || err) } });
+      } catch (e) {}
     }
     try {
       clientRes.end();

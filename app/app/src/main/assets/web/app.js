@@ -189,6 +189,7 @@ function switchTab(tab) {
 
 function renderCurrent() {
   if (currentTab === 'overview') loadOverview();
+  else if (currentTab === 'stats') loadTokenStats();
   else if (currentTab === 'accounts') loadAccounts();
   else if (currentTab === 'keys') loadKeys();
   else if (currentTab === 'chat') loadChat();
@@ -429,6 +430,610 @@ async function resetStats() {
   loadOverview();
 }
 
+// ── 1.5. 统计 (Token Stats，仅 AG 引擎) ────────────────
+let tokenStatsData = null;
+let tokenStatsRange = localStorage.getItem('wag2api_token_stats_range') || 'day';
+let tokenStatsTrendMode = 'tokens'; // 'tokens' | 'requests' | 'cost'
+let tokenStatsRankTab = 'models';   // 'models' | 'accounts'
+let tokenStatsTrendIndex = null;
+
+const DEFAULT_PRICE_RULES = [
+  { prefix: 'gemini-3.8-flash', in: 0.75, out: 3.75, cached: 0.075 },
+  { prefix: 'gemini-3.7', in: 0.75, out: 3.75, cached: 0.075 },
+  { prefix: 'gemini-3.6', in: 0.75, out: 3.75, cached: 0.075 },
+  { prefix: 'gemini-3.5', in: 0.75, out: 3.75, cached: 0.075 },
+  { prefix: 'gemini-3-flash', in: 0.75, out: 3.75, cached: 0.075 },
+  { prefix: 'gemini-2.5-flash', in: 0.75, out: 3.75, cached: 0.075 },
+  { prefix: 'gemini-2.0-flash', in: 0.10, out: 0.40, cached: 0.025 },
+  { prefix: 'gemini-3.1-pro', in: 2.0, out: 12.0, cached: 0.20 },
+  { prefix: 'gemini-3-pro', in: 2.0, out: 12.0, cached: 0.20 },
+  { prefix: 'gemini-2.5-pro', in: 2.0, out: 12.0, cached: 0.20 },
+  { prefix: 'gemini-4-argon', in: 2.0, out: 12.0, cached: 0.20 },
+  { prefix: 'claude-sonnet', in: 3.0, out: 15.0, cached: 0.30 },
+  { prefix: 'claude-opus', in: 5.0, out: 25.0, cached: 0.50 },
+  { prefix: 'claude-haiku', in: 0.8, out: 4.0, cached: 0.08 },
+  { prefix: 'gpt-oss', in: 0.15, out: 0.60, cached: 0.075 },
+  { prefix: 'default', in: 1.0, out: 5.0, cached: 0.10 },
+];
+
+function getPriceRules() {
+  try {
+    const raw = localStorage.getItem('wag2api_price_rules');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) return parsed;
+    }
+  } catch (e) {}
+  return JSON.parse(JSON.stringify(DEFAULT_PRICE_RULES));
+}
+
+function normalizeModelName(m) {
+  if (!m) return '';
+  let name = String(m).toLowerCase().trim();
+  name = name.replace(/^(ag|wb):/, '');
+  name = name.replace(/-(high|low|medium|tiered|thinking)$/, '');
+  return name;
+}
+
+function findPriceRule(modelName, rules) {
+  const norm = normalizeModelName(modelName);
+  let best = null;
+  let maxLen = -1;
+  let defaultRule = null;
+  for (const r of rules) {
+    const p = String(r.prefix || '').toLowerCase().trim();
+    if (!p) continue;
+    if (p === 'default' || p === '*') {
+      defaultRule = r;
+      continue;
+    }
+    if (norm.startsWith(p) && p.length > maxLen) {
+      best = r;
+      maxLen = p.length;
+    }
+  }
+  // 兼顾 claude-3.7-sonnet 等变体
+  if (!best && norm.startsWith('claude-')) {
+    if (norm.includes('sonnet')) best = rules.find(r => r.prefix === 'claude-sonnet');
+    else if (norm.includes('opus')) best = rules.find(r => r.prefix === 'claude-opus');
+    else if (norm.includes('haiku')) best = rules.find(r => r.prefix === 'claude-haiku');
+  }
+  return best || defaultRule || rules.find(r => r.prefix === 'default') || { in: 1.0, out: 5.0, cached: 0.10 };
+}
+
+function calcItemCost(item, rule) {
+  const input = Number(item.input) || 0;
+  const cached = Number(item.cached) || 0;
+  const output = Number(item.output) || 0;
+  const inPrice = Number(rule.in) || 0;
+  const outPrice = Number(rule.out) || 0;
+  const cachedPrice = Number(rule.cached) || 0;
+
+  // 费用 = (input*in + cached*cached价 + output*out) / 1000000 (单位: 美元)
+  const cost = (input * inPrice + cached * cachedPrice + output * outPrice) / 1e6;
+  // 缓存节省 = cached * (in - cached价) / 1000000
+  const saved = (cached * Math.max(0, inPrice - cachedPrice)) / 1e6;
+  return { cost, saved };
+}
+
+function fmtUsd(n) {
+  if (n === null || n === undefined || isNaN(n)) return '--';
+  n = Number(n);
+  if (n === 0) return '$0.00';
+  if (n < 0.0001) return '<$0.0001';
+  if (n < 0.01) return '$' + n.toFixed(4);
+  if (n < 1) return '$' + n.toFixed(3);
+  if (n >= 1000) return '$' + fmtNum(Math.round(n));
+  return '$' + n.toFixed(2);
+}
+
+function openPriceModal() {
+  const rules = getPriceRules();
+  renderPriceRulesList(rules);
+  openModal('priceModal');
+}
+
+function renderPriceRulesList(rules) {
+  const box = $('priceRulesTable');
+  if (!box) return;
+  box.innerHTML = rules.map(r => `
+    <div class="price-rule-row">
+      <div class="price-rule-top">
+        <input type="text" class="input-field mono price-prefix" value="${escapeHtml(r.prefix)}" placeholder="模型前缀" ${r.prefix === 'default' ? 'readonly' : ''} />
+        ${r.prefix === 'default' ? '<span class="price-default-badge">默认</span>' : `<button type="button" class="btn btn-outline btn-sm" onclick="this.closest('.price-rule-row').remove()" title="删除">🗑</button>`}
+      </div>
+      <div class="price-rule-prices">
+        <label class="price-lbl"><span>入</span><input type="number" step="0.001" class="input-field mono price-in" value="${r.in}" /></label>
+        <label class="price-lbl"><span>出</span><input type="number" step="0.001" class="input-field mono price-out" value="${r.out}" /></label>
+        <label class="price-lbl"><span>缓</span><input type="number" step="0.001" class="input-field mono price-cached" value="${r.cached}" /></label>
+      </div>
+    </div>
+  `).join('');
+}
+
+function addPriceRuleRow() {
+  const box = $('priceRulesTable');
+  if (!box) return;
+  const div = document.createElement('div');
+  div.className = 'price-rule-row';
+  div.innerHTML = `
+    <div class="price-rule-top">
+      <input type="text" class="input-field mono price-prefix" value="" placeholder="新模型前缀 (如 gpt-4)" />
+      <button type="button" class="btn btn-outline btn-sm" onclick="this.closest('.price-rule-row').remove()" title="删除">🗑</button>
+    </div>
+    <div class="price-rule-prices">
+      <label class="price-lbl"><span>入</span><input type="number" step="0.001" class="input-field mono price-in" value="1.0" /></label>
+      <label class="price-lbl"><span>出</span><input type="number" step="0.001" class="input-field mono price-out" value="5.0" /></label>
+      <label class="price-lbl"><span>缓</span><input type="number" step="0.001" class="input-field mono price-cached" value="0.10" /></label>
+    </div>
+  `;
+  box.appendChild(div);
+  div.querySelector('.price-prefix').focus();
+}
+
+function resetDefaultPriceRules() {
+  if (!confirm('确定恢复默认价格表？')) return;
+  localStorage.removeItem('wag2api_price_rules');
+  renderPriceRulesList(DEFAULT_PRICE_RULES);
+  showToast('已恢复默认价格', 'info');
+}
+
+function savePriceRules() {
+  const rows = document.querySelectorAll('.price-rule-row');
+  const rules = [];
+  rows.forEach(row => {
+    const prefix = row.querySelector('.price-prefix').value.trim();
+    const inPrice = parseFloat(row.querySelector('.price-in').value) || 0;
+    const outPrice = parseFloat(row.querySelector('.price-out').value) || 0;
+    const cachedPrice = parseFloat(row.querySelector('.price-cached').value) || 0;
+    if (prefix) {
+      rules.push({ prefix, in: inPrice, out: outPrice, cached: cachedPrice });
+    }
+  });
+  if (!rules.some(r => r.prefix.toLowerCase() === 'default')) {
+    rules.push({ prefix: 'default', in: 1.0, out: 5.0, cached: 0.10 });
+  }
+  localStorage.setItem('wag2api_price_rules', JSON.stringify(rules));
+  closeModal('priceModal');
+  showToast('价格表已更新', 'success');
+  if (tokenStatsData) renderTokenStatsView(tokenStatsData);
+}
+
+async function loadTokenStats(toast = false) {
+  await refreshEngineInfo();
+  applyEngineChrome();
+  const box = $('statsContent');
+  if (!box) return;
+
+  if (engine === 'wb') {
+    box.innerHTML = '<div class="card empty">Token 消费统计目前仅支持 AG 引擎</div>';
+    return;
+  }
+  if (!agReady()) {
+    box.innerHTML = `<div class="card">${agOffHtml()}</div>`;
+    return;
+  }
+
+  try {
+    const data = await getJson(`/api/token-stats?range=${encodeURIComponent(tokenStatsRange)}`);
+    tokenStatsData = data;
+    renderTokenStatsView(data);
+    if (toast) showToast('统计已刷新', 'success');
+  } catch (e) {
+    box.innerHTML = `<div class="card empty" style="color:var(--danger)">加载统计失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function setTokenStatsRange(r) {
+  tokenStatsRange = r;
+  localStorage.setItem('wag2api_token_stats_range', r);
+  tokenStatsTrendIndex = null;
+  loadTokenStats();
+}
+
+function setTokenStatsTrendMode(m) {
+  tokenStatsTrendMode = m;
+  tokenStatsTrendIndex = null;
+  if (tokenStatsData) renderStatsTrendCard(tokenStatsData);
+}
+
+function setTokenStatsRankTab(t) {
+  tokenStatsRankTab = t;
+  if (tokenStatsData) renderStatsRankCard(tokenStatsData);
+}
+
+function renderTokenStatsView(data) {
+  const box = $('statsContent');
+  if (!box || !data) return;
+
+  const rules = getPriceRules();
+  const summary = data.summary || {};
+  const models = data.models || [];
+  const accounts = data.accounts || [];
+
+  // 计算每个模型的费用与节省
+  let totalCost = 0;
+  let totalSaved = 0;
+  models.forEach(m => {
+    const rule = findPriceRule(m.model, rules);
+    const { cost, saved } = calcItemCost(m, rule);
+    m.cost = cost;
+    m.saved = saved;
+    totalCost += cost;
+    totalSaved += saved;
+  });
+
+  // 计算每个账号的费用
+  accounts.forEach(a => {
+    const rule = findPriceRule(a.top_model, rules);
+    const { cost, saved } = calcItemCost(a, rule);
+    a.cost = cost;
+    a.saved = saved;
+  });
+
+  // 无模型明细时按 summary 回退计算
+  if (!models.length && (summary.input || summary.cached || summary.output)) {
+    const defRule = findPriceRule('default', rules);
+    const calc = calcItemCost(summary, defRule);
+    totalCost = calc.cost;
+    totalSaved = calc.saved;
+  }
+
+  const totalTokens = Number(summary.tokens) || models.reduce((a, m) => a + (Number(m.tokens) || 0), 0);
+  data._avgPricePerToken = totalTokens > 0 ? (totalCost / totalTokens) : 0;
+  data._totalCost = totalCost;
+  data._totalSaved = totalSaved;
+
+  const reqCount = Number(summary.requests) || 0;
+  const succCount = Number(summary.success) || 0;
+  const saveRate = totalCost + totalSaved > 0 ? (totalSaved / (totalCost + totalSaved)) : 0;
+
+  box.innerHTML = `
+    <!-- 顶部粒度切换 + 刷新按钮 -->
+    <div class="stats-top-bar">
+      <div class="sub-tabs scrollable">
+        ${[
+          ['hour', '近1小时'],
+          ['day', '24小时'],
+          ['week', '7天'],
+          ['month', '30天'],
+          ['all', '全部'],
+        ].map(([k, name]) => `
+          <span class="sub-tab ${tokenStatsRange === k ? 'active' : ''}" onclick="setTokenStatsRange('${k}')">${name}</span>
+        `).join('')}
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="loadTokenStats(true)">🔄 刷新</button>
+    </div>
+
+    <!-- 1. 概要卡 -->
+    <div class="card stats-summary-card">
+      <div class="metric-label">总 Token 消耗</div>
+      <div class="stats-big-tokens mono">${fmtNum(summary.tokens)}</div>
+      <div class="stats-sub-row muted">
+        输入 <b>${fmtNum(summary.input)}</b> · 缓存 <b>${fmtNum(summary.cached)}</b> · 输出 <b>${fmtNum(summary.output)}</b> · 思考 <b>${fmtNum(summary.thoughts)}</b>
+      </div>
+      <div class="stat-grid" style="margin-top:12px;">
+        <div class="stat-cell"><div class="k">请求数</div><div class="v">${fmtNum(summary.requests)}</div></div>
+        <div class="stat-cell"><div class="k">成功率</div><div class="v">${reqCount > 0 ? fmtPct(succCount / reqCount) : '--'}</div></div>
+        <div class="stat-cell"><div class="k">缓存命中率</div><div class="v hl">${fmtPct(summary.cache_hit_rate)}</div></div>
+        <div class="stat-cell" style="grid-column: 1 / -1;"><div class="k">平均耗时 / 首字</div><div class="v">${fmtMs(summary.avg_latency_ms)} / ${fmtMs(summary.avg_ttft_ms)}</div></div>
+      </div>
+    </div>
+
+    <!-- 2. 费用卡 -->
+    <div class="card stats-cost-card">
+      <div class="section-title">
+        <span>预估费用（按模型估算）</span>
+        <button class="btn btn-outline btn-sm" onclick="openPriceModal()">价格</button>
+      </div>
+      <div class="cost-metric-grid">
+        <div class="cost-main-box">
+          <div class="metric-label">预估花费</div>
+          <div class="cost-big-num mono">${fmtUsd(totalCost)}</div>
+          <div class="muted" style="font-size:11px;margin-top:4px;">平均单次 ${reqCount > 0 ? fmtUsd(totalCost / reqCount) : '--'}</div>
+        </div>
+        <div class="cost-save-box">
+          <div class="metric-label">缓存节省</div>
+          <div class="cost-save-num mono">${fmtUsd(totalSaved)}</div>
+          <div class="muted" style="font-size:11px;margin-top:4px;">节省占比 <b>${fmtPct(saveRate)}</b></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. 趋势卡 -->
+    <div class="card stats-trend-card" id="statsTrendCard"></div>
+
+    <!-- 4. 排行卡 -->
+    <div class="card stats-rank-card" id="statsRankCard"></div>
+
+    <!-- 5. 活跃热力图 -->
+    <div class="card stats-heatmap-card" id="statsHeatmapCard"></div>
+  `;
+
+  renderStatsTrendCard(data);
+  renderStatsRankCard(data);
+  renderStatsHeatmapCard(data);
+}
+
+function renderStatsTrendCard(data) {
+  const card = $('statsTrendCard');
+  if (!card) return;
+  const pts = data.series || [];
+  const mode = tokenStatsTrendMode;
+  const peak = data.peak;
+
+  let html = `
+    <div class="section-title">
+      <span>时段趋势</span>
+      <div class="sub-tabs">
+        <span class="sub-tab ${mode === 'tokens' ? 'active' : ''}" onclick="setTokenStatsTrendMode('tokens')">Token</span>
+        <span class="sub-tab ${mode === 'requests' ? 'active' : ''}" onclick="setTokenStatsTrendMode('requests')">请求</span>
+        <span class="sub-tab ${mode === 'cost' ? 'active' : ''}" onclick="setTokenStatsTrendMode('cost')">费用</span>
+      </div>
+    </div>
+  `;
+
+  if (!pts.length) {
+    html += '<div class="empty">暂无时段数据</div>';
+    card.innerHTML = html;
+    return;
+  }
+
+  // 费用按当期 models 份额估算或按 tokens*平均单价近似：单价 = 当期总费用 / 当期总 Token
+  const getVal = p => {
+    if (mode === 'tokens') return Number(p.tokens) || 0;
+    if (mode === 'requests') return Number(p.requests) || 0;
+    return (Number(p.tokens) || 0) * (data._avgPricePerToken || 0);
+  };
+
+  const values = pts.map(getVal);
+  const maxVal = Math.max(1, ...values);
+
+  // 峰值时段识别
+  let peakIdx = -1;
+  if (peak && peak.ts) {
+    let minDiff = Infinity;
+    pts.forEach((p, i) => {
+      const diff = Math.abs(p.ts - peak.ts);
+      if (diff < minDiff) { minDiff = diff; peakIdx = i; }
+    });
+  }
+
+  // 选中的柱子提示条
+  const selIdx = (tokenStatsTrendIndex !== null && tokenStatsTrendIndex < pts.length) ? tokenStatsTrendIndex : null;
+  const currP = selIdx !== null ? pts[selIdx] : null;
+
+  let tipText = '';
+  if (currP) {
+    const t = new Date(currP.ts);
+    const tmStr = t.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) + ' ' + t.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const cVal = getVal(currP);
+    if (mode === 'tokens') {
+      tipText = `<b>${tmStr}</b> · <b>${fmtNum(currP.tokens)}</b> Token (入 ${fmtNum(currP.input)} · 缓 ${fmtNum(currP.cached)} · 出 ${fmtNum(currP.output)})`;
+    } else if (mode === 'requests') {
+      tipText = `<b>${tmStr}</b> · <b>${fmtNum(currP.requests)}</b> 次请求${currP.errors ? ` (失败 ${currP.errors})` : ''}`;
+    } else {
+      tipText = `<b>${tmStr}</b> · 预估费用 <b>${fmtUsd(cVal)}</b> (${fmtNum(currP.tokens)} Token)`;
+    }
+  } else {
+    if (peak && peak.ts) {
+      const pt = new Date(peak.ts);
+      const ptStr = pt.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) + ' ' + pt.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+      tipText = `⚡ 峰值时段：<b>${ptStr}</b> · ${fmtNum(peak.tokens)} Token (${fmtNum(peak.requests)} 次) · 点击柱子查看`;
+    } else {
+      tipText = '点击柱子查看该时段数值';
+    }
+  }
+
+  html += `<div class="stats-trend-tip" id="statsTrendTip">${tipText}</div>`;
+
+  // 柱状图
+  html += '<div class="stats-trend-bars">';
+  pts.forEach((p, i) => {
+    const v = values[i];
+    const h = v > 0 ? Math.max(4, Math.round(v / maxVal * 100)) : 2;
+    const isZero = !v;
+    const isErr = mode === 'requests' && p.errors && p.errors >= v;
+    const isPeak = (i === peakIdx);
+    const isSel = (i === selIdx);
+    const cls = ['stats-bar', isZero ? 'zero' : '', isErr ? 'err' : '', isPeak ? 'peak' : '', isSel ? 'selected' : ''].filter(Boolean).join(' ');
+    html += `<div class="${cls}" style="height:${h}%" onclick="selectStatsTrendPoint(${i})" title="${new Date(p.ts).toLocaleTimeString()}: ${v}">${isPeak ? '<span class="peak-dot"></span>' : ''}</div>`;
+  });
+  html += '</div>';
+
+  // 3 个 x 轴刻度标签 (本地时区)
+  const formatAxisTime = ts => {
+    const d = new Date(ts);
+    if (tokenStatsRange === 'hour' || tokenStatsRange === 'day') {
+      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    }
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  };
+
+  const mid = Math.floor(pts.length / 2);
+  html += `
+    <div class="trend-axis">
+      <span>${formatAxisTime(pts[0].ts)}</span>
+      <span>${formatAxisTime(pts[mid].ts)}</span>
+      <span>${formatAxisTime(pts[pts.length - 1].ts)}</span>
+    </div>
+  `;
+
+  card.innerHTML = html;
+}
+
+function selectStatsTrendPoint(i) {
+  tokenStatsTrendIndex = (tokenStatsTrendIndex === i ? null : i);
+  if (tokenStatsData) renderStatsTrendCard(tokenStatsData);
+}
+
+function renderStatsRankCard(data) {
+  const card = $('statsRankCard');
+  if (!card) return;
+  const isModels = tokenStatsRankTab === 'models';
+  const rawList = isModels ? (data.models || []) : (data.accounts || []);
+  const list = [...rawList].sort((a, b) => (Number(b.tokens) || 0) - (Number(a.tokens) || 0));
+
+  let html = `
+    <div class="section-title">
+      <span>${isModels ? '模型排行' : '账号排行'} (${list.length})</span>
+      <div class="sub-tabs">
+        <span class="sub-tab ${isModels ? 'active' : ''}" onclick="setTokenStatsRankTab('models')">模型</span>
+        <span class="sub-tab ${!isModels ? 'active' : ''}" onclick="setTokenStatsRankTab('accounts')">账号</span>
+      </div>
+    </div>
+  `;
+
+  if (!list.length) {
+    html += `<div class="empty">暂无${isModels ? '模型' : '账号'}数据</div>`;
+    card.innerHTML = html;
+    return;
+  }
+
+  html += '<div class="rank-list">';
+  list.forEach((item, idx) => {
+    const rawName = isModels ? (item.model || '--') : (item.email || '--');
+    const displayName = isModels ? rawName : shortenEmail(rawName, 22);
+    const share = typeof item.share === 'number' ? item.share : 0;
+    const isTop = (idx === 0 && (Number(item.tokens) || 0) > 0);
+
+    html += `
+      <div class="rank-item">
+        <div class="rank-item-header">
+          <div class="rank-left">
+            <span class="rank-idx ${isTop ? 'top' : ''}">${idx + 1}</span>
+            <span class="rank-name mono" title="${escapeHtml(rawName)}">${escapeHtml(displayName)}</span>
+            ${isTop ? '<span class="rank-tag top">主力</span>' : ''}
+          </div>
+          <div class="rank-right">
+            <span class="rank-tokens mono hl">${fmtNum(item.tokens)}</span>
+            <span class="rank-cost mono">${fmtUsd(item.cost)}</span>
+          </div>
+        </div>
+        <div class="rank-progress-wrap">
+          <div class="rank-progress-bar"><i style="width: ${Math.max(1, Math.min(100, Math.round(share * 100)))}%"></i></div>
+          <span class="rank-share mono">${fmtPct(share)}</span>
+        </div>
+        <div class="rank-item-footer muted">
+          <span>${fmtNum(item.requests)} 次请求${item.errors ? ` (失败 ${item.errors})` : ''}</span>
+          ${!isModels ? `<span>命中率 <b>${fmtPct(item.cache_hit_rate)}</b> · 主力 <b>${escapeHtml(item.top_model || '--')}</b></span>` : `<span>入 ${fmtNum(item.input)} · 缓 ${fmtNum(item.cached)} · 出 ${fmtNum(item.output)}</span>`}
+        </div>
+      </div>
+    `;
+  });
+  html += '</div>';
+
+  // 份额 > 80% 警告
+  const topShare = list[0] && typeof list[0].share === 'number' ? list[0].share : 0;
+  if (topShare > 0.8) {
+    html += `
+      <div class="stats-warning-note">
+        ⚠️ 流量高度集中在一个${isModels ? '模型' : '账号'}（占比 ${fmtPct(topShare)}）
+      </div>
+    `;
+  }
+
+  card.innerHTML = html;
+}
+
+function shortenEmail(email, maxLen = 22) {
+  if (!email || email.length <= maxLen) return email;
+  const parts = email.split('@');
+  if (parts.length === 2) {
+    const user = parts[0];
+    const domain = parts[1];
+    if (user.length > 6) {
+      const cut = Math.max(3, maxLen - domain.length - 4);
+      return `${user.slice(0, cut)}…@${domain}`;
+    }
+  }
+  return email.slice(0, 10) + '…' + email.slice(-8);
+}
+
+function renderStatsHeatmapCard(data) {
+  const card = $('statsHeatmapCard');
+  if (!card) return;
+  const rawList = data.heatmap || [];
+  const mapByDay = {};
+  rawList.forEach(h => { if (h && h.day) mapByDay[h.day] = h; });
+
+  // 91 天，7 行 × 13 列
+  const now = new Date();
+  const days = [];
+  for (let i = 90; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 86400000);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dayStr = String(d.getDate()).padStart(2, '0');
+    const key = `${y}-${m}-${dayStr}`;
+    const entry = mapByDay[key] || { day: key, tokens: 0, requests: 0 };
+    days.push(entry);
+  }
+
+  const maxDayTokens = Math.max(1, ...days.map(d => Number(d.tokens) || 0));
+  let mostActive = null;
+  let activeCount = 0;
+  days.forEach(d => {
+    const tok = Number(d.tokens) || 0;
+    if (tok > 0) {
+      activeCount++;
+      if (!mostActive || tok > (Number(mostActive.tokens) || 0)) {
+        mostActive = d;
+      }
+    }
+  });
+
+  const getLevel = tok => {
+    if (!tok || tok <= 0) return 0;
+    const r = tok / maxDayTokens;
+    if (r <= 0.25) return 1;
+    if (r <= 0.50) return 2;
+    if (r <= 0.75) return 3;
+    return 4;
+  };
+
+  let html = `
+    <div class="section-title">
+      <span>活跃热力图（近 91 天）</span>
+      <div class="heatmap-legend">
+        <span>少</span>
+        <i class="heatmap-cell lvl-0"></i>
+        <i class="heatmap-cell lvl-1"></i>
+        <i class="heatmap-cell lvl-2"></i>
+        <i class="heatmap-cell lvl-3"></i>
+        <i class="heatmap-cell lvl-4"></i>
+        <span>多</span>
+      </div>
+    </div>
+    <div class="heatmap-tip" id="heatmapTip">点击方格查看当日数据</div>
+    <div class="heatmap-grid">
+  `;
+
+  days.forEach(d => {
+    const tok = Number(d.tokens) || 0;
+    const req = Number(d.requests) || 0;
+    const lvl = getLevel(tok);
+    html += `<div class="heatmap-cell lvl-${lvl}" onclick="selectHeatmapCell('${d.day}', ${tok}, ${req})" title="${d.day} · ${fmtNum(tok)} Token (${req} 请求)"></div>`;
+  });
+
+  html += `
+    </div>
+    <div class="heatmap-footer">
+      <span>最活跃的一天：<b>${mostActive ? `${mostActive.day} · ${fmtNum(mostActive.tokens)} Token` : '--'}</b></span>
+      <span>活跃天数：<b>${activeCount}/91</b></span>
+    </div>
+  `;
+
+  card.innerHTML = html;
+}
+
+function selectHeatmapCell(day, tokens, reqs) {
+  const tip = $('heatmapTip');
+  if (tip) {
+    tip.innerHTML = `<b>${day}</b> · <b>${fmtNum(tokens)}</b> Token · <b>${fmtNum(reqs)}</b> 次请求`;
+  }
+}
+
 // ── 2. 账号 ─────────────────────────────────────────────
 async function loadAccounts() {
   const want = engine;
@@ -607,13 +1212,15 @@ async function loadAgAccounts() {
 
     const poolRes = await getJson('/api/accounts/pool').catch(() => ({}));
     const selectedEmail = poolRes?.selected_email || '';
+    const hasBlocked = accs.some(a => !!a.validation_blocked);
 
     sch.innerHTML = `
       <div class="section-title" style="margin-bottom: 6px;">
         <span>账号调度</span>
-        <div style="display: flex; gap: 6px;">
+        <div style="display: flex; gap: 6px; flex-wrap: wrap;">
           <button class="btn btn-outline btn-sm" onclick="agRefreshAllQuota()">刷新全部额度</button>
           <button class="btn btn-outline btn-sm" onclick="agClearCooldowns()">清除冷却</button>
+          ${hasBlocked ? '<button class="btn btn-outline btn-sm" style="color:var(--danger);border-color:rgba(239,68,68,0.4);" onclick="agClearValidation(\'\')">解除全部验证标记</button>' : ''}
         </div>
       </div>
       <p class="muted" style="margin-bottom: 10px;">会话粘滞（保住 KV-Cache）+ 智能负载均衡，遇到限流自动冷却换号。</p>
@@ -644,12 +1251,22 @@ async function loadAgAccounts() {
               <div class="account-title-row">
                 <span class="account-name">${em}</span>
                 <span class="tag tag-global">Google</span>
+                <span id="tier-${id}">${tierTagHtml(agQuota[a.email]?.tier || a.tier)}</span>
+                ${a.validation_blocked ? '<span class="tag tag-offline" style="background:rgba(239,68,68,0.2);color:#ef4444;border:1px solid rgba(239,68,68,0.4);">需验证</span>' : ''}
                 <span class="tag ${a.hasRefreshToken ? 'tag-online' : 'tag-offline'}">${a.hasRefreshToken ? '● 正常' : '● 凭据缺失'}</span>
                 ${a.isActive ? '<span class="tag tag-online">当前</span>' : ''}
               </div>
               <div class="account-meta mono">项目 ${escapeHtml(a.projectId || '-')} · 令牌 ${a.expiresInMinutes > 0 ? a.expiresInMinutes + ' 分钟后续期' : '待续期'}</div>
             </div>
           </div>
+          ${a.validation_blocked ? `
+            <div class="account-validation-box">
+              <div class="validation-reason">⚠️ ${escapeHtml(a.validation_reason || '此账号需通过 Google 安全验证')}</div>
+              <div class="validation-actions">
+                ${a.validation_url ? `<a href="${escapeHtml(a.validation_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-outline btn-sm">去验证 ↗</a>` : ''}
+                <button class="btn btn-primary btn-sm" onclick="agClearValidation('${em}')">已验证，解除</button>
+              </div>
+            </div>` : ''}
           <div class="quota-list" id="quota-${id}">${quotaHtml(agQuota[a.email])}</div>
           <div class="kv"><span class="k">请求 / Token</span><span class="v">${fmtNum(u.total_requests)} / ${fmtNum(u.total_tokens)}</span></div>
           <div class="kv"><span class="k">输入 · 缓存 · 输出 · 思考</span><span class="v">${fmtNum(u.input_tokens)} · ${fmtNum(u.cached_tokens)} · ${fmtNum(u.output_tokens)} · ${fmtNum(u.thoughts_tokens)}</span></div>
@@ -677,6 +1294,27 @@ const agId = email => email.replace(/[^a-zA-Z0-9]/g, '_');
 function quotaHtml(q) {
   if (!q) return '<div class="muted">额度加载中…</div>';
   if (!q.ok) return `<div class="muted" style="color:var(--warning)">额度读取失败：${escapeHtml(q.message || q.error || '未知')}</div>`;
+
+  // 优先渲染 q.buckets；缺失时回退旧渲染
+  if (q.buckets && Array.isArray(q.buckets)) {
+    const validBuckets = q.buckets.filter(b => b && (typeof b.percentage === 'number' || b.percentage !== null));
+    if (!validBuckets.length) return '<div class="muted">暂无配额桶数据</div>';
+    return validBuckets.map(b => {
+      const label = escapeHtml(b.label || b.group || '配额');
+      const win = b.window === '7d' ? '周' : (b.window === '5h' ? '5小时' : escapeHtml(b.window || ''));
+      const name = `${label} ${win}`.trim();
+      const p = typeof b.percentage === 'number' ? b.percentage : null;
+      const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
+      const qr = (b.reset_text || '') + (b.inferred ? '（推算）' : '');
+      return `<div class="quota-row">
+        <span class="qn">${name}</span>
+        <div class="qbar"><i class="${cls}" style="width:${p ?? 0}%"></i></div>
+        <span class="qp">${p === null ? '--' : '剩 ' + p + '%'}</span>
+        <span class="qr">${escapeHtml(qr || '暂无数据')}</span>
+      </div>`;
+    }).join('') + (q.updated_time ? `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time)}</div>` : '');
+  }
+
   const rows = [['Gemini 5h', q.gemini_5h], ['Gemini 7天', q.gemini_7d], ['Claude 5h', q.claude_5h], ['Claude 7天', q.claude_7d]];
   return rows.map(([name, b]) => {
     const p = b && typeof b.percentage === 'number' ? b.percentage : null;
@@ -690,6 +1328,15 @@ function quotaHtml(q) {
   }).join('') + `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time || '')}</div>`;
 }
 
+function tierTagHtml(tier) {
+  if (!tier) return '';
+  const t = String(tier).toUpperCase();
+  if (t === 'ULTRA') return '<span class="tag tag-tier-ultra">ULTRA</span>';
+  if (t === 'PRO') return '<span class="tag tag-tier-pro">PRO</span>';
+  if (t === 'FREE') return '<span class="tag tag-tier-free">FREE</span>';
+  return `<span class="tag tag-tier-free">${escapeHtml(t)}</span>`;
+}
+
 async function agLoadQuota(email, toast) {
   const box = $(`quota-${agId(email)}`);
   if (box && toast) box.innerHTML = '<div class="muted">额度加载中…</div>';
@@ -698,7 +1345,19 @@ async function agLoadQuota(email, toast) {
   } catch (e) { agQuota[email] = { ok: false, message: e.message }; }
   const b = $(`quota-${agId(email)}`);
   if (b) b.innerHTML = quotaHtml(agQuota[email]);
+  const tierEl = $(`tier-${agId(email)}`);
+  if (tierEl) tierEl.innerHTML = tierTagHtml(agQuota[email]?.tier);
   if (toast) showToast('额度已刷新', 'success');
+}
+
+async function agClearValidation(email) {
+  try {
+    const res = await postJson('/api/accounts/clear-validation', { email: email || '' });
+    showToast((res && res.message) || (email ? '已解除验证标记' : '已解除全部验证标记'), 'success');
+    loadAgAccounts();
+  } catch (e) {
+    showToast('解除失败：' + e.message, 'error');
+  }
 }
 
 async function agSelect(email) {
@@ -1193,6 +1852,7 @@ async function clearLogs() {
   applyEngineChrome();
   loadOverview();
   setInterval(() => { if (currentTab === 'overview' && !document.hidden) loadOverview(); }, 15000);
+  setInterval(() => { if (currentTab === 'stats' && !document.hidden && engine === 'ag' && agReady()) loadTokenStats(false); }, 30000);
 })();
 
 
@@ -1201,4 +1861,5 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (typeof agReady === 'function' && !agReady()) return;
   postJson('/api/prewarm', { reason: 'foreground' }).catch(() => {});
+  if (currentTab === 'stats' && engine === 'ag') loadTokenStats(false);
 });

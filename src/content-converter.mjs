@@ -94,6 +94,7 @@ export function convertAnthropicToGoogle(anthropicRequest) {
         parts.push({ text: t });
       }
     } else if (Array.isArray(msg.content)) {
+      const mediaParts = []; // tool_result 内的图片，追加在本条消息末尾
       for (const item of msg.content) {
         if (item.type === 'text') {
           // PR1：剔掉网关插入的降级提示行，永不发回模型；剔完与从未插入时字节一致
@@ -126,8 +127,19 @@ export function convertAnthropicToGoogle(anthropicRequest) {
           const actualName = item.name || toolNameMap.get(toolCallId) || signatureCache.getName(toolCallId) || 'tool_response';
           
           let responseContent = item.content;
-          if (typeof responseContent !== 'string') {
-            responseContent = JSON.stringify(responseContent);
+          if (Array.isArray(responseContent)) {
+            // Anthropic tool_result.content 可以是块数组：文本块拼接为纯文本（不再整体 JSON 序列化），
+            // 图片块转为 inlineData 跟在本轮 functionResponse 之后，其它块保留 JSON 原文
+            const texts = [];
+            for (const b of responseContent) {
+              if (b && b.type === 'text') texts.push(b.text || '');
+              else if (b && b.type === 'image' && b.source?.data) {
+                mediaParts.push({ inlineData: { mimeType: b.source.media_type || 'image/jpeg', data: b.source.data } });
+              } else if (b != null) texts.push(typeof b === 'string' ? b : JSON.stringify(b));
+            }
+            responseContent = texts.join('\n');
+          } else if (typeof responseContent !== 'string') {
+            responseContent = responseContent == null ? '' : JSON.stringify(responseContent);
           }
           responseContent = historyPin.pinIf(conv + ':fr:' + toolCallId + ':' + actualName, responseContent, looksTrimmed);
 
@@ -146,8 +158,19 @@ export function convertAnthropicToGoogle(anthropicRequest) {
               data: item.source.data,
             },
           });
+        } else if (item.type === 'document' && item.source?.type === 'base64' && item.source.data) {
+          // PDF 等 base64 文档块：Gemini 原生支持 inlineData（此前被静默丢弃）
+          parts.push({
+            inlineData: {
+              mimeType: item.source.media_type || 'application/pdf',
+              data: item.source.data,
+            },
+          });
+        } else if (item.type === 'document' && item.source?.type === 'text' && item.source.data) {
+          parts.push({ text: String(item.source.data) });
         }
       }
+      if (mediaParts.length) parts.push(...mediaParts);
     }
 
     if (parts.length > 0) {
@@ -309,6 +332,9 @@ export function convertGoogleToAnthropic(googleData, originalModel) {
       });
     }
   }
+
+  // MAX_TOKENS → max_tokens（工具调用优先）
+  if (stopReason !== 'tool_use' && candidate?.finishReason === 'MAX_TOKENS') stopReason = 'max_tokens';
 
   // 兜底：如果内容为空，检查是否命中了 SAFETY；补全文本块防止下游客户端解析崩溃
   if (anthropicContent.length === 0) {
