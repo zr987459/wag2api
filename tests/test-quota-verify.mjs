@@ -116,25 +116,27 @@ await ok('mergeModelQuotas：包含 argon 模型的识别为 argon', () => {
   assert.equal(merged.argon_5h.fraction, 0.6);
 });
 
-// ==================== 3. buckets 列表只含有数据的桶并排序 ====================
-await ok('buildBuckets：只包含真实拿到数据的桶并按 gemini, claude, argon（5h 在前）排序', () => {
+// ==================== 3. buckets 列表：4个核心桶总是出现且缺失标记正确，Argon仅有数据时出现 ====================
+await ok('buildBuckets：4个核心桶总是出现且缺失标记正确，Argon仅有数据时出现', () => {
   const merged = {
     gemini_5h: { fraction: 0.45, reset: '2026-10-29T15:00:00Z', source: 'remainingFraction' },
-    gemini_7d: null, // 无数据，不包含在列表中
+    gemini_7d: null, // 无数据，核心桶必须出现但带 missing: true
     claude_7d: { fraction: 1, reset: '2026-11-05T00:00:00Z', source: 'summary' },
     claude_5h: { fraction: 0.8, reset: '2026-10-29T15:00:00Z', source: 'summary' },
     argon_5h: { fraction: 0, reset: '2026-10-29T16:00:00Z', source: 'remainingFraction' },
-    argon_7d: null, // 无数据
+    argon_7d: null, // 无数据，Argon 非核心桶，不出现
   };
   const buckets = buildBuckets(merged);
-  assert.equal(buckets.length, 4);
+  assert.equal(buckets.length, 5);
   assert.deepEqual(buckets.map(b => `${b.group}:${b.window}`), [
     'gemini:5h',
+    'gemini:7d',
     'claude:5h',
     'claude:7d',
     'argon:5h',
   ]);
   assert.deepEqual(buckets.map(b => b.label), [
+    'Gemini',
     'Gemini',
     'Claude / GPT',
     'Claude / GPT',
@@ -142,8 +144,22 @@ await ok('buildBuckets：只包含真实拿到数据的桶并按 gemini, claude,
   ]);
   assert.equal(buckets[0].percentage, 45);
   assert.equal(buckets[0].remaining_fraction, 0.45);
-  assert.equal(buckets[3].percentage, 0);
-  assert.equal(buckets[3].remaining_fraction, 0);
+  assert.equal(buckets[0].missing, false);
+
+  assert.equal(buckets[1].percentage, null);
+  assert.equal(buckets[1].remaining_fraction, null);
+  assert.equal(buckets[1].missing, true);
+  assert.ok(buckets[1].note && buckets[1].note.includes('Gemini 周额度'));
+
+  assert.equal(buckets[2].percentage, 80);
+  assert.equal(buckets[2].missing, false);
+
+  assert.equal(buckets[3].percentage, 100);
+  assert.equal(buckets[3].missing, false);
+
+  assert.equal(buckets[4].percentage, 0);
+  assert.equal(buckets[4].remaining_fraction, 0);
+  assert.equal(buckets[4].missing, false);
 });
 
 await ok('toPublic：reset 为空时 reset_text 返回空字符串（不再返回动态自适应）', () => {

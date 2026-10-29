@@ -219,45 +219,98 @@ export function toPublic(r) {
   };
 }
 
-const BUCKET_SPECS = [
-  { key: 'gemini_5h', group: 'gemini', label: 'Gemini', window: '5h' },
-  { key: 'gemini_7d', group: 'gemini', label: 'Gemini', window: '7d' },
-  { key: 'claude_5h', group: 'claude', label: 'Claude / GPT', window: '5h' },
-  { key: 'claude_7d', group: 'claude', label: 'Claude / GPT', window: '7d' },
-  { key: 'argon_5h',  group: 'argon',  label: 'Argon', window: '5h' },
-  { key: 'argon_7d',  group: 'argon',  label: 'Argon', window: '7d' },
+export const BUCKET_SPECS = [
+  { key: 'gemini_5h', group: 'gemini', label: 'Gemini', window: '5h', core: true },
+  { key: 'gemini_7d', group: 'gemini', label: 'Gemini', window: '7d', core: true },
+  { key: 'claude_5h', group: 'claude', label: 'Claude / GPT', window: '5h', core: true },
+  { key: 'claude_7d', group: 'claude', label: 'Claude / GPT', window: '7d', core: true },
+  { key: 'argon_5h',  group: 'argon',  label: 'Argon', window: '5h', core: false },
+  { key: 'argon_7d',  group: 'argon',  label: 'Argon', window: '7d', core: false },
 ];
 
-/** 构建动态 buckets 列表：只包含真实拿到数据的桶，按 gemini, claude, argon，5h 在前排序 */
+/** 识别模型名称归属家族：'gemini' | 'claude' | 'argon' */
+export function getModelFamily(name = '') {
+  const m = String(name || '').toLowerCase();
+  if (m.includes('argon')) return 'argon';
+  if (/claude|gpt|3p/.test(m)) return 'claude';
+  return 'gemini';
+}
+
+/** 提取指定家族的更小已知额度比例（取 5h 与 7d 的 min，单个已知取该值，均未知取 null） */
+export function extractFamilyFraction(quotaObj, family) {
+  if (!quotaObj || typeof quotaObj !== 'object') return null;
+  const f5hObj = quotaObj[`${family}_5h`];
+  const f7dObj = quotaObj[`${family}_7d`];
+  const f5h = typeof f5hObj === 'number' ? f5hObj : (f5hObj?.remaining_fraction ?? f5hObj?.fraction ?? null);
+  const f7d = typeof f7dObj === 'number' ? f7dObj : (f7dObj?.remaining_fraction ?? f7dObj?.fraction ?? null);
+
+  const has5h = typeof f5h === 'number';
+  const has7d = typeof f7d === 'number';
+  if (has5h && has7d) return Math.min(f5h, f7d);
+  if (has5h) return f5h;
+  if (has7d) return f7d;
+  return null;
+}
+
+/** 将完整 quota 结果汇总为三个家族的有效配额 (0~1 或 null) */
+export function computeAccountQuotas(quotaData) {
+  return {
+    gemini: extractFamilyFraction(quotaData, 'gemini'),
+    claude: extractFamilyFraction(quotaData, 'claude'),
+    argon: extractFamilyFraction(quotaData, 'argon'),
+  };
+}
+
+/** 构建动态 buckets 列表：Gemini/Claude 4个核心桶总是出现（没数据 missing:true），Argon 只在有数据时出现 */
 export function buildBuckets(merged) {
-  if (!merged || typeof merged !== 'object') return [];
+  const safeMerged = (merged && typeof merged === 'object') ? merged : {};
   const buckets = [];
+
   for (const spec of BUCKET_SPECS) {
-    const item = merged[spec.key];
-    if (!item || typeof item !== 'object') continue;
-    const fraction = item.remaining_fraction !== undefined ? item.remaining_fraction : item.fraction;
-    if (typeof fraction !== 'number') continue;
+    const item = safeMerged[spec.key];
+    const fraction = item?.remaining_fraction !== undefined ? item.remaining_fraction : item?.fraction;
+    const hasData = typeof fraction === 'number';
 
-    const percentage = item.percentage !== undefined
-      ? item.percentage
-      : Math.round(fraction * 100);
-    const resetTime = item.reset_time !== undefined ? item.reset_time : (item.reset || null);
-    const resetText = item.reset_text !== undefined ? item.reset_text : (parseResetTime(resetTime) || '');
-    const source = item.source || null;
-    const inferred = Boolean(item.inferred);
+    if (hasData) {
+      const percentage = item.percentage !== undefined
+        ? item.percentage
+        : Math.round(fraction * 100);
+      const resetTime = item.reset_time !== undefined ? item.reset_time : (item.reset || null);
+      const resetText = item.reset_text !== undefined ? item.reset_text : (parseResetTime(resetTime) || '');
+      const source = item.source || null;
+      const inferred = Boolean(item.inferred);
 
-    buckets.push({
-      group: spec.group,
-      label: spec.label,
-      window: spec.window,
-      percentage,
-      remaining_fraction: fraction,
-      reset_time: resetTime,
-      reset_text: resetText,
-      source,
-      inferred,
-    });
+      buckets.push({
+        group: spec.group,
+        label: spec.label,
+        window: spec.window,
+        percentage,
+        remaining_fraction: fraction,
+        reset_time: resetTime,
+        reset_text: resetText,
+        source,
+        inferred,
+        missing: false,
+      });
+    } else if (spec.core) {
+      buckets.push({
+        group: spec.group,
+        label: spec.label,
+        window: spec.window,
+        percentage: null,
+        remaining_fraction: null,
+        reset_time: null,
+        reset_text: '',
+        source: null,
+        inferred: false,
+        missing: true,
+        note: spec.key === 'gemini_7d'
+          ? '接口未返回（Pro 号通常没有 Gemini 周额度）'
+          : '接口未返回',
+      });
+    }
   }
+
   return buckets;
 }
 

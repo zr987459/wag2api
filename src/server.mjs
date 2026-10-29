@@ -19,7 +19,8 @@ import { runConnectivityTest } from './test-runner.mjs';
 import { hostBench } from './host-bench.mjs';
 import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
 import { prewarm, lastPrewarm } from './prewarm.mjs';
-import { fetchRealQuota } from './quota-fetcher.mjs';
+import { fetchRealQuota, computeAccountQuotas, getModelFamily } from './quota-fetcher.mjs';
+import { testAccount, testAllAccounts } from './account-tester.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
 import { parseAgImport } from './ag-import.mjs';
 import { statsTracker } from './stats.mjs';
@@ -128,6 +129,7 @@ const ADMIN_PATHS = new Set([
   '/api/oauth/exchange', '/api/oauth/token-exchange', '/api/accounts/add-token', '/api/accounts/switch',
   '/api/accounts/remove', '/api/accounts/export', '/api/accounts/import', '/api/trend', '/api/stats/timing',
   '/api/accounts/clear-validation',
+  '/api/accounts/test', '/api/accounts/test-all', '/api/scheduling',
 ]);
 
 
@@ -296,15 +298,65 @@ const server = http.createServer(async (req, res) => {
     const mgr = email ? accountPool.getManager(email) : accountPool.getActiveManager();
     const targetMgr = mgr || accountPool.getActiveManager();
     const quotaData = await fetchRealQuota(targetMgr);
-    const frac = quotaData?.gemini_5h?.remaining_fraction;
-    if (quotaData?.ok && quotaData.email && typeof frac === 'number') quotaCache.set(quotaData.email, frac);
+    if (quotaData?.ok && quotaData.email) {
+      const familyQuotas = computeAccountQuotas(quotaData);
+      quotaCache.set(quotaData.email, familyQuotas);
+      accountPool.updateQuota(quotaData.email, familyQuotas);
+    }
     sendJson(res, 200, quotaData);
     return;
   }
 
   // 2.2 AG 账号池调度与切换接口
   if (url.pathname === '/api/accounts/pool') {
-    sendJson(res, 200, { ok: true, accounts: accountPool.poolStatus(), selected_email: accountPool.getSelectedEmail() });
+    sendJson(res, 200, {
+      ok: true,
+      accounts: accountPool.poolStatus(),
+      selected_email: accountPool.getSelectedEmail(),
+      scheduling: accountPool.getScheduling(),
+    });
+    return;
+  }
+  if (url.pathname === '/api/scheduling' && req.method === 'POST') {
+    try {
+      const { mode, fixed_email } = await readBody(req);
+      const scheduling = accountPool.setScheduling({ mode, fixed_email });
+      sendJson(res, 200, { ok: true, scheduling });
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e.message });
+    }
+    return;
+  }
+  if (url.pathname === '/api/accounts/test' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const email = body.email || '';
+      const model = body.model || 'gemini-3.8-flash';
+      const result = await testAccount({
+        email,
+        model,
+        accountPool,
+        cooldowns,
+      });
+      sendJson(res, 200, result);
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+  if (url.pathname === '/api/accounts/test-all' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const model = body.model || 'gemini-3.8-flash';
+      const out = await testAllAccounts({
+        model,
+        accountPool,
+        cooldowns,
+      });
+      sendJson(res, 200, out);
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message });
+    }
     return;
   }
   if (url.pathname === '/api/accounts/select' && req.method === 'POST') {
@@ -642,7 +694,7 @@ const server = http.createServer(async (req, res) => {
         };
 
         // 智能选号：优先命中会话亲和表（保持 KV-Cache），新会话按最小负载轮询分发，支持 429 冷却避障
-        let activeMgr = accountPool.pickManager(anthropicReq._gwSessionKey);
+        let activeMgr = accountPool.pickManager(anthropicReq._gwSessionKey, new Set(), { model: anthropicReq.model });
         if (!activeMgr) {
           const errMsg = '账号池暂无可用 Google 账号，请在控制台添加账号';
           if (isOaiChat) {
@@ -685,7 +737,20 @@ const server = http.createServer(async (req, res) => {
           upstreamOf: mapToUpstreamModel,
           accounts: () => Array.from(accountPool.managers.values()),
           activeEmail: activeMgr.tokenData.email,
-          quotaOf: email => quotaCache.get(email) ?? null,
+          quotaOf: (email, family) => {
+            const fam = family || getModelFamily(anthropicReq.model);
+            const q = accountPool.getQuota(email, fam);
+            if (typeof q === 'number') return q;
+            const c = quotaCache.get(email);
+            if (c && typeof c === 'object') return c[fam] ?? null;
+            return typeof c === 'number' ? c : null;
+          },
+          recordPerf: (email, ok, latencyMs) => {
+            accountPool.recordResult(email, ok, latencyMs);
+          },
+          onCooldown: (email, delayMs) => {
+            accountPool.markCooling(email, delayMs);
+          },
           cooldowns,
           prepare: async (mgr) => {
             const tok = await mgr.getValidAccessToken();

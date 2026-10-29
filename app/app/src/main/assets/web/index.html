@@ -70,36 +70,8 @@
       </div>
     </div>
 
-    <div class="card ov-stats">
-      <div class="section-title">
-        <span>Token 明细</span>
-        <div class="sub-tabs">
-          <span class="sub-tab active" data-range="today" onclick="setStatRange('today')">今日</span>
-          <span class="sub-tab" data-range="total" onclick="setStatRange('total')">累计</span>
-        </div>
-      </div>
-      <div class="stat-grid" id="statGrid"></div>
-    </div>
-
-    <div class="card ov-timing" id="timingCard" style="display:none;">
-      <div class="section-title"><span>分段耗时 · 最近 20 条中位数</span></div>
-      <div class="stat-grid" id="timingGrid"></div>
-      <div class="muted" id="timingFoot" style="font-size:11px;margin-top:6px;"></div>
-      <div class="muted" id="dgFoot" style="font-size:11px;margin-top:4px;"></div>
-    </div>
-
-    <div class="card ov-trend">
-      <div class="section-title">
-        <span>近 24 小时</span>
-        <div class="sub-tabs">
-          <span class="sub-tab active" data-trend="tokens" onclick="setTrendMode('tokens')">Token</span>
-          <span class="sub-tab" data-trend="requests" onclick="setTrendMode('requests')">请求</span>
-        </div>
-      </div>
-      <div class="muted" id="trendSummary">-</div>
-      <div class="trend" id="trendBars"></div>
-      <div class="trend-axis" id="trendAxis"></div>
-    </div>
+    <!-- 概览统计区（AG 引擎展示完整 Token 消费统计；WB 引擎提示仅支持 AG） -->
+    <div id="overviewStatsContainer"></div>
 
     <div class="card">
       <div class="section-title"><span class="android-only">网关全局设置</span><span class="standalone-only">维护</span></div>
@@ -132,11 +104,6 @@
         <button class="btn btn-outline" style="flex:1;" onclick="resetStats()">清零本引擎统计</button>
       </div>
     </div>
-  </main>
-
-  <!-- 1.5. 统计 (仅 AG 引擎) -->
-  <main id="view-stats" class="tab-content">
-    <div id="statsContent"></div>
   </main>
 
   <!-- 2. 账号 -->
@@ -199,7 +166,6 @@
   <nav class="bottom-nav">
     <div class="nav-brand">wag2api<span id="navEngine"></span></div>
     <div class="nav-item active" data-tab="overview" onclick="switchTab('overview')"><div class="nav-icon">📊</div><div>概览</div></div>
-    <div class="nav-item" data-tab="stats" onclick="switchTab('stats')"><div class="nav-icon">📈</div><div>统计</div></div>
     <div class="nav-item" data-tab="accounts" onclick="switchTab('accounts')"><div class="nav-icon">👤</div><div>账号</div></div>
     <div class="nav-item" data-tab="keys" onclick="switchTab('keys')"><div class="nav-icon">🔑</div><div>接入</div></div>
     <div class="nav-item" data-tab="chat" onclick="switchTab('chat')"><div class="nav-icon">💬</div><div>对话</div></div>

@@ -15,9 +15,11 @@
 import crypto from 'crypto';
 import { FALLBACK_THOUGHT_SIGNATURE } from './signature-cache.mjs';
 import { resolveSessionId } from './session-router.mjs';
+import { getModelFamily } from './quota-fetcher.mjs';
 
 export const SAME_ACCOUNT_RETRY_MAX_MS = 5000;
 export const DEFAULT_COOLDOWN_MS = 60000;
+export const MAX_QUOTA_COOLDOWN_MS = 5 * 60 * 60 * 1000; // 5 小时上限
 
 // ---------- 错误分类 ----------
 
@@ -85,18 +87,92 @@ export function classifyFailure({ status = 0, body = '', error = null } = {}) {
   return 'bad_request';
 }
 
-/** 从 Google 错误体的 RetryInfo.retryDelay（"3.5s"）或 Retry-After 头取等待毫秒数；取不到返回 null */
+/** 从 Google 错误体的 RetryInfo.retryDelay（"35s" / "3.5s"）或 Retry-After 头取等待毫秒数；取不到返回 null */
 export function parseRetryDelayMs(body = '', headers = null) {
-  const m = String(body || '').match(/"retryDelay"\s*:\s*"([\d.]+)s"/);
-  if (m) return Math.round(parseFloat(m[1]) * 1000);
   const ra = headers && (typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after']);
   if (ra !== null && ra !== undefined && ra !== '') {
     const s = Number(ra);
     if (Number.isFinite(s)) return Math.max(0, Math.round(s * 1000));
+    const mHeader = String(ra).trim().match(/^([\d.]+)\s*s?$/i);
+    if (mHeader) return Math.max(0, Math.round(parseFloat(mHeader[1]) * 1000));
     const t = Date.parse(ra);
     if (Number.isFinite(t)) return Math.max(0, t - Date.now());
   }
+
+  const text = typeof body === 'string' ? body : (body ? JSON.stringify(body) : '');
+  const m = text.match(/"retryDelay"\s*:\s*"([\d.]+)s?"/i) || text.match(/"retryDelay"\s*:\s*([\d.]+)/i);
+  if (m) return Math.round(parseFloat(m[1]) * 1000);
+
   return null;
+}
+
+/**
+ * 解析 429 冷却时长：
+ * 1. 如果 body/headers 带 retry-after 或 retryDelay（如 "35s"），按它冷却；
+ * 2. 若带 quota 重置时间且额度耗尽，冷却到重置时间（上限 5 小时）；
+ * 3. 否则沿用现有默认冷却 (DEFAULT_COOLDOWN_MS)。
+ */
+export function calculateCooldownMs(body = '', headers = null, now = Date.now) {
+  const currentNow = typeof now === 'function' ? now() : now;
+
+  // 1. 显式 retry-after 或 retryDelay
+  const delay = parseRetryDelayMs(body, headers);
+  if (delay !== null) {
+    return Math.max(1000, delay);
+  }
+
+  const text = typeof body === 'string' ? body : (body ? JSON.stringify(body) : '');
+
+  // 2. 检查配额重置时间（当额度耗尽 / 429 时）
+  const isQuotaExhausted = /RESOURCE_EXHAUSTED|QUOTA_EXHAUSTED|quota exceeded|quota limit hit|out of quota|quota.*exhausted/i.test(text);
+
+  let resetMs = null;
+
+  // 检查 metadata 或字段中的 quotaResetDelay
+  const mResetDelay = text.match(/"quotaResetDelay"\s*:\s*"([\d.]+)\s*(s|sec|m|min|h|hours?)?"/i) || text.match(/"quotaResetDelay"\s*:\s*([\d.]+)/i);
+  if (mResetDelay) {
+    const val = parseFloat(mResetDelay[1]);
+    const unit = (mResetDelay[2] || 's').toLowerCase();
+    if (unit.startsWith('h')) resetMs = Math.round(val * 3600 * 1000);
+    else if (unit.startsWith('m')) resetMs = Math.round(val * 60 * 1000);
+    else resetMs = Math.round(val * 1000);
+  }
+
+  // 检查 resetTime / quotaResetTime / reset_time
+  if (resetMs === null) {
+    const mResetTime = text.match(/"(?:quotaResetTime|resetTime|reset_time)"\s*:\s*"([^"]+)"/i);
+    if (mResetTime) {
+      const parsed = Date.parse(mResetTime[1]);
+      if (Number.isFinite(parsed) && parsed > currentNow) {
+        resetMs = parsed - currentNow;
+      }
+    }
+  }
+
+  // 检查自然语言文本中的重置时间（如 "resets in 1h19m" 或 "quota will reset in 300 seconds"）
+  if (resetMs === null) {
+    const mTextSec = text.match(/quota will reset in (\d+)\s*sec/i);
+    if (mTextSec) {
+      resetMs = parseInt(mTextSec[1], 10) * 1000;
+    } else {
+      const mTextIn = text.match(/resets? in ([\d.]+)\s*(s|sec|seconds?|m|min|minutes?|h|hours?)\b/i);
+      if (mTextIn) {
+        const val = parseFloat(mTextIn[1]);
+        const unit = mTextIn[2].toLowerCase();
+        if (unit.startsWith('h')) resetMs = Math.round(val * 3600 * 1000);
+        else if (unit.startsWith('m')) resetMs = Math.round(val * 60 * 1000);
+        else resetMs = Math.round(val * 1000);
+      }
+    }
+  }
+
+  if (resetMs !== null && (isQuotaExhausted || resetMs > 0)) {
+    // 冷却到重置时间（上限 5 小时）
+    return Math.min(Math.max(1000, resetMs), MAX_QUOTA_COOLDOWN_MS);
+  }
+
+  // 3. 默认冷却
+  return DEFAULT_COOLDOWN_MS;
 }
 
 // ---------- 冷却表（账号 + 上游模型） ----------
@@ -117,6 +193,13 @@ export class Cooldowns {
     return true;
   }
   remainingMs(email, model) { const u = this.map.get(this.key(email, model)) || 0; return Math.max(0, u - this.now()); }
+  clearAccount(email) {
+    const clean = (email || '').trim();
+    for (const k of this.map.keys()) {
+      if (k.startsWith(`${clean}\u0000`)) this.map.delete(k);
+    }
+  }
+  clear() { this.map.clear(); }
   list() {
     const out = [];
     for (const [k, until] of this.map) {
@@ -207,21 +290,58 @@ export async function runWithPolicy(ctx) {
     });
     const free = all.filter(m => !ctx.cooldowns.isCooling(m.tokenData.email, upModel));
     const active = free.find(m => m.tokenData.email === ctx.activeEmail);
-    const q = m => { const v = ctx.quotaOf ? ctx.quotaOf(m.tokenData.email) : null; return typeof v === 'number' ? v : -1; };
-    const rest = free.filter(m => m !== active).map((m, i) => ({ m, i })).sort((a, b) => q(b.m) - q(a.m) || a.i - b.i).map(x => x.m);
-    return active ? [active, ...rest] : rest;
+
+    const family = getModelFamily(ctx.model);
+    const getQuota = (m) => {
+      const v = ctx.quotaOf ? ctx.quotaOf(m.tokenData.email, family) : null;
+      return typeof v === 'number' ? v : null;
+    };
+
+    const isLow = (m) => {
+      const q = getQuota(m);
+      return q !== null && q < 0.05;
+    };
+
+    const qScore = (m) => {
+      const q = getQuota(m);
+      return q !== null ? q : 0.5; // 未知 (null) 当作中性 0.5
+    };
+
+    const hasNonLow = free.some(m => !isLow(m));
+
+    const sortFn = (a, b) => {
+      if (hasNonLow) {
+        const lowA = isLow(a.m) ? 1 : 0;
+        const lowB = isLow(b.m) ? 1 : 0;
+        if (lowA !== lowB) return lowA - lowB;
+      }
+      return qScore(b.m) - qScore(a.m) || a.i - b.i;
+    };
+
+    // 如果 active 号本身额度 <5% 且号池中有其他可用正常号，则 active 号不可优先占用首位，一并参与重排
+    if (active && (!hasNonLow || !isLow(active))) {
+      const rest = free.filter(m => m !== active).map((m, i) => ({ m, i })).sort(sortFn).map(x => x.m);
+      return [active, ...rest];
+    }
+
+    return free.map((m, i) => ({ m, i })).sort(sortFn).map(x => x.m);
   };
 
   const attempt = async (payload, mgr, host) => {
     const timeoutMs = timeoutFor();
     attempts++;
+    const attemptStart = now();
     try {
       const r = await ctx.send(payload, mgr, host, timeoutMs);
+      const latencyMs = now() - attemptStart;
+      try { ctx.recordPerf?.(mgr.tokenData.email, Boolean(r && r.ok), latencyMs); } catch (e) {}
       if (r && r.ok) return { ok: true, response: r };
       const body = r ? await r.text().catch(() => '') : '';
       const status = r ? r.status : 0;
       return { ok: false, status, body, headers: r?.headers || null, kind: classifyFailure({ status, body }) };
     } catch (error) {
+      const latencyMs = now() - attemptStart;
+      try { ctx.recordPerf?.(mgr.tokenData.email, false, latencyMs); } catch (e) {}
       return { ok: false, status: 0, body: String(error?.message || error), kind: classifyFailure({ error }) };
     }
   };
@@ -275,15 +395,17 @@ export async function runWithPolicy(ctx) {
       return { ok: false, mgr, modelUsed: ctx.model, downgraded: false, reason: null, switchedAccount, attempts, error: lastError };
     }
     if (r.kind === 'quota') {
-      const delay = parseRetryDelayMs(r.body, r.headers);
-      if (delay !== null && delay <= SAME_ACCOUNT_RETRY_MAX_MS && !sameAccountRetried) {
+      const explicitDelay = parseRetryDelayMs(r.body, r.headers);
+      if (explicitDelay !== null && explicitDelay <= SAME_ACCOUNT_RETRY_MAX_MS && !sameAccountRetried) {
         sameAccountRetried = true;
-        log(`[Policy] ${mgr.tokenData.email} 429，${delay}ms 后原账号重试`);
-        await sleep(delay);
+        log(`[Policy] ${mgr.tokenData.email} 429，${explicitDelay}ms 后原账号重试`);
+        await sleep(explicitDelay);
         continue;
       }
-      ctx.cooldowns.set(mgr.tokenData.email, upMain, delay ?? DEFAULT_COOLDOWN_MS);
-      log(`[Policy] ${mgr.tokenData.email} × ${upMain} 冷却 ${Math.round((delay ?? DEFAULT_COOLDOWN_MS) / 1000)}s，换号`);
+      const delay = calculateCooldownMs(r.body, r.headers, now);
+      ctx.cooldowns.set(mgr.tokenData.email, upMain, delay);
+      try { ctx.onCooldown?.(mgr.tokenData.email, delay, upMain); } catch (e) {}
+      log(`[Policy] ${mgr.tokenData.email} × ${upMain} 冷却 ${Math.round(delay / 1000)}s，换号`);
       nextAccount();
       continue;
     }
@@ -336,7 +458,11 @@ export async function runWithPolicy(ctx) {
         if (m.tokenData.email !== ctx.activeEmail) switchedAccount = true;
         return success(r.response, m, dm, reason);
       }
-      if (r.kind === 'quota') ctx.cooldowns.set(m.tokenData.email, up, parseRetryDelayMs(r.body, r.headers) ?? DEFAULT_COOLDOWN_MS);
+      if (r.kind === 'quota') {
+        const delay = calculateCooldownMs(r.body, r.headers, now);
+        ctx.cooldowns.set(m.tokenData.email, up, delay);
+        try { ctx.onCooldown?.(m.tokenData.email, delay, up); } catch (e) {}
+      }
       log(`[Policy] 降级模型 ${dm} 失败：${r.kind}(${r.status})`);
     }
   }

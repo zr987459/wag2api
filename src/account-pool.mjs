@@ -11,14 +11,32 @@
 import fs from 'fs';
 import path from 'path';
 import { TokenManager } from './token-manager.mjs';
+import { getModelFamily, extractFamilyFraction } from './quota-fetcher.mjs';
 
 export const AG_DEFAULT_COOLDOWN_MS = 10000;
 export const AG_SESSION_TTL_MS = 30 * 60 * 1000; // 30 分钟会话亲和期
 export const MAX_AFFINITY_ENTRIES = 1000; // 内存保护：最多存 1000 个活跃会话
 
+export const SCHEDULING_MODES = [
+  { id: 'cache_first', label: '缓存优先', desc: '会话粘滞优先，最大限度复用 Prompt 缓存' },
+  { id: 'balance', label: '均衡轮询', desc: '不粘性，综合配额与最近使用均衡调度' },
+  { id: 'performance', label: '性能优先', desc: '不粘性，优先最近成功率高、延迟低的账号' },
+  { id: 'fixed', label: '固定账号', desc: '固定使用指定账号，遇冷或失败时自动切换' },
+];
+
 export class AccountPool {
-  constructor(accountsDir) {
+  constructor(accountsDir, options = {}) {
     this.accountsDir = accountsDir;
+    this.options = options;
+    this.schedulingFile = options.schedulingFile || (
+      path.basename(accountsDir) === 'accounts'
+        ? path.join(path.dirname(accountsDir), 'scheduling.json')
+        : path.join(accountsDir, 'scheduling.json')
+    );
+    this.schedulingMode = 'cache_first';
+    this.fixedEmail = '';
+    this.perfHistory = new Map(); // email -> { records: [{ success, latency_ms }], fail_streak }
+    this.quotaMap = new Map();    // email -> { gemini, claude, argon }
     this.managers = new Map(); // email -> TokenManager
     this.activeEmail = '';     // 兼容老字段
     this.selectedEmail = '';   // 手动指定的账号，为空表示自动智能调度
@@ -30,6 +48,7 @@ export class AccountPool {
   }
 
   init() {
+    this.loadScheduling();
     if (!fs.existsSync(this.accountsDir)) {
       fs.mkdirSync(this.accountsDir, { recursive: true });
     }
@@ -102,6 +121,8 @@ export class AccountPool {
       this.cooldownUntil.delete(clean);
       this.validationBlocks.delete(clean);
       this.lastUsed.delete(clean);
+      this.perfHistory.delete(clean);
+      this.quotaMap.delete(clean);
 
       // 清理 sessionAffinity 中的该账号
       for (const [sKey, bound] of this.sessionAffinity.entries()) {
@@ -136,6 +157,8 @@ export class AccountPool {
     this.validationBlocks.clear();
     this.sessionAffinity.clear();
     this.lastUsed.clear();
+    this.perfHistory.clear();
+    this.quotaMap.clear();
     if (fs.existsSync(this.accountsDir)) {
       const files = fs.readdirSync(this.accountsDir);
       for (const f of files) {
@@ -170,6 +193,11 @@ export class AccountPool {
     if (!until) return 0;
     const left = until - Date.now();
     return left > 0 ? Math.ceil(left / 1000) : 0;
+  }
+
+  clearCooldown(email) {
+    const clean = (email || '').trim();
+    if (clean) this.cooldownUntil.delete(clean);
   }
 
   clearAllCooldowns() {
@@ -224,6 +252,144 @@ export class AccountPool {
     this.validationBlocks.clear();
   }
 
+  // 调度持久化与设置
+  loadScheduling() {
+    try {
+      if (this.schedulingFile && fs.existsSync(this.schedulingFile)) {
+        const raw = fs.readFileSync(this.schedulingFile, 'utf8');
+        const data = JSON.parse(raw);
+        const validModes = ['cache_first', 'balance', 'performance', 'fixed'];
+        if (data && validModes.includes(data.mode)) {
+          this.schedulingMode = data.mode;
+        }
+        if (data && typeof data.fixed_email === 'string') {
+          this.fixedEmail = data.fixed_email.trim();
+          if (this.schedulingMode === 'fixed') {
+            this.selectedEmail = this.fixedEmail;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[AccountPool] 读取 scheduling.json 失败:', e.message);
+    }
+  }
+
+  saveScheduling() {
+    try {
+      if (this.schedulingFile) {
+        fs.mkdirSync(path.dirname(this.schedulingFile), { recursive: true });
+        const content = JSON.stringify({
+          mode: this.schedulingMode,
+          fixed_email: this.fixedEmail,
+        }, null, 2);
+        fs.writeFileSync(this.schedulingFile, content, 'utf8');
+      }
+    } catch (e) {
+      console.warn('[AccountPool] 保存 scheduling.json 失败:', e.message);
+    }
+  }
+
+  getSchedulingMode() { return this.schedulingMode; }
+  getFixedEmail() { return this.fixedEmail; }
+
+  getScheduling() {
+    return {
+      mode: this.schedulingMode,
+      fixed_email: this.fixedEmail,
+      modes: SCHEDULING_MODES,
+    };
+  }
+
+  setScheduling({ mode, fixed_email = '' } = {}) {
+    const validModes = ['cache_first', 'balance', 'performance', 'fixed'];
+    if (!mode || !validModes.includes(mode)) {
+      throw new Error(`无效的调度模式: ${mode}`);
+    }
+    this.schedulingMode = mode;
+    this.fixedEmail = (fixed_email || '').trim();
+    if (this.schedulingMode === 'fixed') {
+      this.selectedEmail = this.fixedEmail;
+    } else if (this.selectedEmail === this.fixedEmail) {
+      this.selectedEmail = '';
+    }
+    this.saveScheduling();
+    console.log(`[AccountPool] 调度策略已更新 ➔ 模式: ${this.schedulingMode}${this.fixedEmail ? ', 固定账号: ' + this.fixedEmail : ''}`);
+    return this.getScheduling();
+  }
+
+  // 性能统计与配额
+  recordResult(email, success, latencyMs = 0) {
+    const clean = (email || '').trim();
+    if (!clean) return;
+    let history = this.perfHistory.get(clean);
+    if (!history) {
+      history = { records: [], fail_streak: 0 };
+      this.perfHistory.set(clean, history);
+    }
+    const isSuccess = Boolean(success);
+    history.records.push({
+      success: isSuccess,
+      latency_ms: Math.max(0, Math.round(Number(latencyMs) || 0)),
+    });
+    if (history.records.length > 20) {
+      history.records.shift();
+    }
+    if (isSuccess) {
+      history.fail_streak = 0;
+    } else {
+      history.fail_streak = (history.fail_streak || 0) + 1;
+    }
+  }
+
+  getPerfStats(email) {
+    const clean = (email || '').trim();
+    const history = this.perfHistory.get(clean);
+    if (!history || !history.records.length) {
+      return {
+        success_rate: null,
+        avg_latency_ms: null,
+        fail_streak: 0,
+      };
+    }
+    const recs = history.records;
+    const successes = recs.filter(r => r.success).length;
+    const success_rate = Math.round((successes / recs.length) * 100) / 100;
+    const sumLatency = recs.reduce((sum, r) => sum + r.latency_ms, 0);
+    const avg_latency_ms = Math.round(sumLatency / recs.length);
+    return {
+      success_rate,
+      avg_latency_ms,
+      fail_streak: history.fail_streak || 0,
+    };
+  }
+
+  updateQuota(email, quotaObj) {
+    const clean = (email || '').trim();
+    if (!clean) return;
+    if (typeof quotaObj === 'number') {
+      this.quotaMap.set(clean, { gemini: quotaObj, claude: quotaObj, argon: quotaObj });
+      return;
+    }
+    if (!quotaObj || typeof quotaObj !== 'object') return;
+    const prev = this.quotaMap.get(clean) || { gemini: null, claude: null, argon: null };
+    const next = {
+      gemini: quotaObj.gemini !== undefined ? quotaObj.gemini : extractFamilyFraction(quotaObj, 'gemini'),
+      claude: quotaObj.claude !== undefined ? quotaObj.claude : extractFamilyFraction(quotaObj, 'claude'),
+      argon: quotaObj.argon !== undefined ? quotaObj.argon : extractFamilyFraction(quotaObj, 'argon'),
+    };
+    this.quotaMap.set(clean, { ...prev, ...next });
+  }
+
+  getQuota(email, family = 'gemini') {
+    const clean = (email || '').trim();
+    const entry = this.quotaMap.get(clean);
+    if (!entry) return null;
+    if (typeof entry === 'number') return entry;
+    const fam = (family || 'gemini').toLowerCase();
+    const val = entry[fam];
+    return typeof val === 'number' ? val : null;
+  }
+
   // 调度设置
   getSelectedEmail() { return this.selectedEmail; }
   setSelectedEmail(email) {
@@ -253,58 +419,163 @@ export class AccountPool {
     this.sessionAffinity.set(sessionKey, { email: cleanEmail, expireAt: Date.now() + AG_SESSION_TTL_MS });
   }
 
+  _pickBalanced(candidates, family) {
+    if (candidates.length === 1) return candidates[0];
+    const scored = candidates.map(e => {
+      const q = this.getQuota(e, family);
+      const effectiveQ = typeof q === 'number' ? q : 0.5;
+      const last = this.lastUsed.get(e) || 0;
+      return { email: e, q: effectiveQ, last };
+    });
+
+    // 比较两项：
+    // 若配额差距超过 0.15 (15%)，配额高者胜出；
+    // 否则配额接近，最久未使用的优先，实现负载均衡轮询。
+    scored.sort((a, b) => {
+      const qDiff = b.q - a.q;
+      if (Math.abs(qDiff) > 0.15) {
+        return qDiff;
+      }
+      return a.last - b.last;
+    });
+
+    return scored[0].email;
+  }
+
+  _pickPerformance(candidates) {
+    if (candidates.length === 1) return candidates[0];
+    const scored = candidates.map(e => {
+      const perf = this.getPerfStats(e);
+      const failStreak = perf.fail_streak || 0;
+      const successRate = typeof perf.success_rate === 'number' ? perf.success_rate : 0.8;
+      const latency = typeof perf.avg_latency_ms === 'number' ? perf.avg_latency_ms : 1500;
+      const last = this.lastUsed.get(e) || 0;
+      return { email: e, failStreak, successRate, latency, last };
+    });
+
+    scored.sort((a, b) => {
+      // 1. 连败次数越少越优先
+      if (a.failStreak !== b.failStreak) {
+        return a.failStreak - b.failStreak;
+      }
+      // 2. 成功率越高越优先 (差值 > 0.05 时)
+      const srDiff = b.successRate - a.successRate;
+      if (Math.abs(srDiff) > 0.05) {
+        return srDiff;
+      }
+      // 3. 平均延迟越低越优先 (差值 > 100ms 时)
+      const latDiff = a.latency - b.latency;
+      if (Math.abs(latDiff) > 100) {
+        return latDiff;
+      }
+      // 4. 最久未使用兜底
+      return a.last - b.last;
+    });
+
+    return scored[0].email;
+  }
+
   /**
-   * 核心：智能选号（会话粘滞 + 负载均衡 + 冷却避障）
+   * 核心：智能选号（调度模式 + 会话粘滞 + 家族配额 + 冷却避障）
    * @param {string} sessionKey 客户端会话标识
    * @param {Set<string>} exclude 需排除的邮箱
+   * @param {object|string} options 模型名称或选项 { model, family }
    */
-  pickManager(sessionKey = '', exclude = new Set()) {
+  pickManager(sessionKey = '', exclude = new Set(), options = {}) {
     if (this.managers.size === 0) return null;
 
     const allEmails = Array.from(this.managers.keys());
     const usableEmails = allEmails.filter(e => !exclude.has(e) && !this.isValidationBlocked(e));
     if (!usableEmails.length) return null;
 
-    // 1. 如果管理员手动锁定了某账号，且该账号未被排除、未冷却：优先使用
-    if (this.selectedEmail && usableEmails.includes(this.selectedEmail)) {
-      if (!this.isCooling(this.selectedEmail)) {
-        return this.managers.get(this.selectedEmail);
-      }
+    let model = '';
+    let family = 'gemini';
+    if (typeof options === 'string') {
+      model = options;
+      family = getModelFamily(model);
+    } else if (options && typeof options === 'object') {
+      model = options.model || '';
+      family = options.family || (model ? getModelFamily(model) : 'gemini');
     }
 
-    // 2. 会话亲和表查询：优先命中（保住 Google KV-Cache）
-    if (sessionKey) {
-      const bound = this.sessionAffinity.get(sessionKey);
-      if (bound && bound.expireAt > Date.now()) {
-        const boundEmail = bound.email;
-        if (usableEmails.includes(boundEmail) && !this.isCooling(boundEmail)) {
-          bound.expireAt = Date.now() + AG_SESSION_TTL_MS;
-          this.touch(boundEmail);
-          return this.managers.get(boundEmail);
-        }
-      }
-    }
-
-    // 3. 新会话分配：在健康未冷却的账号中，选择最久未用 (LRU) 的账号均摊并发
     const healthyEmails = usableEmails.filter(e => !this.isCooling(e));
-    let chosenEmail = '';
 
-    if (healthyEmails.length > 0) {
-      chosenEmail = healthyEmails.reduce((minE, e) => {
-        const tMin = this.lastUsed.get(minE) || 0;
-        const tCur = this.lastUsed.get(e) || 0;
-        return tCur < tMin ? e : minE;
-      }, healthyEmails[0]);
-    } else {
-      // 4. 全员冷却兜底：选择剩余冷却时间最短（最快恢复）的账号
-      chosenEmail = usableEmails.reduce((minE, e) => {
+    // 如果全员都在冷却中，兜底：选择剩余冷却时间最短（最快恢复）的账号
+    if (healthyEmails.length === 0) {
+      const chosenEmail = usableEmails.reduce((minE, e) => {
         return this.cooldownRemainSec(e) < this.cooldownRemainSec(minE) ? e : minE;
       }, usableEmails[0]);
+      if (chosenEmail) {
+        this.touch(chosenEmail);
+        this.activeEmail = chosenEmail;
+        return this.managers.get(chosenEmail);
+      }
+      return null;
+    }
+
+    // 辅助函数：根据配额 <5% 区分优先级（有 >=5% 或 null 的号时，<5% 的号排后）
+    const filterLowQuota = (emails) => {
+      const nonLow = emails.filter(e => {
+        const q = this.getQuota(e, family);
+        return q === null || q >= 0.05;
+      });
+      return nonLow.length > 0 ? nonLow : emails;
+    };
+
+    let chosenEmail = '';
+
+    // ================= 模式 1: fixed =================
+    if (this.schedulingMode === 'fixed') {
+      const target = (this.fixedEmail || this.selectedEmail || '').trim();
+      if (target && healthyEmails.includes(target)) {
+        chosenEmail = target;
+      } else {
+        const candidates = filterLowQuota(healthyEmails);
+        chosenEmail = this._pickBalanced(candidates, family);
+      }
+    }
+    // ================= 模式 2: cache_first (默认，粘性优先) =================
+    else if (this.schedulingMode === 'cache_first') {
+      // 兼容手动锁定
+      if (this.selectedEmail && healthyEmails.includes(this.selectedEmail)) {
+        chosenEmail = this.selectedEmail;
+      }
+      // 会话亲和表优先
+      else if (sessionKey) {
+        const bound = this.sessionAffinity.get(sessionKey);
+        if (bound && bound.expireAt > Date.now()) {
+          const boundEmail = bound.email;
+          if (healthyEmails.includes(boundEmail)) {
+            bound.expireAt = Date.now() + AG_SESSION_TTL_MS;
+            chosenEmail = boundEmail;
+          }
+        }
+      }
+
+      // 未命中会话粘滞时：在健康未冷却账号中，排后 <5% 的号，选最久未用 (LRU)
+      if (!chosenEmail) {
+        const candidates = filterLowQuota(healthyEmails);
+        chosenEmail = candidates.reduce((minE, e) => {
+          const tMin = this.lastUsed.get(minE) || 0;
+          const tCur = this.lastUsed.get(e) || 0;
+          return tCur < tMin ? e : minE;
+        }, candidates[0]);
+      }
+    }
+    // ================= 模式 3: balance (不粘性，按配额+最近使用均衡) =================
+    else if (this.schedulingMode === 'balance') {
+      const candidates = filterLowQuota(healthyEmails);
+      chosenEmail = this._pickBalanced(candidates, family);
+    }
+    // ================= 模式 4: performance (不粘性，优先最近成功率高/延迟低) =================
+    else if (this.schedulingMode === 'performance') {
+      const candidates = filterLowQuota(healthyEmails);
+      chosenEmail = this._pickPerformance(candidates);
     }
 
     if (chosenEmail) {
       this.touch(chosenEmail);
-      if (sessionKey) {
+      if (sessionKey && this.schedulingMode === 'cache_first') {
         this.bindSession(sessionKey, chosenEmail);
       }
       this.activeEmail = chosenEmail;
@@ -352,6 +623,7 @@ export class AccountPool {
   poolStatus() {
     return Array.from(this.managers.entries()).map(([email, tm]) => {
       const vInfo = this.validationInfo(email);
+      const perf = this.getPerfStats(email);
       return {
         email,
         cooling: this.isCooling(email),
@@ -361,6 +633,9 @@ export class AccountPool {
         validation_blocked: vInfo.blocked,
         validation_url: vInfo.url,
         validation_reason: vInfo.reason,
+        success_rate: perf.success_rate,
+        avg_latency_ms: perf.avg_latency_ms,
+        fail_streak: perf.fail_streak,
         ...tm.getStatus(),
       };
     });

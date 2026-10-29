@@ -355,6 +355,7 @@ body.theme-ag .brand-icon {
   animation: fadeIn 0.2s ease;
   line-height: 1.4;
   word-break: break-all;
+  margin: 6px 0;
 }
 
 .account-test-banner.success {
@@ -675,6 +676,10 @@ body.theme-ag .nav-item.active {
   margin-bottom: 10px;
 }
 .input-field:focus { border-color: var(--primary); }
+select.input-field option {
+  background: #131b26;
+  color: #f1f5f9;
+}
 
 .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
 .switch input { opacity: 0; width: 0; height: 0; }
@@ -770,14 +775,20 @@ body.theme-ag .nav-item.active {
 .trend .bar.zero { background: rgba(255,255,255,0.08); }
 .trend-axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-dim); margin-top: 4px; font-family: var(--font-mono); }
 .quota-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px; }
-.quota-row { display: grid; grid-template-columns: 74px 1fr 64px; align-items: center; gap: 8px; font-size: 12px; }
-.quota-row .qn { color: var(--text-muted); }
-.quota-row .qp { text-align: right; white-space: nowrap; font-family: var(--font-mono); font-weight: 700; }
-.quota-row .qr { grid-column: 2 / 4; font-size: 11px; color: var(--text-dim); margin-top: -4px; }
+.quota-row { display: grid; grid-template-columns: minmax(76px, auto) 1fr 54px; align-items: center; gap: 8px; font-size: 12px; }
+.quota-row .qn { color: var(--text-muted); white-space: nowrap; font-size: 11.5px; }
+.quota-row .qp { text-align: right; white-space: nowrap; font-family: var(--font-mono); font-weight: 700; font-size: 11.5px; }
+.quota-row .qr { grid-column: 2 / 4; font-size: 11px; color: var(--text-dim); margin-top: -4px; word-break: break-all; }
+.quota-row .qr:empty { display: none; }
+.quota-row.missing .qn { color: var(--text-dim); }
+.quota-row.missing .qr { grid-column: 1 / -1; margin-top: 1px; }
 .qbar { height: 7px; border-radius: 4px; background: rgba(255,255,255,0.08); overflow: hidden; }
 .qbar > i { display: block; height: 100%; border-radius: 4px; background: var(--primary); }
 .qbar > i.mid { background: var(--warning); }
 .qbar > i.low { background: var(--danger); }
+.qbar.qbar-missing { background: transparent; border: 1px dashed rgba(255,255,255,0.25); }
+.qbar.qbar-missing > i { display: none !important; width: 0 !important; }
+.qp.qp-missing { color: var(--text-dim) !important; font-size: 11px !important; font-weight: normal !important; }
 .kv { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
 .kv:last-child { border-bottom: none; }
 .kv .k { color: var(--text-muted); }
@@ -871,20 +882,25 @@ body.standalone .host-only { display: none !important; }
   .sheet-handle { display: none; }
   .toast-container { left: calc(50% + 116px); }
 
-  #view-stats.active { max-width: 1000px; }
+  #overviewStatsContainer { display: contents; }
+  #overviewStatsContainer > .stats-summary-card { grid-column: 1 / -1; }
+  #overviewStatsContainer > .stats-trend-card { grid-column: 1 / -1; }
+  #overviewStatsContainer > .stats-cost-card { grid-column: 1; }
+  #overviewStatsContainer > .stats-rank-card { grid-column: 2; }
+  #overviewStatsContainer > .stats-heatmap-card { grid-column: 1 / -1; }
   .stats-trend-bars { height: 130px; }
 }
 
-/* ── 底部导航 6 项窄屏自适应 ── */
+/* ── 底部导航 5 项窄屏自适应 ── */
 @media (max-width: 430px) {
-  .bottom-nav { width: calc(100% - 20px); padding: 4px; max-width: none; }
-  .nav-item { padding: 4px 0; font-size: 10.5px; min-height: 38px; }
-  .nav-icon { font-size: 15px; margin-bottom: 1px; }
+  .bottom-nav { width: calc(100% - 16px); padding: 4px; max-width: none; }
+  .nav-item { padding: 4px 0; font-size: 11px; min-height: 40px; }
+  .nav-icon { font-size: 16px; margin-bottom: 2px; }
 }
 @media (max-width: 360px) {
-  .bottom-nav { width: calc(100% - 12px); padding: 3px 2px; }
-  .nav-item { font-size: 9.5px; min-height: 36px; }
-  .nav-icon { font-size: 14px; margin-bottom: 0; }
+  .bottom-nav { width: calc(100% - 10px); padding: 3px 2px; }
+  .nav-item { font-size: 10px; min-height: 38px; }
+  .nav-icon { font-size: 15px; margin-bottom: 1px; }
 }
 
 /* ── 账号页：Tier 徽章与安全验证 ── */
@@ -1290,3 +1306,191 @@ body.standalone .host-only { display: none !important; }
   padding: 5px 8px;
   font-size: 12px;
 }
+
+/* ── 概览统计容器 ── */
+#overviewStatsContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+/* ── 账号调度与性能指标 ── */
+.sched-modes-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-sm);
+  padding: 3px;
+  margin-bottom: 6px;
+}
+.sched-mode-btn {
+  padding: 6px 2px;
+  font-size: 11.5px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: center;
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: all 0.15s ease;
+}
+.sched-mode-btn.active {
+  background: var(--primary);
+  color: #ffffff;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+.sched-mode-desc {
+  font-size: 11px;
+  line-height: 1.4;
+  margin-top: 4px;
+}
+
+.account-perf-row {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin: 6px 0 4px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+.account-perf-row .fail-streak-warn {
+  color: #f59e0b;
+  font-weight: 700;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -1px;
+  margin-right: 4px;
+}
+
+@media (max-width: 380px) {
+  .account-actions-row {
+    gap: 5px;
+  }
+  .account-actions-row .btn {
+    padding: 6px 2px;
+    font-size: 11px;
+  }
+  .sched-mode-btn {
+    font-size: 11px;
+    padding: 6px 1px;
+  }
+}
+
+/* ── 浅色主题支持 ── */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg-color: #f6f8fb;
+    --surface-color: #ffffff;
+    --surface-hover: #edf2f7;
+    --card-border: rgba(0, 0, 0, 0.08);
+    --text-main: #0f172a;
+    --text-muted: #475569;
+    --text-dim: #94a3b8;
+  }
+  body {
+    background-color: var(--bg-color);
+    color: var(--text-main);
+  }
+  .app-header {
+    background: rgba(246, 248, 251, 0.94);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  }
+  .bottom-nav {
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.06);
+  }
+  .card, .metric-card {
+    background: var(--surface-color);
+    border-color: var(--card-border);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+  }
+  .stat-cell, .rank-item, .cost-main-box, .cost-save-box, .price-rule-row {
+    background: #f8fafc;
+    border-color: rgba(0, 0, 0, 0.06);
+  }
+  .input-field {
+    background: #ffffff;
+    border-color: rgba(0, 0, 0, 0.15);
+    color: #0f172a;
+  }
+  select.input-field option {
+    background: #ffffff;
+    color: #0f172a;
+  }
+  .btn-outline {
+    background: #ffffff;
+    border-color: rgba(0, 0, 0, 0.15);
+    color: #1e293b;
+  }
+  .btn-outline:hover {
+    background: #f1f5f9;
+  }
+  .code-box {
+    background: #f1f5f9;
+    border-color: rgba(0, 0, 0, 0.08);
+    color: #0f172a;
+  }
+  .modal-sheet {
+    background: #ffffff;
+    border-color: rgba(0, 0, 0, 0.1);
+  }
+  .qbar {
+    background: rgba(0, 0, 0, 0.08);
+  }
+  .qbar.qbar-missing {
+    border-color: rgba(0, 0, 0, 0.25);
+  }
+  .heatmap-cell.lvl-0 {
+    background: rgba(0, 0, 0, 0.06);
+  }
+  .stats-bar.zero, .trend .bar.zero {
+    background: rgba(0, 0, 0, 0.08);
+  }
+  .sched-modes-grid {
+    background: #f1f5f9;
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+  .sched-mode-btn {
+    color: var(--text-muted);
+  }
+  .sched-mode-btn.active {
+    background: var(--primary);
+    color: #ffffff;
+  }
+  .stats-warning-note {
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.3);
+    color: #b45309;
+  }
+  .account-test-banner.success {
+    background: rgba(16, 185, 129, 0.1);
+    border-color: rgba(16, 185, 129, 0.3);
+    color: #059669;
+  }
+  .account-test-banner.error {
+    background: rgba(239, 68, 68, 0.1);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #dc2626;
+  }
+}
+

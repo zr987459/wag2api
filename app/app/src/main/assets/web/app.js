@@ -5,12 +5,15 @@
 let engine = localStorage.getItem('wag2api_engine') === 'ag' ? 'ag' : 'wb';
 let currentTab = 'overview';
 let engineInfo = { supported: false, enabled: false, state: 'OFF', default_engine: 'wb' };
-let statRange = 'today';
-let trendMode = 'tokens';
 let lastStats = { wb: null, ag: null };
 const chatState = { wb: { history: [], html: '' }, ag: { history: [], html: '' } };
 const modelCache = { wb: null, ag: null };
 const agQuota = {};          // email -> quota
+const agTestResults = {};    // email -> test result
+const agTestingAccounts = new Set();
+let agTestingAll = false;
+let agSchedulingState = {};
+let agAccountsCache = [];
 let activePollTimer = null;
 let currentAbort = null;
 
@@ -189,7 +192,6 @@ function switchTab(tab) {
 
 function renderCurrent() {
   if (currentTab === 'overview') loadOverview();
-  else if (currentTab === 'stats') loadTokenStats();
   else if (currentTab === 'accounts') loadAccounts();
   else if (currentTab === 'keys') loadKeys();
   else if (currentTab === 'chat') loadChat();
@@ -197,18 +199,6 @@ function renderCurrent() {
 }
 
 // ── 1. 概览 ─────────────────────────────────────────────
-function setStatRange(r) {
-  statRange = r;
-  document.querySelectorAll('.sub-tab[data-range]').forEach(el => el.classList.toggle('active', el.dataset.range === r));
-  renderStats(lastStats[engine]);
-}
-
-function setTrendMode(m) {
-  trendMode = m;
-  document.querySelectorAll('.sub-tab[data-trend]').forEach(el => el.classList.toggle('active', el.dataset.trend === m));
-  renderTrend(lastStats[engine]);
-}
-
 function setHeader(ok, text) {
   $('headerStatusText').textContent = text;
   const pill = $('headerStatus');
@@ -237,6 +227,7 @@ async function loadOverview() {
       evEl.textContent = '● 异常';
       evEl.style.color = 'var(--danger)';
     }
+    renderWbOverviewStats();
   } else {
     $('nodeEnabledToggle').checked = !!engineInfo.enabled;
     $('agEngineSub').textContent = `状态：${({ READY: '运行中', STARTING: '启动中', FAILED: '启动失败', OFF: '已关闭' })[engineInfo.state] || engineInfo.state}${engineInfo.port ? ' · 内部端口 ' + engineInfo.port : ''}`;
@@ -248,11 +239,11 @@ async function loadOverview() {
       evEl.textContent = engineInfo.state === 'STARTING' ? '● 启动中' : '● 未运行';
       evEl.style.color = 'var(--warning)';
       setHeader(null, 'AG 未运行');
+      renderAgOffOverviewStats();
       if (engineInfo.state === 'STARTING') setTimeout(() => { if (engine === 'ag' && currentTab === 'overview') loadOverview(); }, 3000);
     } else {
       try {
-        const [status, st, tr] = await Promise.all([getJson('/api/status'), getJson('/api/stats'), getJson('/api/trend')]);
-        st.trend = tr;
+        const [status, st] = await Promise.all([getJson('/api/status'), getJson('/api/stats')]);
         lastStats.ag = st;
         const accs = status.accounts || [];
         $('ovAccounts').textContent = `${accs.filter(a => a.hasRefreshToken).length} / ${accs.length}`;
@@ -261,83 +252,24 @@ async function loadOverview() {
         evEl.textContent = '● 就绪';
         evEl.style.color = 'var(--primary)';
         setHeader(true, '网关在线');
+        await loadAgTokenStats(false);
       } catch (e) {
         setHeader(false, 'AG 无响应');
       }
     }
   }
-  renderStats(lastStats[engine]);
-  renderTiming(lastStats[engine]);
-  renderTrend(lastStats[engine]);
 }
 
-// PR2 分段打点：仅 AG 引擎有；各值为相对请求开始的毫秒中位数
-function renderTiming(st) {
-  const card = $('timingCard');
-  if (!card) return;
-  const t = engine === 'ag' ? st?.timing_recent : null;
-  if (!t || !t.n) { card.style.display = 'none'; return; }
-  card.style.display = '';
-  const ms = v => (v === 0 ? '0ms' : fmtMs(v));
-  const cells = [
-    ['Token / 组包', `${ms(t.t_token)} / ${ms(t.t_payload)}`],
-    ['握手', ms(t.t_tls)],
-    ['响应头', ms(t.t_headers)],
-    ['首个思考', ms(t.t_first_thought)],
-    ['首个正文', ms(t.t_first_text)],
-    ['总耗时', ms(t.latency_ms)],
-    ['尝试次数', t.attempts ?? '--'],
-    ['缓存 / 未命中', `${fmtNum(t.cached_tokens)} / ${fmtNum(t.input_tokens)}`],
-    ['命中率', fmtPct(t.cache_hit_rate)],
-  ];
-  $('timingGrid').innerHTML = cells.map(([k, v]) => `<div class="stat-cell"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
-  const hosts = Object.entries(t.hosts || {}).map(([h, c]) => `${escapeHtml(h.split('.')[0])} ×${c}`).join('，');
-  const dg = st?.downgrade_24h;
-  const dgEl = $('dgFoot');
-  if (dgEl) {
-    const labels = { quota_all_accounts: '全部账号冷却', quota: '配额', upstream_5xx: '上游5xx', timeout: '超时', network: '网络', auth: '凭据' };
-    const rs = Object.entries(dg?.reasons || {}).map(([k, v]) => `${labels[k] || escapeHtml(k)} ${v}`).join('，');
-    dgEl.textContent = dg ? `近 24 小时降级 ${dg.count} 次 · 降级率 ${dg.rate === null ? '--' : fmtPct(dg.rate)}${rs ? ' · ' + rs : ''}` : '';
-  }
-  $('timingFoot').textContent = `样本 ${t.n} 条 · host：${hosts || '--'} · 换号 ${t.switched_account} 次 · 换 host ${t.switched_host} 次 · 连接复用 ${t.conn_reused ?? 0} / 新建 ${t.conn_new ?? 0}`;
+function renderWbOverviewStats() {
+  const box = $('overviewStatsContainer');
+  if (!box) return;
+  box.innerHTML = '<div class="card empty" style="padding:18px 12px;font-size:13px;">Token 统计仅支持 AG 引擎</div>';
 }
 
-function renderStats(st) {
-  const grid = $('statGrid');
-  if (!st) { grid.innerHTML = engine === 'ag' && !agReady() ? `<div style="grid-column:1/4">${agOffHtml()}</div>` : '<div class="empty" style="grid-column:1/4">暂无数据</div>'; return; }
-  const s = statRange === 'today' ? (st.today || {}) : st;
-  const cells = [
-    ['请求', fmtNum(s.total_requests), false],
-    ['成功 / 失败', `${fmtNum(s.success_requests)} / ${fmtNum(s.error_requests)}`, false],
-    ['总 Token', fmtNum(s.total_tokens), true],
-    ['输入', fmtNum(s.input_tokens), false],
-    ['缓存命中', fmtNum(s.cached_tokens), false],
-    ['输出', fmtNum(s.output_tokens), false],
-    ['思考', fmtNum(s.thoughts_tokens), false],
-    ['缓存命中率', fmtPct(s.cache_hit_rate), true],
-    ['平均耗时 / 首字', `${fmtMs(s.avg_latency_ms)} / ${fmtMs(s.avg_ttft_ms)}`, false],
-  ];
-  grid.innerHTML = cells.map(([k, v, hl]) => `<div class="stat-cell"><div class="k">${k}</div><div class="v${hl ? ' hl' : ''}">${v}</div></div>`).join('');
-}
-
-function renderTrend(st) {
-  const bars = $('trendBars'), axis = $('trendAxis'), sum = $('trendSummary');
-  const pts = st?.trend?.points || [];
-  if (!pts.length) { bars.innerHTML = ''; axis.innerHTML = ''; sum.textContent = engine === 'ag' && !agReady() ? 'AG 引擎未运行' : '暂无数据'; return; }
-  const key = trendMode === 'tokens' ? 'tokens' : 'requests';
-  const max = Math.max(1, ...pts.map(p => Number(p[key]) || 0));
-  const total = pts.reduce((a, p) => a + (Number(p[key]) || 0), 0);
-  const errs = pts.reduce((a, p) => a + (Number(p.errors) || 0), 0);
-  sum.textContent = trendMode === 'tokens' ? `共 ${fmtNum(total)} Token` : `共 ${fmtNum(total)} 次请求${errs ? `，失败 ${errs}` : ''}`;
-  bars.innerHTML = pts.map(p => {
-    const v = Number(p[key]) || 0;
-    const h = v ? Math.max(4, Math.round(v / max * 100)) : 3;
-    const cls = !v ? 'zero' : (trendMode === 'requests' && p.errors && p.errors >= v) ? 'err' : '';
-    const t = new Date(p.ts);
-    return `<div class="bar ${cls}" style="height:${h}%" title="${t.getHours()}:00 · ${v}"></div>`;
-  }).join('');
-  const lab = i => { const t = new Date(pts[i].ts); return `${String(t.getHours()).padStart(2, '0')}:00`; };
-  axis.innerHTML = `<span>${lab(0)}</span><span>${lab(Math.floor(pts.length / 2))}</span><span>现在</span>`;
+function renderAgOffOverviewStats() {
+  const box = $('overviewStatsContainer');
+  if (!box) return;
+  box.innerHTML = `<div class="card">${agOffHtml()}</div>`;
 }
 
 async function loadGlobalSettings() {
@@ -599,18 +531,16 @@ function savePriceRules() {
   if (tokenStatsData) renderTokenStatsView(tokenStatsData);
 }
 
-async function loadTokenStats(toast = false) {
-  await refreshEngineInfo();
-  applyEngineChrome();
-  const box = $('statsContent');
+async function loadAgTokenStats(toast = false) {
+  const box = $('overviewStatsContainer');
   if (!box) return;
 
   if (engine === 'wb') {
-    box.innerHTML = '<div class="card empty">Token 消费统计目前仅支持 AG 引擎</div>';
+    renderWbOverviewStats();
     return;
   }
   if (!agReady()) {
-    box.innerHTML = `<div class="card">${agOffHtml()}</div>`;
+    renderAgOffOverviewStats();
     return;
   }
 
@@ -628,7 +558,7 @@ function setTokenStatsRange(r) {
   tokenStatsRange = r;
   localStorage.setItem('wag2api_token_stats_range', r);
   tokenStatsTrendIndex = null;
-  loadTokenStats();
+  loadAgTokenStats(false);
 }
 
 function setTokenStatsTrendMode(m) {
@@ -643,7 +573,7 @@ function setTokenStatsRankTab(t) {
 }
 
 function renderTokenStatsView(data) {
-  const box = $('statsContent');
+  const box = $('overviewStatsContainer');
   if (!box || !data) return;
 
   const rules = getPriceRules();
@@ -689,39 +619,41 @@ function renderTokenStatsView(data) {
   const saveRate = totalCost + totalSaved > 0 ? (totalSaved / (totalCost + totalSaved)) : 0;
 
   box.innerHTML = `
-    <!-- 顶部粒度切换 + 刷新按钮 -->
-    <div class="stats-top-bar">
-      <div class="sub-tabs scrollable">
-        ${[
-          ['hour', '近1小时'],
-          ['day', '24小时'],
-          ['week', '7天'],
-          ['month', '30天'],
-          ['all', '全部'],
-        ].map(([k, name]) => `
-          <span class="sub-tab ${tokenStatsRange === k ? 'active' : ''}" onclick="setTokenStatsRange('${k}')">${name}</span>
-        `).join('')}
+    <!-- 1. 统计概要卡 -->
+    <div class="card stats-summary-card" id="statsSummaryCard">
+      <div class="stats-top-bar" style="margin-bottom: 10px;">
+        <div class="sub-tabs scrollable">
+          ${[
+            ['hour', '1小时'],
+            ['day', '24小时'],
+            ['week', '7天'],
+            ['month', '30天'],
+            ['all', '全部'],
+          ].map(([k, name]) => `
+            <span class="sub-tab ${tokenStatsRange === k ? 'active' : ''}" onclick="setTokenStatsRange('${k}')">${name}</span>
+          `).join('')}
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="loadAgTokenStats(true)">🔄 刷新</button>
       </div>
-      <button class="btn btn-outline btn-sm" onclick="loadTokenStats(true)">🔄 刷新</button>
-    </div>
 
-    <!-- 1. 概要卡 -->
-    <div class="card stats-summary-card">
       <div class="metric-label">总 Token 消耗</div>
       <div class="stats-big-tokens mono">${fmtNum(summary.tokens)}</div>
       <div class="stats-sub-row muted">
         输入 <b>${fmtNum(summary.input)}</b> · 缓存 <b>${fmtNum(summary.cached)}</b> · 输出 <b>${fmtNum(summary.output)}</b> · 思考 <b>${fmtNum(summary.thoughts)}</b>
       </div>
-      <div class="stat-grid" style="margin-top:12px;">
+      <div class="stat-grid" style="margin-top:10px;">
         <div class="stat-cell"><div class="k">请求数</div><div class="v">${fmtNum(summary.requests)}</div></div>
         <div class="stat-cell"><div class="k">成功率</div><div class="v">${reqCount > 0 ? fmtPct(succCount / reqCount) : '--'}</div></div>
         <div class="stat-cell"><div class="k">缓存命中率</div><div class="v hl">${fmtPct(summary.cache_hit_rate)}</div></div>
-        <div class="stat-cell" style="grid-column: 1 / -1;"><div class="k">平均耗时 / 首字</div><div class="v">${fmtMs(summary.avg_latency_ms)} / ${fmtMs(summary.avg_ttft_ms)}</div></div>
+        <div class="stat-cell" style="grid-column: 1 / -1;"><div class="k">平均耗时 / 首字</div><div class="v" style="font-size:13px;">${fmtMs(summary.avg_latency_ms)} / ${fmtMs(summary.avg_ttft_ms)}</div></div>
       </div>
     </div>
 
-    <!-- 2. 费用卡 -->
-    <div class="card stats-cost-card">
+    <!-- 2. 趋势卡 -->
+    <div class="card stats-trend-card" id="statsTrendCard"></div>
+
+    <!-- 3. 费用卡 -->
+    <div class="card stats-cost-card" id="statsCostCard">
       <div class="section-title">
         <span>预估费用（按模型估算）</span>
         <button class="btn btn-outline btn-sm" onclick="openPriceModal()">价格</button>
@@ -739,9 +671,6 @@ function renderTokenStatsView(data) {
         </div>
       </div>
     </div>
-
-    <!-- 3. 趋势卡 -->
-    <div class="card stats-trend-card" id="statsTrendCard"></div>
 
     <!-- 4. 排行卡 -->
     <div class="card stats-rank-card" id="statsRankCard"></div>
@@ -1198,20 +1127,166 @@ async function wbTestAll() {
 }
 
 // AG 账号：每个账号显示 Gemini / Claude 的 5 小时与 7 天额度
+const DEFAULT_SCHEDULING_MODES = [
+  { id: 'cache_first', label: '缓存优先', desc: '优先复用最近调用的账号，最大化 KV-Cache 命中' },
+  { id: 'balance', label: '均衡', desc: '在可用账号之间轮询分配，负载更均匀' },
+  { id: 'performance', label: '性能优先', desc: '优先选择平均延迟最低、成功率最高的账号' },
+  { id: 'fixed', label: '固定账号', desc: '始终使用指定的单一账号' },
+];
+
+function formatAccountPerfRow(p) {
+  const rate = p.success_rate;
+  const rateText = (rate === null || rate === undefined) ? '--' : Math.round(Number(rate) * 100) + '%';
+  const lat = p.avg_latency_ms;
+  let latText = '--';
+  if (lat !== null && lat !== undefined && Number(lat) > 0) {
+    const num = Number(lat);
+    latText = num >= 1000 ? (num / 1000).toFixed(1) + 's' : Math.round(num) + 'ms';
+  }
+  const failStreak = Number(p.fail_streak) || 0;
+  return `
+    <div class="account-perf-row mono">
+      <span>成功率 ${rateText} · 平均 ${latText}</span>
+      ${failStreak >= 3 ? `<span class="fail-streak-warn"> · 连续失败 ${failStreak} 次</span>` : ''}
+    </div>
+  `;
+}
+
+function renderAccountTestBanner(res) {
+  if (!res) return '';
+  if (res.ok) {
+    const lat = res.latency_ms !== null && res.latency_ms !== undefined ? res.latency_ms + 'ms' : '--';
+    const mod = escapeHtml(res.model || '');
+    return `
+      <div class="account-test-banner success" style="display:block;">
+        ✓ 可用 · ${lat}${mod ? ' · ' + mod : ''}
+      </div>
+    `;
+  }
+  const statusStr = (res.status !== undefined && res.status !== null && String(res.status).trim()) ? String(res.status) : '';
+  const errStr = String(res.error || res.reply || '测试未通过');
+  const summary = escapeHtml(statusStr ? `${statusStr} · ${errStr}` : errStr);
+  const isValidation = res.kind === 'validation' && res.validation_url;
+  return `
+    <div class="account-test-banner error" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+      <span style="word-break:break-word;">✗ ${summary}</span>
+      ${isValidation ? `<a href="${escapeHtml(res.validation_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm" style="padding:2px 8px;font-size:11px;text-decoration:none;margin-left:auto;">去验证 ↗</a>` : ''}
+    </div>
+  `;
+}
+
+async function agTestAccount(email, btn) {
+  if (agTestingAccounts.has(email)) return;
+  agTestingAccounts.add(email);
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>测试中…';
+  }
+  try {
+    const res = await postJson('/api/accounts/test', { email });
+    agTestResults[email] = res || { ok: false, error: '无响应' };
+    if (res && res.ok) {
+      showToast(`可用 · ${res.latency_ms ?? 0}ms`, 'success');
+    } else {
+      const err = (res && (res.error || res.reply)) || '测试未通过';
+      showToast(`测试未通过：${err}`, 'error');
+    }
+  } catch (e) {
+    agTestResults[email] = { ok: false, error: e.message };
+    showToast('测试出错：' + e.message, 'error');
+  } finally {
+    agTestingAccounts.delete(email);
+    await loadAgAccounts();
+  }
+}
+
+async function agTestAll(btn) {
+  if (agTestingAll) return;
+  agTestingAll = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>全部测试中…';
+  }
+  try {
+    const res = await postJson('/api/accounts/test-all', {});
+    const results = Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []);
+    results.forEach(r => {
+      if (r && r.email) agTestResults[r.email] = r;
+    });
+    const okCount = results.filter(r => r && r.ok).length;
+    const total = results.length;
+    showToast(`可用 ${okCount} / 共 ${total}`, okCount === total && total > 0 ? 'success' : 'warn');
+  } catch (e) {
+    showToast('全部测试失败：' + e.message, 'error');
+  } finally {
+    agTestingAll = false;
+    await loadAgAccounts();
+  }
+}
+
+async function setSchedulingMode(mode) {
+  let fixedEmail = agSchedulingState.fixed_email || '';
+  if (mode === 'fixed' && !fixedEmail) {
+    fixedEmail = (agAccountsCache[0] && agAccountsCache[0].email) || '';
+  }
+  agSchedulingState.mode = mode;
+  agSchedulingState.fixed_email = fixedEmail;
+  try {
+    const r = await postJson('/api/scheduling', { mode, fixed_email: fixedEmail });
+    if (r && r.ok === false) {
+      showToast(r.error || r.msg || '切换模式失败', 'warn');
+    } else {
+      showToast('调度模式已更新', 'success');
+    }
+  } catch (e) {
+    showToast('设置调度模式失败：' + e.message, 'error');
+  }
+  await loadAgAccounts();
+}
+
+async function setSchedulingFixedEmail(email) {
+  agSchedulingState.mode = 'fixed';
+  agSchedulingState.fixed_email = email;
+  try {
+    const r = await postJson('/api/scheduling', { mode: 'fixed', fixed_email: email });
+    if (r && r.ok === false) {
+      showToast(r.error || r.msg || '指定账号失败', 'warn');
+    } else {
+      showToast(`已固定账号：${email}`, 'success');
+    }
+  } catch (e) {
+    showToast('指定账号失败：' + e.message, 'error');
+  }
+  await loadAgAccounts();
+}
+
 async function loadAgAccounts() {
   const box = $('accountList');
   const sch = $('schedulerCard');
   sch.style.display = 'block';
   try {
-    const [status, st] = await Promise.all([getJson('/api/status'), getJson('/api/stats')]);
+    const [status, st, poolRes] = await Promise.all([
+      getJson('/api/status'),
+      getJson('/api/stats'),
+      getJson('/api/accounts/pool').catch(() => ({})),
+    ]);
     if (engine !== 'ag') return;
     const accs = status.accounts || [];
+    agAccountsCache = accs;
     const usage = {};
     (st.accounts || []).forEach(a => { usage[a.email] = a; });
     $('accountCount').textContent = accs.length;
 
-    const poolRes = await getJson('/api/accounts/pool').catch(() => ({}));
-    const selectedEmail = poolRes?.selected_email || '';
+    const poolList = Array.isArray(poolRes?.accounts) ? poolRes.accounts : (Array.isArray(poolRes?.poolStatus) ? poolRes.poolStatus : []);
+    const poolStatusMap = {};
+    poolList.forEach(p => { if (p && p.email) poolStatusMap[p.email] = p; });
+
+    const scheduling = poolRes?.scheduling || {};
+    agSchedulingState = scheduling;
+    const modes = (Array.isArray(scheduling.modes) && scheduling.modes.length) ? scheduling.modes : DEFAULT_SCHEDULING_MODES;
+    const currentMode = scheduling.mode || (poolRes?.selected_email ? 'fixed' : 'cache_first');
+    const fixedEmail = scheduling.fixed_email || poolRes?.selected_email || (accs[0] && accs[0].email) || '';
+    const currentModeObj = modes.find(m => m.id === currentMode) || modes[0];
     const hasBlocked = accs.some(a => !!a.validation_blocked);
 
     sch.innerHTML = `
@@ -1223,17 +1298,30 @@ async function loadAgAccounts() {
           ${hasBlocked ? '<button class="btn btn-outline btn-sm" style="color:var(--danger);border-color:rgba(239,68,68,0.4);" onclick="agClearValidation(\'\')">解除全部验证标记</button>' : ''}
         </div>
       </div>
-      <p class="muted" style="margin-bottom: 10px;">会话粘滞（保住 KV-Cache）+ 智能负载均衡，遇到限流自动冷却换号。</p>
-      <div class="row-between" style="margin-bottom: 10px;">
-        <span style="font-size: 13px;">调度策略</span>
-        <select class="input-field" style="margin-bottom: 0; max-width: 65%;" onchange="agSelect(this.value)">
-          <option value="">自动轮询 (负载均衡+缓存粘滞)</option>
-          ${accs.map(a => `<option value="${escapeHtml(a.email)}" ${a.email === selectedEmail ? 'selected' : ''}>${escapeHtml(a.email)}</option>`).join('')}
-        </select>
+      <p class="muted" style="margin-bottom: 8px;">调度模式选择及负载均衡策略：</p>
+      <div class="sched-modes-wrap">
+        <div class="sched-modes-grid">
+          ${modes.map(m => `
+            <button type="button" class="sched-mode-btn ${m.id === currentMode ? 'active' : ''}" onclick="setSchedulingMode('${escapeHtml(m.id)}')">
+              ${escapeHtml(m.label)}
+            </button>
+          `).join('')}
+        </div>
+        ${currentMode === 'fixed' ? `
+          <div class="row-between" style="margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.06);">
+            <span style="font-size: 12px; color: var(--text-muted);">指定账号</span>
+            <select class="input-field mono" style="margin-bottom: 0; max-width: 68%; font-size: 12px;" onchange="setSchedulingFixedEmail(this.value)">
+              ${accs.map(a => `<option value="${escapeHtml(a.email)}" ${a.email === fixedEmail ? 'selected' : ''}>${escapeHtml(a.email)}</option>`).join('')}
+            </select>
+          </div>
+        ` : ''}
+        <div class="muted sched-mode-desc">${escapeHtml(currentModeObj?.desc || '')}</div>
       </div>
-      <div style="display: flex; gap: 8px;">
-        <button class="btn btn-outline" style="flex: 1;" onclick="agTestActive(this)">⚡ 测试当前账号</button>
-        <button class="btn btn-outline" style="flex: 1;" onclick="agBenchHosts(this)">🏁 集群测速</button>
+      <div style="display: flex; gap: 8px; margin-top: 10px;">
+        <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="agTestAll(this)" ${agTestingAll ? 'disabled' : ''}>
+          ${agTestingAll ? '<span class="spinner"></span>全部测试中…' : '⚡ 全部测试'}
+        </button>
+        <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="agBenchHosts(this)">🏁 集群测速</button>
       </div>
       <div class="account-test-banner" id="ag-test-banner"></div>`;
 
@@ -1243,6 +1331,13 @@ async function loadAgAccounts() {
       const id = agId(a.email);
       const u = usage[a.email] || {};
       const em = escapeHtml(a.email);
+      const pStatus = poolStatusMap[a.email] || {};
+      const perfRowHtml = formatAccountPerfRow({
+        success_rate: pStatus.success_rate !== undefined ? pStatus.success_rate : a.success_rate,
+        avg_latency_ms: pStatus.avg_latency_ms !== undefined ? pStatus.avg_latency_ms : a.avg_latency_ms,
+        fail_streak: pStatus.fail_streak !== undefined ? pStatus.fail_streak : a.fail_streak,
+      });
+
       return `
         <div class="account-card">
           <div class="account-card-header">
@@ -1268,11 +1363,16 @@ async function loadAgAccounts() {
               </div>
             </div>` : ''}
           <div class="quota-list" id="quota-${id}">${quotaHtml(agQuota[a.email])}</div>
+          ${perfRowHtml}
           <div class="kv"><span class="k">请求 / Token</span><span class="v">${fmtNum(u.total_requests)} / ${fmtNum(u.total_tokens)}</span></div>
           <div class="kv"><span class="k">输入 · 缓存 · 输出 · 思考</span><span class="v">${fmtNum(u.input_tokens)} · ${fmtNum(u.cached_tokens)} · ${fmtNum(u.output_tokens)} · ${fmtNum(u.thoughts_tokens)}</span></div>
           <div class="kv"><span class="k">缓存命中率 · 首字</span><span class="v">${fmtPct(u.cache_hit_rate)} · ${fmtMs(u.avg_ttft_ms)}</span></div>
+          ${renderAccountTestBanner(agTestResults[a.email])}
           <div class="account-actions-wrap">
             <div class="account-actions-row">
+              <button class="btn btn-outline btn-sm" onclick="agTestAccount('${em}', this)" ${agTestingAccounts.has(a.email) ? 'disabled' : ''}>
+                ${agTestingAccounts.has(a.email) ? '<span class="spinner"></span>测试中…' : '⚡ 测试'}
+              </button>
               <button class="btn btn-outline btn-sm" onclick="agLoadQuota('${em}', true)">🔄 额度</button>
               <button class="btn btn-outline btn-sm" onclick="agExportOne('${em}')">📤 导出</button>
               <button class="btn btn-outline btn-sm" onclick="agSwitch('${em}')" ${a.isActive ? 'disabled' : ''}>🌟 使用</button>
@@ -1295,37 +1395,52 @@ function quotaHtml(q) {
   if (!q) return '<div class="muted">额度加载中…</div>';
   if (!q.ok) return `<div class="muted" style="color:var(--warning)">额度读取失败：${escapeHtml(q.message || q.error || '未知')}</div>`;
 
-  // 优先渲染 q.buckets；缺失时回退旧渲染
-  if (q.buckets && Array.isArray(q.buckets)) {
-    const validBuckets = q.buckets.filter(b => b && (typeof b.percentage === 'number' || b.percentage !== null));
-    if (!validBuckets.length) return '<div class="muted">暂无配额桶数据</div>';
-    return validBuckets.map(b => {
-      const label = escapeHtml(b.label || b.group || '配额');
-      const win = b.window === '7d' ? '周' : (b.window === '5h' ? '5小时' : escapeHtml(b.window || ''));
-      const name = `${label} ${win}`.trim();
-      const p = typeof b.percentage === 'number' ? b.percentage : null;
-      const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
-      const qr = (b.reset_text || '') + (b.inferred ? '（推算）' : '');
-      return `<div class="quota-row">
-        <span class="qn">${name}</span>
-        <div class="qbar"><i class="${cls}" style="width:${p ?? 0}%"></i></div>
-        <span class="qp">${p === null ? '--' : '剩 ' + p + '%'}</span>
-        <span class="qr">${escapeHtml(qr || '暂无数据')}</span>
-      </div>`;
-    }).join('') + (q.updated_time ? `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time)}</div>` : '');
+  let buckets = [];
+  if (Array.isArray(q.buckets) && q.buckets.length > 0) {
+    buckets = q.buckets;
+  } else {
+    buckets = [
+      { name: 'Gemini 5h', ...(q.gemini_5h || {}) },
+      { name: 'Gemini 7d', ...(q.gemini_7d || {}) },
+      { name: 'Claude/GPT 5h', ...(q.claude_5h || {}) },
+      { name: 'Claude/GPT 7d', ...(q.claude_7d || {}) },
+    ];
   }
 
-  const rows = [['Gemini 5h', q.gemini_5h], ['Gemini 7天', q.gemini_7d], ['Claude 5h', q.claude_5h], ['Claude 7天', q.claude_7d]];
-  return rows.map(([name, b]) => {
-    const p = b && typeof b.percentage === 'number' ? b.percentage : null;
-    const cls = p === null ? '' : p < 20 ? 'low' : p < 50 ? 'mid' : '';
-    return `<div class="quota-row">
-      <span class="qn">${name}</span>
-      <div class="qbar"><i class="${cls}" style="width:${p ?? 0}%"></i></div>
-      <span class="qp">${p === null ? '--' : '剩 ' + p + '%'}</span>
-      <span class="qr">${b ? (b.reset_text || '') + (b.inferred ? '（推算）' : '') : '暂无数据'}</span>
-    </div>`;
-  }).join('') + `<div class="muted" style="text-align:right;font-size:11px;">更新于 ${escapeHtml(q.updated_time || '')}</div>`;
+  const rows = buckets.map(b => {
+    let name = b.name || b.label || b.group || '配额';
+    name = name.replace(/\s*\/\s*/g, '/');
+    if (b.window && !name.toLowerCase().includes(String(b.window).toLowerCase())) {
+      const winLabel = b.window === '7d' ? '7d' : (b.window === '5h' ? '5h' : b.window);
+      name = `${name} ${winLabel}`;
+    }
+    const isMissing = !!b.missing || b.percentage === null || b.percentage === undefined;
+    if (isMissing) {
+      const note = b.note || '未提供';
+      return `
+        <div class="quota-row missing">
+          <span class="qn">${escapeHtml(name)}</span>
+          <div class="qbar qbar-missing"><i class="empty-bar"></i></div>
+          <span class="qp qp-missing">未提供</span>
+          <span class="qr">${escapeHtml(note)}</span>
+        </div>
+      `;
+    }
+
+    const p = Math.max(0, Math.min(100, Math.round(Number(b.percentage))));
+    const cls = p < 20 ? 'low' : p < 50 ? 'mid' : '';
+    const qr = (b.reset_text || '') + (b.inferred ? '（推算）' : '');
+    return `
+      <div class="quota-row">
+        <span class="qn">${escapeHtml(name)}</span>
+        <div class="qbar"><i class="${cls}" style="width:${p}%"></i></div>
+        <span class="qp">剩 ${p}%</span>
+        <span class="qr">${escapeHtml(qr)}</span>
+      </div>
+    `;
+  }).join('');
+
+  return rows + (q.updated_time ? `<div class="muted" style="text-align:right;font-size:11px;margin-top:4px;">更新于 ${escapeHtml(q.updated_time)}</div>` : '');
 }
 
 function tierTagHtml(tier) {
@@ -1851,15 +1966,16 @@ async function clearLogs() {
   await refreshEngineInfo();
   applyEngineChrome();
   loadOverview();
-  setInterval(() => { if (currentTab === 'overview' && !document.hidden) loadOverview(); }, 15000);
-  setInterval(() => { if (currentTab === 'stats' && !document.hidden && engine === 'ag' && agReady()) loadTokenStats(false); }, 30000);
+  // 自动刷新只在概览可见时进行
+  setInterval(() => {
+    if (currentTab === 'overview' && !document.hidden) loadOverview();
+  }, 15000);
 })();
 
-
-// PR4：控制台回到前台时预热 AG 上游连接 / token（后端 20 秒内去重）
+// 控制台回到前台时预热 AG 上游连接 / token；仅在概览可见时刷新概览
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (typeof agReady === 'function' && !agReady()) return;
   postJson('/api/prewarm', { reason: 'foreground' }).catch(() => {});
-  if (currentTab === 'stats' && engine === 'ag') loadTokenStats(false);
+  if (currentTab === 'overview') loadOverview();
 });
