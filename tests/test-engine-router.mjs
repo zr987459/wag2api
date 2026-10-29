@@ -10,6 +10,7 @@ function decide(path, model, defaultEngine='ais') {
   const p = normalize(path);
   if (p.startsWith('/ag/')) return ['node', p.slice(3)];
   if (p === '/ag') return ['node', '/'];
+  if (p === '/api/pairing/accounts') return ['ais', p];
   if (p.startsWith('/api/')) return ['node', p];
   if (p.startsWith('/ais/')) return ['ais', p];
   if (p === '/v1/messages' || p === '/v1/chat/completions') {
@@ -37,6 +38,7 @@ const cases = [
   ['/v1/chat/completions', 'gemini-4-argon', 'ais', 'ag', 'OpenAI 路径也分流'],
   ['/ag/', 'x', 'ais', 'node', '控制台路径'],
   ['/api/status', 'x', 'ais', 'node', 'Node 内部 API'],
+  ['/api/pairing/accounts', 'x', 'ais', 'ais', '远程配对端点特判'],
   ['/ais/api/status', 'x', 'ais', 'ais', 'AIS 接口'],
   ['//v1//messages/', 'gemini-2.5-flash', 'ais', 'ais', '路径归一化'],
 ];

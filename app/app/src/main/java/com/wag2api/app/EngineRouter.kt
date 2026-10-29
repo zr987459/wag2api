@@ -101,6 +101,7 @@ object EngineRouter {
         // ── 第 1 层：路径 ──────────────────────────────
         if (p.startsWith("/ag/")) return Route.ToNode(p.removePrefix("/ag"))
         if (p == "/ag") return Route.ToNode("/")
+        if (p == "/api/pairing/accounts") return Route.ToAis(p)
         if (p.startsWith("/api/")) return Route.ToNode(p)   // Node 控制台内部用绝对路径 fetch
 
         if (p.startsWith("/ais/api/") || p == "/ais/api") return Route.ToAis(p.removePrefix("/ais"))
@@ -261,22 +262,31 @@ object EngineRouter {
             if (query.isNotEmpty()) append('?').append(query)
         }
 
-        val rb = if (method == "GET" || method == "HEAD") null
+        val rb = if (method == "GET" || method == "HEAD" || (method == "DELETE" && realBody.isEmpty())) null
         else {
             val ct = headers["content-type"] ?: "application/json; charset=utf-8"
             realBody.toRequestBody(ct.toMediaType())
         }
 
         val reqBuilder = Request.Builder().url(url).method(method, rb)
-        // 转发 AIS 时请求头去掉 Authorization/x-api-key/x-goog-api-key（AIS 不设 PROXY_API_KEY，只监听回环）
+        val keepAuth = (path == "/api/pairing/accounts")
         for ((k, v) in headers) {
             val lk = k.lowercase()
-            if (lk == "authorization" || lk == "x-api-key" || lk == "x-goog-api-key" ||
-                lk == "content-length" || lk == "host") {
+            if (lk == "origin" ||
+                lk == "referer" ||
+                lk.startsWith("sec-fetch-") ||
+                lk == "host" ||
+                lk == "content-length" ||
+                lk == "x-api-key" ||
+                lk == "x-goog-api-key" ||
+                lk == "x-admin-key" ||
+                (lk == "authorization" && !keepAuth)
+            ) {
                 continue
             }
             reqBuilder.header(k, v)
         }
+        reqBuilder.header("Host", AisEngine.baseUrl.removePrefix("http://").removePrefix("https://"))
 
         val startTime = System.currentTimeMillis()
         val model = try { JSONObject(realBody).optString("model", "") } catch (e: Exception) { "" }
@@ -313,13 +323,21 @@ object EngineRouter {
                     out.flush()
                 } else {
                     val bytes = resp.body?.bytes() ?: ByteArray(0)
-                    val head = "HTTP/1.1 ${resp.code} ${resp.message}\r\n" +
-                            "Content-Type: $ct\r\n" +
-                            "Content-Length: ${bytes.size}\r\n" +
-                            "Access-Control-Allow-Origin: *\r\n" +
-                            "Connection: close\r\n\r\n"
+                    val head = if (resp.code == 204) {
+                        "HTTP/1.1 204 No Content\r\n" +
+                                "Access-Control-Allow-Origin: *\r\n" +
+                                "Connection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 ${resp.code} ${resp.message}\r\n" +
+                                "Content-Type: $ct\r\n" +
+                                "Content-Length: ${bytes.size}\r\n" +
+                                "Access-Control-Allow-Origin: *\r\n" +
+                                "Connection: close\r\n\r\n"
+                    }
                     out.write(head.toByteArray(Charsets.US_ASCII))
-                    out.write(bytes)
+                    if (bytes.isNotEmpty()) {
+                        out.write(bytes)
+                    }
                     out.flush()
                 }
                 GatewayMetrics.record(method, path, model, "ais", resp.code, 0, System.currentTimeMillis() - startTime)

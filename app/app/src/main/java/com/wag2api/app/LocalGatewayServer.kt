@@ -163,7 +163,7 @@ class LocalGatewayServer(
             if (method == "OPTIONS") {
                 val preflight = "HTTP/1.1 204 No Content\r\n" +
                         "Access-Control-Allow-Origin: *\r\n" +
-                        "Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n" +
+                        "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n" +
                         "Access-Control-Allow-Headers: *\r\n" +
                         "Connection: close\r\n\r\n"
                 output.write(preflight.toByteArray(Charsets.US_ASCII))
