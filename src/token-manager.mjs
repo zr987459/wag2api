@@ -136,7 +136,7 @@ export class TokenManager {
         headers: {
           'Authorization': `Bearer ${this.tokenData.accessToken}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/1.10.2 linux/arm64',
+          'User-Agent': 'antigravity/4.3.0 linux/arm64',
         },
         body: JSON.stringify({
           metadata: { ideType: 'ANTIGRAVITY' }
@@ -159,7 +159,7 @@ export class TokenManager {
           headers: {
             'Authorization': `Bearer ${this.tokenData.accessToken}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'antigravity/1.10.2 linux/arm64',
+            'User-Agent': 'antigravity/4.3.0 linux/arm64',
           },
           body: JSON.stringify({
             tier_id: tierId,

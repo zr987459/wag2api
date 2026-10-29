@@ -586,7 +586,7 @@ export async function fetchSubscriptionTier(accessToken, email) {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/1.10.2 linux/arm64',
+          'User-Agent': 'antigravity/4.3.0 linux/arm64',
         },
         body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
         signal: AbortSignal.timeout(10000),
@@ -620,7 +620,7 @@ export async function fetchQuotaSummary(accessToken, project) {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/1.10.2 linux/arm64',
+          'User-Agent': 'antigravity/4.3.0 linux/arm64',
         },
         body: JSON.stringify(project ? { project } : {}),
         signal: AbortSignal.timeout(15000),
@@ -683,7 +683,7 @@ export async function fetchRealQuota(tokenManager) {
           headers: {
             'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'antigravity/1.10.2 linux/arm64',
+            'User-Agent': 'antigravity/4.3.0 linux/arm64',
           },
           body: JSON.stringify(validProj ? { project: validProj } : {}),
           signal: AbortSignal.timeout(15000),

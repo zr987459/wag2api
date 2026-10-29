@@ -50,7 +50,7 @@ export function buildAntigravityHeaders(accessToken) {
   return {
     'Authorization': `Bearer ${accessToken}`,
     'Content-Type': 'application/json',
-    'User-Agent': 'antigravity/1.10.2 linux/arm64',
+    'User-Agent': 'antigravity/4.3.0 linux/arm64',
     'X-Client-Name': 'antigravity',
     'Connection': 'keep-alive',
   };

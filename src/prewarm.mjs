@@ -27,7 +27,7 @@ export async function prewarm(accountPool, { reason = 'manual', force = false, f
         out.t_project = Date.now() - t0;
       }
       const c0 = Date.now();
-      const r = await fetchImpl(`${ANTIGRAVITY_ENDPOINT_DAILY}/`, { method: 'GET', headers: { 'User-Agent': 'antigravity/1.10.2 linux/arm64' } });
+      const r = await fetchImpl(`${ANTIGRAVITY_ENDPOINT_DAILY}/`, { method: 'GET', headers: { 'User-Agent': 'antigravity/4.3.0 linux/arm64' } });
       await r.text().catch(() => '');   // 读完响应，连接才会回到池里
       out.t_conn = Date.now() - c0;
       out.status = r.status;
