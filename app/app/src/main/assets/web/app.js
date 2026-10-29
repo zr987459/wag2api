@@ -1145,10 +1145,7 @@ function formatAccountPerfRow(p) {
   }
   const failStreak = Number(p.fail_streak) || 0;
   return `
-    <div class="account-perf-row mono">
-      <span>成功率 ${rateText} · 平均 ${latText}</span>
-      ${failStreak >= 3 ? `<span class="fail-streak-warn"> · 连续失败 ${failStreak} 次</span>` : ''}
-    </div>
+${failStreak >= 3 ? `<div class="account-perf-row mono"><span class="fail-streak-warn">连续失败 ${failStreak} 次</span></div>` : ''}
   `;
 }
 
@@ -1400,9 +1397,6 @@ async function loadAgAccounts() {
             </div>` : ''}
           <div class="quota-list" id="quota-${id}">${quotaHtml(agQuota[a.email])}</div>
           ${perfRowHtml}
-          <div class="kv"><span class="k">请求 / Token</span><span class="v">${fmtNum(u.total_requests)} / ${fmtNum(u.total_tokens)}</span></div>
-          <div class="kv"><span class="k">输入 · 缓存 · 输出 · 思考</span><span class="v">${fmtNum(u.input_tokens)} · ${fmtNum(u.cached_tokens)} · ${fmtNum(u.output_tokens)} · ${fmtNum(u.thoughts_tokens)}</span></div>
-          <div class="kv"><span class="k">缓存命中率 · 首字</span><span class="v">${fmtPct(u.cache_hit_rate)} · ${fmtMs(u.avg_ttft_ms)}</span></div>
           ${renderAccountTestBanner(agTestResults[a.email])}
           <div class="account-actions-wrap">
             <div class="account-actions-row">
