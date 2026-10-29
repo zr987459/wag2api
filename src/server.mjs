@@ -20,6 +20,7 @@ import { hostBench } from './host-bench.mjs';
 import { upstreamFetch, RUNTIME } from './upstream-fetch.mjs';
 import { prewarm, lastPrewarm } from './prewarm.mjs';
 import { fetchRealQuota, computeAccountQuotas, getModelFamily } from './quota-fetcher.mjs';
+import { startQuotaRefreshLoop } from './quota-refresher.mjs';
 import { testAccount, testAllAccounts } from './account-tester.mjs';
 import { getModelsResponse } from './models-catalog.mjs';
 import { parseAgImport } from './ag-import.mjs';
@@ -301,7 +302,7 @@ const server = http.createServer(async (req, res) => {
     if (quotaData?.ok && quotaData.email) {
       const familyQuotas = computeAccountQuotas(quotaData);
       quotaCache.set(quotaData.email, familyQuotas);
-      accountPool.updateQuota(quotaData.email, familyQuotas);
+      accountPool.updateQuota(quotaData.email, quotaData);
     }
     sendJson(res, 200, quotaData);
     return;
@@ -319,8 +320,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/scheduling' && req.method === 'POST') {
     try {
-      const { mode, fixed_email } = await readBody(req);
-      const scheduling = accountPool.setScheduling({ mode, fixed_email });
+      const { mode, fixed_email, prewarm_weekly } = await readBody(req);
+      const scheduling = accountPool.setScheduling({ mode, fixed_email, prewarm_weekly });
       sendJson(res, 200, { ok: true, scheduling });
     } catch (e) {
       sendJson(res, 400, { ok: false, error: e.message });
@@ -986,6 +987,9 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 server.listen(PORT, HOST, () => {
   // PR4：启动即预热（不阻塞监听）
   setTimeout(() => { prewarm(accountPool, { reason: 'start', force: true }).then(r => console.log(`[Prewarm] start ok=${r.ok} conn=${r.t_conn}ms tls=${r.tls_ms}ms`)).catch(() => {}); }, 500).unref?.();
+  if (process.env.NODE_ENV !== 'test' && process.env.AG_DISABLE_AUTO_REFRESH !== '1') {
+    startQuotaRefreshLoop(accountPool, quotaCache);
+  }
   const lan = Object.values(os.networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
   console.log(`🚀 wag2api 已启动`);
   console.log(`   本机:   http://127.0.0.1:${PORT}`);

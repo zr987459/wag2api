@@ -392,6 +392,7 @@ body.theme-ag .brand-icon {
 .tag-google { background: rgba(234, 67, 53, 0.15); color: #ea4335; }
 .tag-online { background: rgba(16, 185, 129, 0.15); color: #10b981; }
 .tag-offline { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.tag-protected { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
 
 /* 按钮规范 */
 .btn {

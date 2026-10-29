@@ -297,6 +297,11 @@ export async function runWithPolicy(ctx) {
       return typeof v === 'number' ? v : null;
     };
 
+    const isProtected = (m) => {
+      const q = getQuota(m);
+      return q !== null && q <= 0.02;
+    };
+
     const isLow = (m) => {
       const q = getQuota(m);
       return q !== null && q < 0.05;
@@ -307,7 +312,11 @@ export async function runWithPolicy(ctx) {
       return q !== null ? q : 0.5; // 未知 (null) 当作中性 0.5
     };
 
-    const hasNonLow = free.some(m => !isLow(m));
+    // 配额保护：已知额度 <= 2% 的号直接跳过；若所有号都被保护，则仍选额度最高的那个
+    const nonProtected = free.filter(m => !isProtected(m));
+    const candidateFree = nonProtected.length > 0 ? nonProtected : free;
+
+    const hasNonLow = candidateFree.some(m => !isLow(m));
 
     const sortFn = (a, b) => {
       if (hasNonLow) {
@@ -319,12 +328,12 @@ export async function runWithPolicy(ctx) {
     };
 
     // 如果 active 号本身额度 <5% 且号池中有其他可用正常号，则 active 号不可优先占用首位，一并参与重排
-    if (active && (!hasNonLow || !isLow(active))) {
-      const rest = free.filter(m => m !== active).map((m, i) => ({ m, i })).sort(sortFn).map(x => x.m);
+    if (active && candidateFree.includes(active) && (!hasNonLow || !isLow(active))) {
+      const rest = candidateFree.filter(m => m !== active).map((m, i) => ({ m, i })).sort(sortFn).map(x => x.m);
       return [active, ...rest];
     }
 
-    return free.map((m, i) => ({ m, i })).sort(sortFn).map(x => x.m);
+    return candidateFree.map((m, i) => ({ m, i })).sort(sortFn).map(x => x.m);
   };
 
   const attempt = async (payload, mgr, host) => {

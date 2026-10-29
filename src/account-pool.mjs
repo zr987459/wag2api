@@ -35,6 +35,8 @@ export class AccountPool {
     );
     this.schedulingMode = 'cache_first';
     this.fixedEmail = '';
+    this.prewarmWeekly = false;
+    this.quotaRefreshStatus = { interval_min: 15, last_run_at: null, next_run_at: null };
     this.perfHistory = new Map(); // email -> { records: [{ success, latency_ms }], fail_streak }
     this.quotaMap = new Map();    // email -> { gemini, claude, argon }
     this.managers = new Map(); // email -> TokenManager
@@ -268,6 +270,9 @@ export class AccountPool {
             this.selectedEmail = this.fixedEmail;
           }
         }
+        if (data && typeof data.prewarm_weekly === 'boolean') {
+          this.prewarmWeekly = data.prewarm_weekly;
+        }
       }
     } catch (e) {
       console.warn('[AccountPool] 读取 scheduling.json 失败:', e.message);
@@ -281,6 +286,7 @@ export class AccountPool {
         const content = JSON.stringify({
           mode: this.schedulingMode,
           fixed_email: this.fixedEmail,
+          prewarm_weekly: Boolean(this.prewarmWeekly),
         }, null, 2);
         fs.writeFileSync(this.schedulingFile, content, 'utf8');
       }
@@ -292,28 +298,49 @@ export class AccountPool {
   getSchedulingMode() { return this.schedulingMode; }
   getFixedEmail() { return this.fixedEmail; }
 
+  setQuotaRefreshStatus(status) {
+    if (status && typeof status === 'object') {
+      this.quotaRefreshStatus = {
+        ...this.quotaRefreshStatus,
+        ...status,
+      };
+    }
+  }
+
   getScheduling() {
     return {
       mode: this.schedulingMode,
       fixed_email: this.fixedEmail,
+      prewarm_weekly: Boolean(this.prewarmWeekly),
       modes: SCHEDULING_MODES,
+      quota_refresh: this.quotaRefreshStatus || {
+        interval_min: 15,
+        last_run_at: null,
+        next_run_at: null,
+      },
     };
   }
 
-  setScheduling({ mode, fixed_email = '' } = {}) {
+  setScheduling({ mode, fixed_email, prewarm_weekly } = {}) {
     const validModes = ['cache_first', 'balance', 'performance', 'fixed'];
-    if (!mode || !validModes.includes(mode)) {
-      throw new Error(`无效的调度模式: ${mode}`);
+    const targetMode = mode || this.schedulingMode;
+    if (!validModes.includes(targetMode)) {
+      throw new Error(`无效的调度模式: ${targetMode}`);
     }
-    this.schedulingMode = mode;
-    this.fixedEmail = (fixed_email || '').trim();
-    if (this.schedulingMode === 'fixed') {
-      this.selectedEmail = this.fixedEmail;
-    } else if (this.selectedEmail === this.fixedEmail) {
-      this.selectedEmail = '';
+    this.schedulingMode = targetMode;
+    if (fixed_email !== undefined) {
+      this.fixedEmail = (fixed_email || '').trim();
+      if (this.schedulingMode === 'fixed') {
+        this.selectedEmail = this.fixedEmail;
+      } else if (this.selectedEmail === this.fixedEmail) {
+        this.selectedEmail = '';
+      }
+    }
+    if (typeof prewarm_weekly === 'boolean') {
+      this.prewarmWeekly = prewarm_weekly;
     }
     this.saveScheduling();
-    console.log(`[AccountPool] 调度策略已更新 ➔ 模式: ${this.schedulingMode}${this.fixedEmail ? ', 固定账号: ' + this.fixedEmail : ''}`);
+    console.log(`[AccountPool] 调度策略已更新 ➔ 模式: ${this.schedulingMode}${this.fixedEmail ? ', 固定账号: ' + this.fixedEmail : ''}, 周预热: ${this.prewarmWeekly}`);
     return this.getScheduling();
   }
 
@@ -367,27 +394,114 @@ export class AccountPool {
     const clean = (email || '').trim();
     if (!clean) return;
     if (typeof quotaObj === 'number') {
-      this.quotaMap.set(clean, { gemini: quotaObj, claude: quotaObj, argon: quotaObj });
+      const entry = { fraction: quotaObj, reset_time: null };
+      this.quotaMap.set(clean, { gemini: { ...entry }, claude: { ...entry }, argon: { ...entry } });
       return;
     }
     if (!quotaObj || typeof quotaObj !== 'object') return;
     const prev = this.quotaMap.get(clean) || { gemini: null, claude: null, argon: null };
-    const next = {
-      gemini: quotaObj.gemini !== undefined ? quotaObj.gemini : extractFamilyFraction(quotaObj, 'gemini'),
-      claude: quotaObj.claude !== undefined ? quotaObj.claude : extractFamilyFraction(quotaObj, 'claude'),
-      argon: quotaObj.argon !== undefined ? quotaObj.argon : extractFamilyFraction(quotaObj, 'argon'),
+
+    const parseBucketOrVal = (val, f5hObj, f7dObj) => {
+      if (f5hObj !== undefined || f7dObj !== undefined) {
+        const getFrac = obj => {
+          if (typeof obj === 'number') return obj;
+          if (obj && typeof obj === 'object') return obj.remaining_fraction ?? obj.fraction ?? null;
+          return null;
+        };
+        const getReset = obj => {
+          if (obj && typeof obj === 'object') return obj.reset_time || obj.reset || null;
+          return null;
+        };
+        return {
+          f5h: getFrac(f5hObj),
+          reset5h: getReset(f5hObj),
+          f7d: getFrac(f7dObj),
+          reset7d: getReset(f7dObj),
+        };
+      }
+      if (typeof val === 'number') {
+        return { fraction: val, reset_time: null };
+      }
+      if (val && typeof val === 'object') {
+        if (val.f5h !== undefined || val.f7d !== undefined) return { ...val };
+        const frac = val.remaining_fraction ?? val.fraction ?? null;
+        const reset = val.reset_time || val.reset || null;
+        if (typeof frac === 'number') return { fraction: frac, reset_time: reset };
+      }
+      return null;
     };
-    this.quotaMap.set(clean, { ...prev, ...next });
+
+    const hasRawBuckets = quotaObj.gemini_5h !== undefined || quotaObj.gemini_7d !== undefined ||
+                          quotaObj.claude_5h !== undefined || quotaObj.claude_7d !== undefined ||
+                          quotaObj.argon_5h !== undefined || quotaObj.argon_7d !== undefined;
+
+    let geminiVal, claudeVal, argonVal;
+    if (hasRawBuckets) {
+      geminiVal = parseBucketOrVal(null, quotaObj.gemini_5h, quotaObj.gemini_7d);
+      claudeVal = parseBucketOrVal(null, quotaObj.claude_5h, quotaObj.claude_7d);
+      argonVal = parseBucketOrVal(null, quotaObj.argon_5h, quotaObj.argon_7d);
+    } else {
+      geminiVal = quotaObj.gemini !== undefined ? parseBucketOrVal(quotaObj.gemini) : prev.gemini;
+      claudeVal = quotaObj.claude !== undefined ? parseBucketOrVal(quotaObj.claude) : prev.claude;
+      argonVal = quotaObj.argon !== undefined ? parseBucketOrVal(quotaObj.argon) : prev.argon;
+    }
+
+    this.quotaMap.set(clean, {
+      gemini: geminiVal !== undefined ? geminiVal : prev.gemini,
+      claude: claudeVal !== undefined ? claudeVal : prev.claude,
+      argon: argonVal !== undefined ? argonVal : prev.argon,
+    });
   }
 
-  getQuota(email, family = 'gemini') {
+  getQuota(email, family = 'gemini', now = Date.now()) {
     const clean = (email || '').trim();
     const entry = this.quotaMap.get(clean);
     if (!entry) return null;
     if (typeof entry === 'number') return entry;
     const fam = (family || 'gemini').toLowerCase();
     const val = entry[fam];
-    return typeof val === 'number' ? val : null;
+    if (val === null || val === undefined) return null;
+    if (typeof val === 'number') return val;
+
+    if (val && typeof val === 'object' && (val.f5h !== undefined || val.f7d !== undefined)) {
+      const isPassed = (resetStr) => {
+        if (!resetStr) return false;
+        const t = new Date(resetStr).getTime();
+        return !Number.isNaN(t) && t <= now;
+      };
+      let eff5h = null;
+      if (typeof val.f5h === 'number') {
+        eff5h = isPassed(val.reset5h) ? 1.0 : val.f5h;
+      }
+      let eff7d = null;
+      if (typeof val.f7d === 'number') {
+        eff7d = isPassed(val.reset7d) ? 1.0 : val.f7d;
+      }
+      if (eff5h !== null && eff7d !== null) return Math.min(eff5h, eff7d);
+      if (eff5h !== null) return eff5h;
+      if (eff7d !== null) return eff7d;
+      return null;
+    }
+
+    if (val && typeof val === 'object' && typeof val.fraction === 'number') {
+      if (val.reset_time) {
+        const t = new Date(val.reset_time).getTime();
+        if (!Number.isNaN(t) && t <= now) return 1.0;
+      }
+      return val.fraction;
+    }
+
+    return null;
+  }
+
+  isFamilyProtected(email, family = 'gemini', now = Date.now()) {
+    const q = this.getQuota(email, family, now);
+    return typeof q === 'number' && q <= 0.02;
+  }
+
+  getProtectedFamilies(email, now = Date.now()) {
+    const families = ['gemini', 'claude', 'argon'];
+    return families.filter(fam => this.isFamilyProtected(email, fam, now));
   }
 
   // 调度设置
@@ -513,6 +627,27 @@ export class AccountPool {
       return null;
     }
 
+    // 配额保护：已知额度 <= 2% 的账号直接跳过（直到该桶重置时间过去或刷新后回升）
+    const unprotectedEmails = healthyEmails.filter(e => !this.isFamilyProtected(e, family));
+
+    // 若所有号都被保护，则仍选额度最高的那个（不能完全无号可用）
+    if (unprotectedEmails.length === 0) {
+      const chosenEmail = [...healthyEmails].sort((a, b) => {
+        const qA = this.getQuota(a, family) ?? -1;
+        const qB = this.getQuota(b, family) ?? -1;
+        if (qB !== qA) return qB - qA;
+        const tA = this.lastUsed.get(a) || 0;
+        const tB = this.lastUsed.get(b) || 0;
+        return tA - tB;
+      })[0];
+      if (chosenEmail) {
+        this.touch(chosenEmail);
+        this.activeEmail = chosenEmail;
+        return this.managers.get(chosenEmail);
+      }
+      return null;
+    }
+
     // 辅助函数：根据配额 <5% 区分优先级（有 >=5% 或 null 的号时，<5% 的号排后）
     const filterLowQuota = (emails) => {
       const nonLow = emails.filter(e => {
@@ -527,17 +662,17 @@ export class AccountPool {
     // ================= 模式 1: fixed =================
     if (this.schedulingMode === 'fixed') {
       const target = (this.fixedEmail || this.selectedEmail || '').trim();
-      if (target && healthyEmails.includes(target)) {
+      if (target && unprotectedEmails.includes(target)) {
         chosenEmail = target;
       } else {
-        const candidates = filterLowQuota(healthyEmails);
+        const candidates = filterLowQuota(unprotectedEmails);
         chosenEmail = this._pickBalanced(candidates, family);
       }
     }
     // ================= 模式 2: cache_first (默认，粘性优先) =================
     else if (this.schedulingMode === 'cache_first') {
       // 兼容手动锁定
-      if (this.selectedEmail && healthyEmails.includes(this.selectedEmail)) {
+      if (this.selectedEmail && unprotectedEmails.includes(this.selectedEmail)) {
         chosenEmail = this.selectedEmail;
       }
       // 会话亲和表优先
@@ -545,16 +680,16 @@ export class AccountPool {
         const bound = this.sessionAffinity.get(sessionKey);
         if (bound && bound.expireAt > Date.now()) {
           const boundEmail = bound.email;
-          if (healthyEmails.includes(boundEmail)) {
+          if (unprotectedEmails.includes(boundEmail)) {
             bound.expireAt = Date.now() + AG_SESSION_TTL_MS;
             chosenEmail = boundEmail;
           }
         }
       }
 
-      // 未命中会话粘滞时：在健康未冷却账号中，排后 <5% 的号，选最久未用 (LRU)
+      // 未命中会话粘滞时：在未受保护账号中，排后 <5% 的号，选最久未用 (LRU)
       if (!chosenEmail) {
-        const candidates = filterLowQuota(healthyEmails);
+        const candidates = filterLowQuota(unprotectedEmails);
         chosenEmail = candidates.reduce((minE, e) => {
           const tMin = this.lastUsed.get(minE) || 0;
           const tCur = this.lastUsed.get(e) || 0;
@@ -564,12 +699,12 @@ export class AccountPool {
     }
     // ================= 模式 3: balance (不粘性，按配额+最近使用均衡) =================
     else if (this.schedulingMode === 'balance') {
-      const candidates = filterLowQuota(healthyEmails);
+      const candidates = filterLowQuota(unprotectedEmails);
       chosenEmail = this._pickBalanced(candidates, family);
     }
     // ================= 模式 4: performance (不粘性，优先最近成功率高/延迟低) =================
     else if (this.schedulingMode === 'performance') {
-      const candidates = filterLowQuota(healthyEmails);
+      const candidates = filterLowQuota(unprotectedEmails);
       chosenEmail = this._pickPerformance(candidates);
     }
 
@@ -636,6 +771,7 @@ export class AccountPool {
         success_rate: perf.success_rate,
         avg_latency_ms: perf.avg_latency_ms,
         fail_streak: perf.fail_streak,
+        protected_families: this.getProtectedFamilies(email),
         ...tm.getStatus(),
       };
     });

@@ -1224,6 +1224,21 @@ async function agTestAll(btn) {
   }
 }
 
+async function togglePrewarmWeekly(enabled) {
+  try {
+    agSchedulingState.prewarm_weekly = enabled;
+    const r = await postJson('/api/scheduling', { prewarm_weekly: enabled });
+    if (r && r.ok === false) {
+      showToast(r.error || '设置预热失败', 'warn');
+    } else {
+      showToast(enabled ? '已开启周额度智能预热' : '已关闭周额度智能预热', 'success');
+    }
+  } catch (e) {
+    showToast('设置失败：' + e.message, 'error');
+  }
+  await loadAgAccounts();
+}
+
 async function setSchedulingMode(mode) {
   let fixedEmail = agSchedulingState.fixed_email || '';
   if (mode === 'fixed' && !fixedEmail) {
@@ -1289,6 +1304,15 @@ async function loadAgAccounts() {
     const currentModeObj = modes.find(m => m.id === currentMode) || modes[0];
     const hasBlocked = accs.some(a => !!a.validation_blocked);
 
+    const qr = scheduling.quota_refresh || {};
+    let qrText = '额度每 15 分钟自动刷新';
+    if (qr.last_run_at) {
+      const d = new Date(qr.last_run_at);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      qrText += ` · 上次 ${hh}:${mm}`;
+    }
+
     sch.innerHTML = `
       <div class="section-title" style="margin-bottom: 6px;">
         <span>账号调度</span>
@@ -1298,6 +1322,7 @@ async function loadAgAccounts() {
           ${hasBlocked ? '<button class="btn btn-outline btn-sm" style="color:var(--danger);border-color:rgba(239,68,68,0.4);" onclick="agClearValidation(\'\')">解除全部验证标记</button>' : ''}
         </div>
       </div>
+      <div class="muted" style="font-size: 11px; margin-bottom: 8px;">${escapeHtml(qrText)}</div>
       <p class="muted" style="margin-bottom: 8px;">调度模式选择及负载均衡策略：</p>
       <div class="sched-modes-wrap">
         <div class="sched-modes-grid">
@@ -1316,6 +1341,13 @@ async function loadAgAccounts() {
           </div>
         ` : ''}
         <div class="muted sched-mode-desc">${escapeHtml(currentModeObj?.desc || '')}</div>
+      </div>
+      <div class="row-between" style="margin-top: 10px; padding: 10px 12px; background: rgba(255,255,255,0.03); border-radius: var(--radius-md); border: 1px solid rgba(255,255,255,0.06);">
+        <div style="flex: 1; padding-right: 12px;">
+          <div style="font-size: 13px; font-weight: 600;">7 天周额度智能预热</div>
+          <div class="muted" style="font-size: 11px; line-height: 1.4; margin-top: 2px;">周额度重置后自动发 1 次极小请求，提前开始新的周期计时</div>
+        </div>
+        <label class="switch" style="flex-shrink: 0;"><input type="checkbox" id="prewarmWeeklyToggle" ${scheduling.prewarm_weekly ? 'checked' : ''} onchange="togglePrewarmWeekly(this.checked)"><span class="slider"></span></label>
       </div>
       <div style="display: flex; gap: 8px; margin-top: 10px;">
         <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="agTestAll(this)" ${agTestingAll ? 'disabled' : ''}>
@@ -1347,6 +1379,10 @@ async function loadAgAccounts() {
                 <span class="account-name">${em}</span>
                 <span class="tag tag-global">Google</span>
                 <span id="tier-${id}">${tierTagHtml(agQuota[a.email]?.tier || a.tier)}</span>
+                ${(pStatus.protected_families || []).map(f => {
+                  const name = f === 'claude' ? 'Claude' : (f === 'argon' ? 'Argon' : 'Gemini');
+                  return `<span class="tag tag-protected">${name} 已保护</span>`;
+                }).join('')}
                 ${a.validation_blocked ? '<span class="tag tag-offline" style="background:rgba(239,68,68,0.2);color:#ef4444;border:1px solid rgba(239,68,68,0.4);">需验证</span>' : ''}
                 <span class="tag ${a.hasRefreshToken ? 'tag-online' : 'tag-offline'}">${a.hasRefreshToken ? '● 正常' : '● 凭据缺失'}</span>
                 ${a.isActive ? '<span class="tag tag-online">当前</span>' : ''}
