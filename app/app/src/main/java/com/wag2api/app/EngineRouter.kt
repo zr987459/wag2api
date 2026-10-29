@@ -272,8 +272,11 @@ object EngineRouter {
         val keepAuth = (path == "/api/pairing/accounts")
         for ((k, v) in headers) {
             val lk = k.lowercase()
+            // accept-encoding 交给 OkHttp 自己管：透传浏览器的 gzip 会让 AIS 返回压缩体，
+            // OkHttp 不解压、前门又不带 Content-Encoding，WebView 读到乱码 JSON（res.json() 为 null）
             if (lk == "origin" ||
                 lk == "referer" ||
+                lk == "accept-encoding" ||
                 lk.startsWith("sec-fetch-") ||
                 lk == "host" ||
                 lk == "content-length" ||

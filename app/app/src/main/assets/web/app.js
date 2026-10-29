@@ -100,6 +100,7 @@ async function getJson(url, opts, retried) {
     const msg = (err && (err.message || err.code)) || (typeof err === 'string' ? err : '') || (data && (data.message || data.error)) || `HTTP ${res.status}`;
     throw new Error(msg);
   }
+  if (data === null && url.startsWith('/ais/')) throw new Error('AIS 返回了无法解析的响应');
   return data;
 }
 
