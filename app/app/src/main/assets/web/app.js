@@ -67,6 +67,12 @@ async function getJson(url, opts, retried) {
   let data = null;
   try { data = await res.json(); } catch (e) { /* 非 JSON */ }
   if (!res.ok && !(data && typeof data === 'object')) throw new Error(`HTTP ${res.status}`);
+  // AIS 的错误以 JSON {error:{message}} 返回，必须当失败处理，不能误报成功
+  if (!res.ok && url.startsWith('/ais/')) {
+    const err = data && data.error;
+    const msg = (err && (err.message || err.code)) || (typeof err === 'string' ? err : '') || (data && data.message) || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
   return data;
 }
 
@@ -1698,6 +1704,8 @@ async function handleAisCookieImport() {
       await postJson('/ais/api/accounts/import/cookies', payload);
       showToast('导入成功', 'success');
     }
+    // 首次有账号时生成服务不会自动起来，导入后主动启动一次
+    try { await postJson('/ais/api/control/start', {}); } catch (e) { showToast('账号已导入，但启动服务失败: ' + e.message, 'warn'); }
     $('aisCookieInput').value = '';
     $('aisDiscoverArea').style.display = 'none';
     aisDiscoveredAccounts = [];
@@ -1805,6 +1813,7 @@ async function importAis(raw) {
   try {
     const d = await postJson('/ais/api/accounts/import/cookies', { cookies: raw });
     const id = (d.account && d.account.id) || '';
+    try { await postJson('/ais/api/control/start', {}); } catch (e) { /* 服务可能已在运行 */ }
     return { ok: true, msg: id ? `导入成功：${id}` : '导入成功' };
   } catch (e) {
     return { ok: false, msg: e.message || '导入失败' };

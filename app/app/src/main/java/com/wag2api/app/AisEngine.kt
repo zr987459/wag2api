@@ -135,6 +135,7 @@ object AisEngine {
             "AISTUDIO_AUTH_STATES" to "auth",
             "WARM_WORKER_LIMIT" to "1",
             "MAX_ACTIVE_WORKERS" to "2",
+            "WARM_STARTUP_CONCURRENCY" to "1",
             "PER_ACCOUNT_CONCURRENCY" to "2",
             "LOG_MAX_TOTAL_MB" to "50"
         )
