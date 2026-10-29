@@ -1,13 +1,16 @@
 // wag2api 双引擎控制台 v2
-// 一个界面、两个引擎：顶部切 WB / AG，底部五页两边通用。
-// WB 走 /panel/api/*（Kotlin），AG 走 /api/*（Node，经前门转发）。
+// 一个界面、两个引擎：顶部切 AIS / AG，底部五页两边通用。
+// AIS 走 /ais/api/*（AIStudio2API），AG 走 /api/*（Node，经前门转发）。
 
-let engine = localStorage.getItem('wag2api_engine') === 'ag' ? 'ag' : 'wb';
+let engine = localStorage.getItem('wag2api_engine') === 'ag' ? 'ag' : 'ais';
 let currentTab = 'overview';
-let engineInfo = { supported: false, enabled: false, state: 'OFF', default_engine: 'wb' };
-let lastStats = { wb: null, ag: null };
-const chatState = { wb: { history: [], html: '' }, ag: { history: [], html: '' } };
-const modelCache = { wb: null, ag: null };
+let engineInfo = { supported: false, enabled: false, state: 'OFF', default_engine: 'ais', ais: { available: true, running: true, base_url: '' } };
+let lastStats = { ais: null, ag: null };
+const chatState = { ais: { history: [], html: '' }, ag: { history: [], html: '' } };
+const modelCache = { ais: null, ag: null };
+const aisRefreshTimes = {};
+let currentAisPairing = null;
+let aisDiscoveredAccounts = [];
 const agQuota = {};          // email -> quota
 const agTestResults = {};    // email -> test result
 const agTestingAccounts = new Set();
@@ -18,7 +21,7 @@ let activePollTimer = null;
 let currentAbort = null;
 
 const META = {
-  wb: { title: 'WorkBuddy', icon: '◉', name: 'WB 引擎', vendor: '腾讯 WorkBuddy' },
+  ais: { title: 'AI Studio', icon: '✦', name: 'AIS 引擎', vendor: 'Google AI Studio' },
   ag: { title: 'Antigravity', icon: '⚡', name: 'AG 引擎', vendor: 'Google Antigravity' },
 };
 
@@ -40,7 +43,7 @@ function fmtNum(n) {
 function fmtPct(r) { return r === null || r === undefined ? '--' : (r * 100).toFixed(1) + '%'; }
 function fmtMs(ms) { return ms === null || ms === undefined || ms === 0 ? '--' : ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
 
-// 独立运行：standalone=只有 AG（WB_ENGINE=0）；dual=Linux / 源码版双引擎（没有安卓宿主）。
+// 独立运行：standalone=只有 AG；dual=Linux / 源码版（没有安卓宿主）。
 // 设置了 ADMIN_KEY 时管理接口需带密钥
 const isStandalone = () => !!engineInfo.standalone;
 const isDual = () => !!engineInfo.dual;
@@ -57,7 +60,7 @@ function authHeaders(h) {
 async function getJson(url, opts, retried) {
   const finalUrl = apiUrl(url);
   const res = await fetch(finalUrl, { cache: 'no-store', ...opts, headers: authHeaders(opts && opts.headers) });
-  if (res.status === 401 && !retried && (url.startsWith('/api/') || url.startsWith('/panel/api/'))) {
+  if (res.status === 401 && !retried && (url.startsWith('/api/') || url.startsWith('/panel/api/') || url.startsWith('/ais/api/'))) {
     const k = prompt('此网关设置了管理密钥（ADMIN_KEY），请输入：', '');
     if (k) { localStorage.setItem('wag2api_admin_key', k.trim()); return getJson(url, opts, true); }
   }
@@ -127,19 +130,34 @@ async function refreshEngineInfo() {
   try {
     engineInfo = await getJson('/panel/api/engine/state');
   } catch (e) { /* 保持旧值 */ }
-  if (isStandalone()) {
-    document.body.classList.add('standalone');
-    if (engine !== 'ag') { engine = 'ag'; localStorage.setItem('wag2api_engine', 'ag'); }
-  }
-  document.body.classList.toggle('dual', isDual());
+  const hasAg = !!engineInfo.supported;
   const mini = $('miniAg');
-  const tab = $('tabSwitchAg');
-  if (!engineInfo.supported) { mini.textContent = '未内置'; tab.classList.add('disabled'); }
-  else if (engineInfo.state === 'READY') { mini.textContent = 'Google'; tab.classList.remove('disabled'); }
-  else if (engineInfo.state === 'STARTING') { mini.textContent = '启动中'; tab.classList.add('disabled'); }
-  else { mini.textContent = engineInfo.enabled ? '异常' : '已关闭'; tab.classList.add('disabled'); }
+  const tabAg = $('tabSwitchAg');
+  const switcherBar = $('engineSwitcherBar');
+
+  if (!hasAg) {
+    if (tabAg) tabAg.style.display = 'none';
+    if (mini) mini.textContent = '未内置';
+    if (switcherBar) switcherBar.classList.add('single-engine');
+    if (engine !== 'ais') {
+      engine = 'ais';
+      localStorage.setItem('wag2api_engine', 'ais');
+    }
+  } else {
+    if (tabAg) {
+      tabAg.style.display = '';
+      if (engineInfo.state === 'READY') { mini.textContent = 'Google'; tabAg.classList.remove('disabled'); }
+      else if (engineInfo.state === 'STARTING') { mini.textContent = '启动中'; tabAg.classList.add('disabled'); }
+      else { mini.textContent = engineInfo.enabled ? '异常' : '已关闭'; tabAg.classList.add('disabled'); }
+    }
+    if (switcherBar) switcherBar.classList.remove('single-engine');
+  }
   const sel = $('defaultEngineSelect');
-  if (sel) sel.value = engineInfo.default_engine || 'wb';
+  if (sel) {
+    sel.value = engineInfo.default_engine || 'ais';
+    const optAg = sel.querySelector('option[value="ag"]');
+    if (optAg) optAg.style.display = hasAg ? '' : 'none';
+  }
   return engineInfo;
 }
 
@@ -158,10 +176,11 @@ function agOffHtml() {
 
 // ── 引擎 / 页签切换 ─────────────────────────────────────
 function applyEngineChrome() {
-  const m = META[engine];
-  $('tabSwitchWb').className = 'engine-tab' + (engine === 'wb' ? ' active wb-active' : '');
+  const m = META[engine] || META.ais;
+  $('tabSwitchAis').className = 'engine-tab' + (engine === 'ais' ? ' active ais-active' : '');
   $('tabSwitchAg').className = 'engine-tab' + (engine === 'ag' ? ' active ag-active' : '') + ($('tabSwitchAg').classList.contains('disabled') ? ' disabled' : '');
   document.body.classList.toggle('theme-ag', engine === 'ag');
+  document.body.classList.toggle('theme-ais', engine === 'ais');
   $('brandIcon').textContent = m.icon;
   $('currentEngineBadge').textContent = m.title;
   if ($('navEngine')) $('navEngine').textContent = isStandalone() ? 'AG' : m.name;
@@ -212,22 +231,37 @@ async function loadOverview() {
   if (!isStandalone()) loadGlobalSettings();
   const evEl = $('ovEngine');
 
-  if (engine === 'wb') {
+  if (engine === 'ais') {
     try {
-      const [ov, st] = await Promise.all([getJson('/panel/api/overview'), getJson('/panel/api/stats')]);
-      lastStats.wb = st;
-      $('ovAccounts').textContent = `${ov.healthy || 0} / ${ov.total || 0}`;
-      $('ovReq').textContent = fmtNum(st.today?.total_requests);
-      $('ovTokens').textContent = fmtNum(st.today?.total_tokens);
-      evEl.textContent = '● 就绪';
-      evEl.style.color = 'var(--primary)';
-      setHeader(true, '网关在线');
+      const status = await getJson('/ais/api/status');
+      const isRunning = status.state === 'RUNNING' || status.running;
+      const [modelsRes, accountsRes] = await Promise.all([
+        getJson('/ais/api/models').catch(() => ({ models: [] })),
+        getJson('/ais/api/accounts').catch(() => ({ accounts: [] })),
+      ]);
+      const models = modelsRes.models || [];
+      const accounts = accountsRes.accounts || [];
+
+      const to = new Date().toISOString();
+      const from = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+      const usage = await getJson(`/ais/api/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`).catch(() => null);
+      const totals = usage?.totals || {};
+
+      const readyAccs = accounts.filter(a => a.state === 'ready' || a.enabled).length;
+      $('ovAccounts').textContent = `${readyAccs} / ${accounts.length}`;
+      $('ovReq').textContent = fmtNum(totals.requests || 0);
+      $('ovTokens').textContent = fmtNum(totals.total_tokens || 0);
+      evEl.textContent = status.state || (isRunning ? '● RUNNING' : '● STOPPED');
+      evEl.style.color = isRunning ? 'var(--primary)' : 'var(--warning)';
+      setHeader(isRunning, isRunning ? 'AIS 运行中' : 'AIS 已停止');
+
+      renderAisOverview(status, models, accounts, totals, usage);
     } catch (e) {
-      setHeader(false, '连接中断');
+      setHeader(false, 'AIS 未响应');
       evEl.textContent = '● 异常';
       evEl.style.color = 'var(--danger)';
+      renderAisError(e.message);
     }
-    renderWbOverviewStats();
   } else {
     $('nodeEnabledToggle').checked = !!engineInfo.enabled;
     $('agEngineSub').textContent = `状态：${({ READY: '运行中', STARTING: '启动中', FAILED: '启动失败', OFF: '已关闭' })[engineInfo.state] || engineInfo.state}${engineInfo.port ? ' · 内部端口 ' + engineInfo.port : ''}`;
@@ -260,10 +294,59 @@ async function loadOverview() {
   }
 }
 
-function renderWbOverviewStats() {
+function renderAisOverview(status, models, accounts, totals, usage) {
   const box = $('overviewStatsContainer');
   if (!box) return;
-  box.innerHTML = '<div class="card empty" style="padding:18px 12px;font-size:13px;">Token 统计仅支持 AG 引擎</div>';
+  const isRunning = status.state === 'RUNNING' || status.running;
+  const costStr = usage && usage.cost !== undefined ? `$${Number(usage.cost).toFixed(4)}` : '--';
+  box.innerHTML = `
+    <div class="card">
+      <div class="row-between">
+        <div>
+          <div style="font-size: 14px; font-weight: 600;">AIS 引擎服务</div>
+          <div class="muted">状态：<span class="tag ${isRunning ? 'tag-online' : 'tag-offline'}">${escapeHtml(status.state || (isRunning ? 'RUNNING' : 'STOPPED'))}</span> · 可用模型：<b>${models.length}</b> 个 · 活跃请求：<b>${status.active_requests || 0}</b></div>
+        </div>
+        <button class="btn btn-sm ${isRunning ? 'btn-outline' : 'btn-primary'}" onclick="${isRunning ? 'stopAisService()' : 'startAisService()'}">
+          ${isRunning ? '⏹ 停止服务' : '▶ 启动服务'}
+        </button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title"><span>近 24 小时用量摘要</span></div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:8px;">
+        <div class="kv"><span class="k">成功请求</span><span class="v" style="color:var(--primary); font-weight:600;">${fmtNum(totals.succeeded || 0)}</span></div>
+        <div class="kv"><span class="k">失败 / 限流</span><span class="v" style="color:var(--danger); font-weight:600;">${fmtNum((totals.failed || 0) + (totals.rate_limited || 0))}</span></div>
+        <div class="kv"><span class="k">输入 Token</span><span class="v mono">${fmtNum(totals.input_tokens || 0)}</span></div>
+        <div class="kv"><span class="k">输出 Token</span><span class="v mono">${fmtNum(totals.output_tokens || totals.reply_tokens || 0)}</span></div>
+        <div class="kv"><span class="k">缓存 Token</span><span class="v mono">${fmtNum(totals.cached_tokens || 0)}</span></div>
+        <div class="kv"><span class="k">预估费用</span><span class="v mono">${costStr}</span></div>
+      </div>
+      ${usage && usage.recent ? `<div class="muted" style="margin-top:10px; font-size:12px;">最近 ${usage.recent.minutes} 分钟内：${usage.recent.requests} 次请求 · ${fmtNum(usage.recent.tokens)} Tokens</div>` : ''}
+    </div>
+  `;
+}
+
+function renderAisError(msg) {
+  const box = $('overviewStatsContainer');
+  if (!box) return;
+  box.innerHTML = `<div class="card"><div class="empty" style="color:var(--danger)">AIS 引擎未响应：${escapeHtml(msg)}<div class="muted" style="margin-top:8px;"><button class="btn btn-primary btn-sm" onclick="startAisService()">尝试启动服务</button></div></div></div>`;
+}
+
+async function startAisService() {
+  try {
+    await postJson('/ais/api/control/start', {});
+    showToast('已请求启动 AIS 服务', 'success');
+    setTimeout(loadOverview, 1000);
+  } catch (e) { showToast(`启动失败: ${e.message}`, 'error'); }
+}
+
+async function stopAisService() {
+  try {
+    await postJson('/ais/api/control/stop', {});
+    showToast('已请求停止 AIS 服务', 'warn');
+    setTimeout(loadOverview, 1000);
+  } catch (e) { showToast(`停止失败: ${e.message}`, 'error'); }
 }
 
 function renderAgOffOverviewStats() {
@@ -356,8 +439,12 @@ async function restartAgEngine() {
 
 async function resetStats() {
   if (!confirm(`清零 ${META[engine].name} 的全部统计和日志？`)) return;
-  if (engine === 'wb') await postJson('/panel/api/stats/reset', {});
-  else { if (!agReady()) return; await postJson('/api/stats/reset', {}); }
+  if (engine === 'ais') {
+    await fetch(apiUrl('/ais/api/logs'), { method: 'DELETE', headers: authHeaders() }).catch(() => {});
+  } else {
+    if (!agReady()) return;
+    await postJson('/api/stats/reset', {});
+  }
   showToast('统计已清零', 'success');
   loadOverview();
 }
@@ -402,7 +489,7 @@ function getPriceRules() {
 function normalizeModelName(m) {
   if (!m) return '';
   let name = String(m).toLowerCase().trim();
-  name = name.replace(/^(ag|wb):/, '');
+  name = name.replace(/^(ag|ais):/, '');
   name = name.replace(/-(high|low|medium|tiered|thinking)$/, '');
   return name;
 }
@@ -535,8 +622,7 @@ async function loadAgTokenStats(toast = false) {
   const box = $('overviewStatsContainer');
   if (!box) return;
 
-  if (engine === 'wb') {
-    renderWbOverviewStats();
+  if (engine === 'ais') {
     return;
   }
   if (!agReady()) {
@@ -976,7 +1062,7 @@ async function loadAccounts() {
   await refreshEngineInfo();
   if (engine !== want) return;
   applyEngineChrome();
-  if (engine === 'wb') return loadWbAccounts();
+  if (engine === 'ais') return loadAisAccounts();
   if (!agReady()) {
     $('schedulerCard').style.display = 'none';
     $('accountCount').textContent = '0';
@@ -986,78 +1072,54 @@ async function loadAccounts() {
   return loadAgAccounts();
 }
 
-async function loadWbAccounts() {
+async function loadAisAccounts() {
   const box = $('accountList');
   const sch = $('schedulerCard');
-  sch.style.display = 'block';
+  if (sch) sch.style.display = 'none';
   try {
-    const [ov, pool] = await Promise.all([getJson('/panel/api/overview'), getJson('/panel/api/pool')]);
-    if (engine !== 'wb') return;
-    const accounts = ov.accounts || [];
-    const poolMap = {};
-    (pool.accounts || []).forEach(x => { poolMap[x.uid] = x; });
-    const isOff = uid => !!(poolMap[uid] && poolMap[uid].disabled) || accounts.some(a => a.uid === uid && a.disabled);
-    // 已暂停的账号不算「当前」（后端暂停时会清空选中，这里再兜一层）
-    const selected = pool.selected_uid && !isOff(pool.selected_uid) ? pool.selected_uid : '';
+    const res = await getJson('/ais/api/accounts');
+    if (engine !== 'ais') return;
+    const accounts = res.accounts || [];
     $('accountCount').textContent = accounts.length;
 
-    sch.innerHTML = `
-      <div class="section-title" style="margin-bottom: 6px;">
-        <span>账号调度</span>
-        <button class="btn btn-outline btn-sm" onclick="wbClearCooldowns()">清除冷却</button>
-      </div>
-      <p class="muted" style="margin-bottom: 10px;">遇到「模型繁忙」自动换账号重试，冷却中的账号暂时跳过。</p>
-      <div class="row-between">
-        <span style="font-size: 13px;">当前使用</span>
-        <select class="input-field" style="margin-bottom: 0; max-width: 62%;" onchange="wbSelect(this.value)">
-          <option value="">自动轮询</option>
-          ${(pool.accounts || []).filter(a => !isOff(a.uid)).map(a => `<option value="${escapeHtml(a.uid)}" ${a.uid === selected ? 'selected' : ''}>${escapeHtml(a.nickname || a.uid.slice(0, 8))}</option>`).join('')}
-        </select>
-      </div>
-      <div style="display: flex; gap: 8px; margin-top: 10px;">
-        <button class="btn btn-outline" style="flex: 1;" onclick="wbRefreshTokens()">🔄 Token 保活</button>
-        <button class="btn btn-outline" style="flex: 1;" onclick="wbTestAll()">⚡ 全部测试</button>
-      </div>`;
+    if (!accounts.length) {
+      box.innerHTML = '<div class="empty">暂无 AIS 账号，点击右上角「+ 添加」或「导入」</div>';
+      return;
+    }
 
-    if (!accounts.length) { box.innerHTML = '<div class="empty">还没有账号，点右上角「+ 添加」或「导入」</div>'; return; }
+    const stateLabels = {
+      ready: { text: '● 正常', cls: 'tag-online' },
+      disabled: { text: '● 已停用', cls: 'tag-offline' },
+      auth_required: { text: '● 需认证', cls: 'tag-offline' },
+      cooldown: { text: '● 冷却中', cls: 'tag-warn' },
+      busy: { text: '● 忙碌', cls: 'tag-warn' },
+      unavailable: { text: '● 不可用', cls: 'tag-offline' },
+    };
 
     box.innerHTML = accounts.map(a => {
-      const p = poolMap[a.uid] || {};
-      const disabled = !!p.disabled || !!a.disabled;
-      const cooling = !!p.cooling;
-      const uid = escapeHtml(a.uid);
-      let st = '● 在线', stc = 'tag-online';
-      if (disabled) { st = '● 已暂停'; stc = 'tag-offline'; }
-      else if (cooling) { st = `● 冷却 ${p.cooldown_sec || 0}s`; stc = 'tag-offline'; }
-      const u = a.token_usage || {};
+      const id = escapeHtml(a.id);
+      const stInfo = stateLabels[a.state] || { text: `● ${escapeHtml(a.state || '未知')}`, cls: a.enabled ? 'tag-online' : 'tag-offline' };
+      const lastRef = aisRefreshTimes[a.id] ? new Date(aisRefreshTimes[a.id]).toLocaleTimeString('zh-CN', { hour12: false }) : '未手动刷新';
+      const modelsCount = (a.models && a.models.length) || 0;
       return `
         <div class="account-card">
           <div class="account-card-header">
-            <div class="item-avatar">${escapeHtml((a.nickname || 'U').charAt(0).toUpperCase())}</div>
+            <div class="item-avatar">${escapeHtml((a.id || 'A').charAt(0).toUpperCase())}</div>
             <div class="account-card-info">
               <div class="account-title-row">
-                <span class="account-name">${escapeHtml(a.nickname || a.uid)}</span>
-                <span class="tag tag-global">${a.realm === 'global' ? '国际版' : '国内版'}</span>
-                <span class="tag ${stc}">${st}</span>
-                ${selected === a.uid ? '<span class="tag tag-online">当前</span>' : ''}
+                <span class="account-name" style="word-break:break-all;">${id}</span>
+                <span class="tag ${stInfo.cls}">${stInfo.text}</span>
+                <span class="tag tag-global">${escapeHtml(a.benefit_tier || 'Free')}</span>
               </div>
-              <div class="account-meta mono">UID ${uid}</div>
+              <div class="account-meta mono">模型数: ${modelsCount} · 上次刷新: ${lastRef}</div>
             </div>
           </div>
-          <div style="margin-top:8px;">
-            <div class="kv"><span class="k">积分余额</span><span class="v">${a.credits >= 0 ? a.credits : '--'}</span></div>
-            <div class="kv"><span class="k">累计请求 / Token</span><span class="v">${fmtNum(u.request_count || p.request_count || 0)} / ${fmtNum(u.total_tokens || 0)}</span></div>
-          </div>
-          <div class="account-test-banner" id="test-banner-${uid}"></div>
-          <div class="account-actions-wrap">
+          ${a.message ? `<div class="log-note-box" style="margin-top:8px;">⚠️ ${escapeHtml(a.message)}</div>` : ''}
+          <div class="account-actions-wrap" style="margin-top:10px;">
             <div class="account-actions-row">
-              <button class="btn btn-outline btn-sm" onclick="wbTest('${uid}', this)">⚡ 测试</button>
-              <button class="btn btn-outline btn-sm" onclick="wbExportOne('${uid}')">📤 导出</button>
-              <button class="btn btn-outline btn-sm" onclick="wbSelect('${uid}', ${disabled})">🌟 使用</button>
-            </div>
-            <div class="account-actions-row">
-              <button class="btn btn-outline btn-sm" onclick="wbToggle('${uid}', ${!disabled})">${disabled ? '▶ 启用' : '⏸ 暂停'}</button>
-              <button class="btn btn-outline btn-sm" style="color: var(--danger); border-color: rgba(239,68,68,0.4);" onclick="wbDelete('${uid}')">🗑 删除</button>
+              <button class="btn btn-outline btn-sm" onclick="aisRefreshAccount('${id}')">🔄 刷新</button>
+              <button class="btn btn-outline btn-sm" onclick="aisToggleAccount('${id}', ${!a.enabled})">${a.enabled ? '⏸ 停用' : '▶ 启用'}</button>
+              <button class="btn btn-outline btn-sm" style="color:var(--danger); border-color:rgba(239,68,68,0.4);" onclick="aisDeleteAccount('${id}')">🗑 删除</button>
             </div>
           </div>
         </div>`;
@@ -1067,63 +1129,45 @@ async function loadWbAccounts() {
   }
 }
 
-async function wbSelect(uid, disabled = false) {
-  if (uid && disabled) { showToast('该账号已暂停，请先启用', 'warn'); return; }
-  const r = await postJson('/panel/api/pool/select', { uid });
-  if (r && r.ok === false && uid) { showToast(r.msg || '设置失败', 'warn'); loadWbAccounts(); return; }
-  showToast(uid ? '已设为当前账号' : '已改为自动轮询', 'success');
-  loadWbAccounts();
-}
-async function wbClearCooldowns() { await postJson('/panel/api/pool/clear-cooldown'); showToast('冷却已清除', 'success'); loadWbAccounts(); }
-async function wbRefreshTokens() { const r = await postJson('/panel/api/tokens/refresh'); showToast(r.msg || '已在后台刷新', 'success'); }
-async function wbToggle(uid, disabled) { await postJson('/panel/api/pool/toggle', { uid, disabled }); loadWbAccounts(); }
-async function wbDelete(uid) {
-  if (!confirm('确定删除这个账号？')) return;
-  const r = await postJson('/panel/api/accounts/delete', { uid });
-  showToast(r.ok ? '已删除' : '删除失败', r.ok ? 'success' : 'error');
-  loadWbAccounts();
-}
-async function wbExportOne(uid) {
-  const d = await postJson('/panel/api/accounts/export-one', { uid });
-  if (!d.ok) { showToast(d.msg || '导出失败', 'error'); return; }
-  showText('导出账号', '含完整 Token，可在任意 wag2api 的 WB 引擎导入。请妥善保管。', JSON.stringify([d.account], null, 2));
-}
-
-function testBanner(id, cls, text) {
-  const b = $(id);
-  if (!b) return;
-  b.style.display = 'block';
-  b.className = 'account-test-banner ' + cls;
-  b.textContent = text;
-}
-
-async function wbTest(uid, btn) {
-  const orig = btn.textContent;
-  btn.textContent = '测试中…'; btn.disabled = true;
-  testBanner(`test-banner-${uid}`, '', '正在向上游验证…');
+async function aisRefreshAccount(id) {
+  showToast(`正在刷新 ${id}…`);
   try {
-    const d = await postJson('/panel/api/accounts/test', { uid });
-    if (d.ok) testBanner(`test-banner-${uid}`, 'success', `✅ 连通正常 · ${d.elapsed_ms}ms`);
-    else if (d.partial) testBanner(`test-banner-${uid}`, 'warning', `⚠️ 账号有效，上游繁忙 · ${d.msg || ''}`);
-    else testBanner(`test-banner-${uid}`, 'error', `❌ ${d.msg || '测试未通过'}`);
+    const res = await postJson(`/ais/api/accounts/${encodeURIComponent(id)}/refresh`, {});
+    aisRefreshTimes[id] = Date.now();
+    showToast(`刷新成功 · 模型数: ${res.models ?? (res.account && res.account.models && res.account.models.length) ?? 0}`, 'success');
+    loadAccounts();
   } catch (e) {
-    testBanner(`test-banner-${uid}`, 'error', `❌ ${e.message}`);
-  } finally { btn.textContent = orig; btn.disabled = false; }
+    showToast(`刷新失败: ${e.message}`, 'error');
+  }
 }
 
-async function wbTestAll() {
-  const pool = await getJson('/panel/api/pool');
-  const list = (pool.accounts || []).filter(a => !a.disabled);
-  if (!list.length) { showToast('没有可测试的账号', 'warn'); return; }
-  showToast(`正在测试 ${list.length} 个账号…`);
-  const lines = [];
-  for (const a of list) {
-    try {
-      const d = await postJson('/panel/api/accounts/test', { uid: a.uid });
-      lines.push(`${d.ok ? '✅' : d.partial ? '⚠️' : '❌'} ${a.nickname || a.uid.slice(0, 8)} · ${d.elapsed_ms}ms${d.ok ? '' : ' · ' + (d.msg || '')}`);
-    } catch (e) { lines.push(`❌ ${a.nickname || a.uid} · ${e.message}`); }
+async function aisToggleAccount(id, enabled) {
+  try {
+    await fetch(apiUrl(`/ais/api/accounts/${encodeURIComponent(id)}`), {
+      method: 'PUT',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    showToast(enabled ? '账号已启用' : '账号已停用', 'success');
+    loadAccounts();
+  } catch (e) {
+    showToast(`操作失败: ${e.message}`, 'error');
   }
-  showText('连通性测试报告', '', lines.join('\n'));
+}
+
+async function aisDeleteAccount(id) {
+  if (!confirm(`确定删除账号 ${id} 吗？`)) return;
+  try {
+    await fetch(apiUrl(`/ais/api/accounts/${encodeURIComponent(id)}`), {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
+    delete aisRefreshTimes[id];
+    showToast('已删除账号', 'success');
+    loadAccounts();
+  } catch (e) {
+    showToast(`删除失败: ${e.message}`, 'error');
+  }
 }
 
 // AG 账号：每个账号显示 Gemini / Claude 的 5 小时与 7 天额度
@@ -1580,57 +1624,140 @@ async function agBenchHosts(btn) {
 // 添加账号
 function openAuthModal() {
   if (engine === 'ag' && !agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
-  $('authTitle').textContent = engine === 'wb' ? '添加 WorkBuddy 账号' : '添加 Google 账号';
-  $('authDesc').textContent = engine === 'wb'
-    ? '生成腾讯官方授权链接，在浏览器里确认登录，完成后自动入库。'
+  $('authTitle').textContent = engine === 'ais' ? '添加 Google AI Studio 账号' : '添加 Google 账号';
+  $('authDesc').textContent = engine === 'ais'
+    ? '粘贴 AI Studio Cookie 或使用命令行远程添加配对。'
     : '用 Google 登录授权，完成后自动加入账号池。也可以在「导入」里直接粘贴 Refresh Token。';
-  $('authResultArea').style.display = 'none';
-  $('agPasteArea').style.display = 'none';
-  $('pollStatusText').textContent = '';
-  const btn = $('startAuthBtn');
-  btn.style.display = 'block'; btn.disabled = false; btn.textContent = '获取授权链接';
+  if (engine === 'ais') {
+    $('aisAuthArea').style.display = 'block';
+    $('agAuthArea').style.display = 'none';
+    $('startAuthBtn').style.display = 'none';
+    switchAisAuthTab('cookie');
+  } else {
+    $('aisAuthArea').style.display = 'none';
+    $('agAuthArea').style.display = 'block';
+    $('authResultArea').style.display = 'none';
+    $('agPasteArea').style.display = 'none';
+    $('pollStatusText').textContent = '';
+    const btn = $('startAuthBtn');
+    btn.style.display = 'block'; btn.disabled = false; btn.textContent = '获取授权链接';
+  }
   openModal('authModal');
+}
+
+function switchAisAuthTab(tab) {
+  const isCookie = tab === 'cookie';
+  $('tabAisCookieBtn').className = 'btn btn-sm btn-outline' + (isCookie ? ' active' : '');
+  $('tabAisPairingBtn').className = 'btn btn-sm btn-outline' + (!isCookie ? ' active' : '');
+  $('aisAuthCookiePane').style.display = isCookie ? 'block' : 'none';
+  $('aisAuthPairingPane').style.display = !isCookie ? 'block' : 'none';
+  if (!isCookie) loadAisPairingToken();
+}
+
+async function handleAisDiscover() {
+  const cookies = $('aisCookieInput').value.trim();
+  if (!cookies) { showToast('请先粘贴 Cookie', 'warn'); return; }
+  showToast('正在识别账号…');
+  try {
+    const res = await postJson('/ais/api/accounts/import/cookies/discover', { cookies });
+    const accs = res.accounts || [];
+    aisDiscoveredAccounts = accs;
+    const list = $('aisDiscoverList');
+    if (!accs.length) {
+      list.innerHTML = '<div class="muted" style="font-size:12px;">未识别到有效 Google 账号</div>';
+    } else {
+      list.innerHTML = accs.map(a => `
+        <div style="font-size:12px; margin-top:4px; display:flex; justify-content:space-between; align-items:center;">
+          <span class="mono">${escapeHtml(a.email || '序号 ' + a.auth_user)}</span>
+          <span class="tag ${a.imported ? 'tag-warn' : (a.signed_out ? 'tag-offline' : 'tag-online')}">${a.imported ? '已导入' : (a.signed_out ? '已登出' : '可用')}</span>
+        </div>
+      `).join('');
+    }
+    $('aisDiscoverArea').style.display = 'block';
+  } catch (e) {
+    showToast('识别失败: ' + e.message, 'error');
+  }
+}
+
+async function handleAisCookieImport() {
+  const cookies = $('aisCookieInput').value.trim();
+  if (!cookies) { showToast('请先粘贴 Cookie', 'warn'); return; }
+  showToast('正在导入…');
+  try {
+    const unimported = (aisDiscoveredAccounts || []).filter(a => !a.imported);
+    if (unimported.length > 1) {
+      let count = 0;
+      for (const a of unimported) {
+        await postJson('/ais/api/accounts/import/cookies', { cookies, auth_user: a.auth_user, label: a.email });
+        count++;
+      }
+      showToast(`已导入 ${count} 个账号`, 'success');
+    } else {
+      const first = unimported[0];
+      const payload = first ? { cookies, auth_user: first.auth_user, label: first.email } : { cookies };
+      await postJson('/ais/api/accounts/import/cookies', payload);
+      showToast('导入成功', 'success');
+    }
+    $('aisCookieInput').value = '';
+    $('aisDiscoverArea').style.display = 'none';
+    aisDiscoveredAccounts = [];
+    closeModal('authModal');
+    loadAccounts();
+  } catch (e) {
+    showToast('导入失败: ' + e.message, 'error');
+  }
+}
+
+let currentPairingToken = null;
+async function loadAisPairingToken() {
+  const tokenEl = $('aisPairingTokenText');
+  const expEl = $('aisPairingExpires');
+  const cmdEl = $('aisPairingCmdText');
+  tokenEl.textContent = '获取中…';
+  expEl.textContent = '';
+  try {
+    const res = await postJson('/ais/api/pairing', {});
+    currentPairingToken = res.token || '';
+    tokenEl.textContent = currentPairingToken || '--';
+    if (res.expires_at) {
+      const d = new Date(res.expires_at);
+      expEl.textContent = '有效期至 ' + d.toLocaleTimeString('zh-CN', { hour12: false });
+    }
+    const origin = window.location.origin.startsWith('http') ? window.location.origin : 'http://127.0.0.1:8800';
+    cmdEl.textContent = `aistudio2api setup --remote ${origin}`;
+  } catch (e) {
+    tokenEl.textContent = '获取失败';
+    expEl.textContent = e.message;
+  }
+}
+
+function copyAisPairingToken() {
+  if (currentPairingToken) copyText(currentPairingToken);
+  else showToast('暂无配对令牌', 'warn');
+}
+
+function copyAisPairingCmd() {
+  const cmd = $('aisPairingCmdText').textContent;
+  copyText(cmd);
 }
 
 async function requestAuthLink() {
   const btn = $('startAuthBtn');
   btn.disabled = true; btn.textContent = '正在生成…';
   try {
-    let url, state;
-    if (engine === 'wb') {
-      const d = await postJson('/panel/api/login/start', { realm: 'global' });
-      if (!d.ok || !d.url) throw new Error(d.error || '获取失败');
-      url = d.url; state = d.state;
-    } else {
-      const d = await postJson('/api/gemini/auth', {});
-      if (!d.ok || !d.auth_url) throw new Error(d.error || '获取失败');
-      url = d.auth_url;
-    }
+    const d = await postJson('/api/gemini/auth', {});
+    if (!d.ok || !d.auth_url) throw new Error(d.error || '获取失败');
+    const url = d.auth_url;
     $('authUrlInput').value = url;
     $('authLinkBtn').href = url;
     $('authResultArea').style.display = 'block';
     btn.style.display = 'none';
-    if (engine === 'wb') startWbPoll(state);
-    else { $('agPasteArea').style.display = 'block'; startAgPoll(); }
+    $('agPasteArea').style.display = 'block';
+    startAgPoll();
   } catch (e) {
     showToast('获取授权链接失败：' + e.message, 'error');
     btn.disabled = false; btn.textContent = '获取授权链接';
   }
-}
-
-function startWbPoll(state) {
-  if (activePollTimer) clearInterval(activePollTimer);
-  $('pollStatusText').textContent = '⏳ 等待浏览器完成登录…';
-  activePollTimer = setInterval(async () => {
-    try {
-      const d = await getJson('/panel/api/login/poll?state=' + encodeURIComponent(state));
-      if (d.done) {
-        clearInterval(activePollTimer); activePollTimer = null;
-        $('pollStatusText').textContent = `🎉 已添加 ${d.nickname || d.uid}`;
-        setTimeout(() => { closeModal('authModal'); loadAccounts(); }, 1500);
-      }
-    } catch (e) { /* 继续等 */ }
-  }, 2500);
 }
 
 async function startAgPoll() {
@@ -1662,21 +1789,26 @@ async function submitAgCallback() {
   } else showToast(d.error || '授权失败', 'error');
 }
 
-// 导入 / 导出（两个引擎都支持，双引擎备份可一次导回）
+// 导入 / 导出
 function openImportModal() {
   if (engine === 'ag' && !agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
-  $('importTitle').textContent = engine === 'wb' ? '导入 WB 账号' : '导入 AG 账号';
-  $('importDesc').textContent = engine === 'wb'
-    ? '粘贴 AccessToken（eyJ 开头）、CookieBox 提取结果，或导出的账号 JSON。双引擎备份也可以直接粘贴。'
-    : '粘贴 Refresh Token（1// 开头，一行一个），或导出的账号 JSON。双引擎备份也可以直接粘贴。';
+  $('importTitle').textContent = engine === 'ais' ? '导入 AIS 账号' : '导入 AG 账号';
+  $('importDesc').textContent = engine === 'ais'
+    ? '粘贴 Cookie（支持 Cookie-Editor JSON / Cookie 请求头 / cookies.txt）。'
+    : '粘贴 Refresh Token（1// 开头，一行一个），或导出的账号 JSON。备份也可以直接粘贴。';
   $('importInput').value = '';
-  $('importInput').placeholder = engine === 'wb' ? 'eyJ... 或 [ { "uid": ... } ]' : '1//0e... 或 { "accounts": [...] }';
+  $('importInput').placeholder = engine === 'ais' ? '粘贴 Cookie 文本或 JSON…' : '1//0e... 或 { "accounts": [...] }';
   openModal('importModal');
 }
 
-async function importWb(raw) {
-  const d = await postJson('/panel/api/tokens/import', { raw });
-  return { ok: !!d.ok, msg: d.msg || (d.ok ? '导入成功' : '导入失败') };
+async function importAis(raw) {
+  try {
+    const d = await postJson('/ais/api/accounts/import/cookies', { cookies: raw });
+    const id = (d.account && d.account.id) || '';
+    return { ok: true, msg: id ? `导入成功：${id}` : '导入成功' };
+  } catch (e) {
+    return { ok: false, msg: e.message || '导入失败' };
+  }
 }
 
 async function importAg(raw) {
@@ -1696,16 +1828,13 @@ async function submitImport() {
     const msgs = [];
     let anyOk = false;
     if (parsed && parsed.format === 'wag2api-backup') {
-      // 双引擎备份：分别交给两个引擎
-      if (Array.isArray(parsed.wb) && parsed.wb.length) {
-        const r = await importWb(JSON.stringify(parsed.wb)); anyOk = anyOk || r.ok; msgs.push('WB：' + r.msg);
-      }
       if (parsed.ag && (parsed.ag.accounts || []).length) {
         if (agReady()) { const r = await importAg(JSON.stringify(parsed.ag)); anyOk = anyOk || r.ok; msgs.push('AG：' + r.msg); }
         else msgs.push('AG：引擎未运行，已跳过');
       }
+      if (parsed.note) msgs.push(parsed.note);
     } else {
-      const r = engine === 'wb' ? await importWb(raw) : await importAg(raw);
+      const r = engine === 'ais' ? await importAis(raw) : await importAg(raw);
       anyOk = r.ok; msgs.push(r.msg);
     }
     const text = msgs.join('\n') || '没有可导入的内容';
@@ -1719,31 +1848,30 @@ async function submitImport() {
 
 async function openExportModal() {
   try {
-    if (engine === 'wb') {
-      const txt = await (await fetch(apiUrl('/panel/api/tokens/export'), { cache: 'no-store', headers: authHeaders() })).text();
-      showText('导出 WB 账号', '全部账号与完整 Token，可在 WB 引擎「导入」里恢复。请妥善保管。', txt);
-    } else {
-      if (!agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
-      const d = await getJson('/api/accounts/export');
-      showText('导出 AG 账号', '全部 Google 账号的 Refresh Token，可在 AG 引擎「导入」里恢复。请妥善保管。', JSON.stringify(d, null, 2));
+    if (engine === 'ais') {
+      showToast('AIS 账号不支持导出，请妥善保存 Cookie', 'info');
+      return;
     }
+    if (!agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
+    const d = await getJson('/api/accounts/export');
+    showText('导出 AG 账号', '全部 Google 账号的 Refresh Token，可在 AG 引擎「导入」里恢复。请妥善保管。', JSON.stringify(d, null, 2));
   } catch (e) { showToast('导出失败：' + e.message, 'error'); }
 }
 
 async function openBackupModal() {
-  const out = { format: 'wag2api-backup', version: 1, exported_at: new Date().toISOString(), wb: [], ag: null };
-  try { out.wb = JSON.parse(await (await fetch(apiUrl('/panel/api/tokens/export'), { cache: 'no-store', headers: authHeaders() })).text()); } catch (e) { /* 空 */ }
+  const out = { format: 'wag2api-backup', version: 2, exported_at: new Date().toISOString(), ag: null, note: 'AIS 账号不支持导出，请使用 Cookie 重新导入' };
   if (agReady()) { try { out.ag = await getJson('/api/accounts/export'); } catch (e) { /* 空 */ } }
-  const n = (out.wb || []).length + ((out.ag && out.ag.accounts) || []).length;
-  showText('双引擎备份', `共 ${n} 个账号（WB ${(out.wb || []).length}，AG ${((out.ag && out.ag.accounts) || []).length}）。在任一引擎的「导入」里粘贴即可整体恢复。`, JSON.stringify(out, null, 2));
+  const n = ((out.ag && out.ag.accounts) || []).length;
+  showText('账号备份', `已备份 AG 账号共 ${n} 个（AIS 账号请使用 Cookie 重新导入）。可在 AG 引擎「导入」里粘贴恢复。`, JSON.stringify(out, null, 2));
 }
 
 // ── 3. 接入 ─────────────────────────────────────────────
 async function loadModels(e) {
   if (modelCache[e]) return modelCache[e];
   try {
-    const d = await getJson(e === 'wb' ? '/panel/api/models/wb' : '/api/models');
-    modelCache[e] = (d.data || []).map(m => ({ id: m.id, name: m.name || m.display_name || m.id }));
+    const d = await getJson(e === 'ais' ? '/panel/api/models/ais' : '/api/models');
+    const list = d.data || d.models || [];
+    modelCache[e] = list.map(m => ({ id: m.id, name: m.name || m.display_name || m.id }));
   } catch (err) { return []; }
   return modelCache[e];
 }
@@ -1756,14 +1884,14 @@ async function loadKeys() {
   const box = $('keysContent');
   if (engine === 'ag' && !agReady()) { box.innerHTML = agOffHtml(); return; }
   const models = await loadModels(engine);
-  const pre = engine === 'wb' ? 'wb:' : 'ag:';
+  const pre = engine === 'ais' ? 'ais:' : 'ag:';
   const eps = `${base}/v1/chat/completions（OpenAI 兼容）\n${base}/v1/messages（Anthropic 原生）`;
-  const sample = models[0] ? models[0].id : (engine === 'wb' ? 'deepseek-v4.1-flash-1017' : 'gemini-3.8-flash-high');
+  const sample = models[0] ? models[0].id : (engine === 'ais' ? 'gemini-2.5-flash' : 'gemini-3.8-flash-high');
   box.innerHTML = `
     <div class="section-title">${META[engine].name} 接入</div>
     <div class="muted">接口</div>
     <div class="code-box">${escapeHtml(eps)}</div>
-    <div class="muted" style="margin-top:12px;">指定引擎：模型名加 <span class="mono" style="color:var(--primary)">${pre}</span> 前缀最稳；不加时按模型表自动分流，重名走默认引擎（现在是 ${META[engineInfo.default_engine || 'wb'].name}）。</div>
+    <div class="muted" style="margin-top:12px;">指定引擎：模型名加 <span class="mono" style="color:var(--primary)">${pre}</span> 前缀最稳；不加时按模型表自动分流，重名走默认引擎（现在是 ${META[engineInfo.default_engine || 'ais'].name}）。</div>
     <div class="muted" style="margin-top:12px;">OpenAI 接入示例 (Cherry Studio / Chatbox / NextChat)</div>
     <div class="code-box">Base URL : ${escapeHtml(base)}/v1
 API Key  : 随便填 (如 123456)
@@ -1870,7 +1998,7 @@ async function sendMessage() {
       signal: currentAbort.signal,
       body: JSON.stringify(isAg
         ? { model: 'ag:' + model, max_tokens: 8192, stream: true, messages: st.history }
-        : { model: 'wb:' + model, stream: true, messages: st.history }),
+        : { model: 'ais:' + model, stream: true, messages: st.history }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
@@ -1924,22 +2052,32 @@ async function loadLogs() {
   const box = $('logList');
   if (engine === 'ag' && !agReady()) { $('logTitle').textContent = '请求日志'; box.innerHTML = `<div class="card">${agOffHtml()}</div>`; return; }
   try {
-    let logs;
-    if (engine === 'wb') {
-      logs = ((await getJson('/panel/api/logs')).logs || []).map(l => ({
-        status: l.status, path: `${l.method || 'POST'} ${l.path || ''}`, model: l.model, ms: l.latency_ms, ttft: l.ttft_ms,
-        u: l.usage || { total: l.tokens || 0 }, hit: l.cache_hit_rate, time: l.timestamp ? new Date(l.timestamp) : null, timeText: l.time,
-        stream: l.endpoint === 'stream', note: l.note, who: l.nickname || l.uid || '',
-      }));
-    } else {
-      const raw = await getJson('/api/logs');
-      logs = (Array.isArray(raw) ? raw : raw.logs || []).map(l => ({
-        status: l.status, path: 'POST /v1/messages', model: l.model, ms: l.latency_ms, ttft: l.ttft_ms,
-        u: l.tokens || {}, hit: l.cache_hit_rate, time: l.timestamp ? new Date(l.timestamp) : null,
-        stream: l.is_stream, note: l.error, who: l.email, timing: l.timing,
-        dg: l.downgraded ? { to: l.model_used, reason: l.downgrade_reason } : null,
-      }));
+    if (engine === 'ais') {
+      let raw;
+      try {
+        const text = await (await fetch(apiUrl('/ais/logs'), { cache: 'no-store', headers: authHeaders() })).text();
+        try { raw = JSON.parse(text); } catch { raw = text; }
+      } catch (err) { raw = []; }
+      const lines = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.logs) ? raw.logs : (typeof raw === 'string' ? raw.split('\n').filter(Boolean) : []));
+      $('logTitle').textContent = `运行日志 (${lines.length})`;
+      if (!lines.length) {
+        box.innerHTML = '<div class="empty">暂无 AIS 日志。启动 AIS 引擎或调用接口后会在此显示。</div>';
+        return;
+      }
+      box.innerHTML = `
+        <div class="card" style="padding:10px;">
+          <pre class="mono" style="margin:0; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-all; max-height:600px; overflow-y:auto;">${escapeHtml(lines.slice(-200).map(l => typeof l === 'object' ? JSON.stringify(l) : String(l)).join('\n'))}</pre>
+        </div>`;
+      return;
     }
+
+    const raw = await getJson('/api/logs');
+    const logs = (Array.isArray(raw) ? raw : raw.logs || []).map(l => ({
+      status: l.status, path: 'POST /v1/messages', model: l.model, ms: l.latency_ms, ttft: l.ttft_ms,
+      u: l.tokens || {}, hit: l.cache_hit_rate, time: l.timestamp ? new Date(l.timestamp) : null,
+      stream: l.is_stream, note: l.error, who: l.email, timing: l.timing,
+      dg: l.downgraded ? { to: l.model_used, reason: l.downgrade_reason } : null,
+    }));
     $('logTitle').textContent = `请求日志 (${logs.length})`;
     if (!logs.length) { box.innerHTML = '<div class="empty">暂无请求记录。调用 API 或在「对话」里发一条，就会出现在这里。</div>'; return; }
     box.innerHTML = logs.map(l => {
@@ -1984,8 +2122,8 @@ async function loadLogs() {
 }
 
 async function clearLogs() {
-  if (!confirm(`清空 ${META[engine].name} 的请求日志？`)) return;
-  if (engine === 'wb') await postJson('/panel/api/logs/clear');
+  if (!confirm(`清空 ${META[engine].name} 的日志？`)) return;
+  if (engine === 'ais') await postJson('/panel/api/logs/clear');
   else if (agReady()) await postJson('/api/logs/clear');
   showToast('日志已清空', 'success');
   loadLogs();

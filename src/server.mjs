@@ -48,7 +48,6 @@ import { cacheProbe } from './cache-probe.mjs';
 import { estimateAnthropicInputTokens } from './token-estimate.mjs';
 import { historyPin } from './history-pin.mjs';
 import { clientSessionKey, bumpSessionOnOverflow, sessionStats } from './session-router.mjs';
-import { createWbEngine, decide as decideEngine, mergedModels } from './wb/index.mjs';
 
 let lastClientHeaders = null;
 
@@ -89,31 +88,12 @@ for (const m of ['addAccount', 'removeAccount', 'clearAccounts']) {
 const oauthFlowManager = new OAuthFlowManager(accountPool);
 const access = new AccessControl(path.join(DATA_DIR, 'keys.json'));
 
-// ── 双引擎（Linux / 源码版）────────────────────────────────
-// 安卓上 Node 以 ENGINE_TOKEN 启动，只做 AG 引擎；WB 与前门分流由 Kotlin 负责，这里绝不介入。
-// WB_ENGINE=0 可退回只有 AG 的旧行为。
-const DUAL = !process.env.ENGINE_TOKEN && process.env.WB_ENGINE !== '0';
-const wb = DUAL ? createWbEngine({
-  dataDir: DATA_DIR,
-  port: PORT,
-  defaultEngine: process.env.DEFAULT_ENGINE,
-  authEnabled: () => access.enabled,
-  onChange: () => persist.schedule(), // 账号 / 设置变化 → 同步到 GitHub state 分支（未配置时空操作）
-}) : null;
-
 // 从 Supabase 云端数据库恢复账号（解决 Render 免费容器重启重置临时硬盘的问题）
 await dbVault.restore({
   onAgAccount: (email, refreshToken, projectId) => {
     accountPool.addAccount(refreshToken, email, projectId);
   },
-  onWbAccounts: (rawJson) => {
-    if (wb && wb.vault) {
-      wb.vault.restoreList(rawJson);
-    }
-  },
 });
-if (wb) wb.start();
-const agModelList = () => (getModelsResponse().data || []);
 
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -226,50 +206,25 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 1.0.1 引擎状态：双引擎时 dual:true（界面显示引擎切换）；WB_ENGINE=0 时 standalone:true（只有 AG）
+  // 1.0.1 引擎状态
   if (url.pathname === '/panel/api/engine/state' || url.pathname === '/m/api/engine/state') {
-    if (wb) {
-      if (!access.isAdmin(req)) { denyAdmin(res); return; }
-      sendJson(res, 200, wb.engineState());
-    } else {
-      sendJson(res, 200, { supported: true, enabled: true, state: 'READY', port: PORT, default_engine: 'ag', standalone: true, auth: access.enabled });
-    }
+    sendJson(res, 200, { supported: true, enabled: true, state: 'READY', port: PORT, default_engine: 'ag', standalone: true, auth: access.enabled });
     return;
   }
 
-  // 1.0.2 WB 管理接口（与安卓 LocalGatewayServer 同一套 /panel/api/*），设置 ADMIN_KEY 时需带密钥
-  if (wb && (url.pathname.startsWith('/panel/api/') || url.pathname.startsWith('/m/api/'))) {
-    if (!access.isAdmin(req)) { denyAdmin(res); return; }
-    const raw = req.method === 'GET' || req.method === 'HEAD' ? '' : await readRawBody(req);
-    await wb.handlePanel(req, res, url, raw);
-    return;
-  }
-
-  // 1.0.3 网关总开关：关闭时只拦数据面（/v1/*），控制台照常可用
-  if (wb && url.pathname.startsWith('/v1/') && !wb.gatewayEnabled()) {
-    res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': '30' });
-    res.end(JSON.stringify({ error: { message: 'WorkBuddy 网关已关闭，请在管理面板开启', type: 'gateway_disabled', code: 'gateway_disabled' } }));
-    return;
-  }
-
-  // 1.0.4 前门分流：/v1/messages 与 /v1/chat/completions 按 EngineRouter 规则交给 WB 或 AG
-  if (wb && req.method === 'POST' && (url.pathname === '/v1/messages' || url.pathname === '/v1/chat/completions')) {
+  // 1.0.4 前门分流：/v1/messages 与 /v1/chat/completions 前缀判断
+  if (req.method === 'POST' && (url.pathname === '/v1/messages' || url.pathname === '/v1/chat/completions')) {
     const raw = await readRawBody(req);
     let model = '';
     try { model = String(JSON.parse(raw).model || ''); } catch (e) { /* 交给下游报错 */ }
-    const d = decideEngine(url.pathname, model, { agModels: agModelList(), wbModels: wb.models(), defaultEngine: wb.defaultEngine() });
-    if (d.engine === 'wb') {
-      if (access.enabled && !access.isAdmin(req)) {
-        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'API Key 无效或缺失 (x-api-key)' } });
-        return;
-      }
-      let json;
-      try { json = JSON.parse(stripModelPrefix(raw, 'wb:')); } catch (e) {
-        sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: '请求体不是合法 JSON' } });
-        return;
-      }
-      if (url.pathname === '/v1/messages') await wb.handleMessages(req, res, json);
-      else await wb.handleChat(req, res, json);
+    if (model.startsWith('wb:') || model.startsWith('ais:')) {
+      sendJson(res, 400, {
+        error: {
+          type: 'invalid_request_error',
+          message: 'Linux 版暂不内置 AIS 引擎',
+          code: 'ais_not_supported',
+        },
+      });
       return;
     }
     req._rawBody = stripModelPrefix(raw, 'ag:'); // 交给下面的 AG 处理
@@ -428,11 +383,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 4. 模型列表接口（双引擎时 /v1/models 合并两边；/api/models 仍只给 AG）
-  if (url.pathname === '/v1/models' && wb) {
-    sendJson(res, 200, mergedModels(wb.models(), agModelList()));
-    return;
-  }
+  // 4. 模型列表接口
   if (url.pathname === '/v1/models' || url.pathname === '/models' || url.pathname === '/api/models') {
     sendJson(res, 200, getModelsResponse());
     return;
@@ -968,7 +919,6 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     shuttingDown = true;
     console.log(`收到 ${sig}，正在安全退出…`);
     try { statsTracker.flush(); } catch (e) {}
-    try { if (wb) wb.flush(); } catch (e) {}
     try {
       if (persist.enabled) {
         await Promise.race([
@@ -995,7 +945,7 @@ server.listen(PORT, HOST, () => {
   console.log(`   本机:   http://127.0.0.1:${PORT}`);
   if (HOST === '0.0.0.0') lan.forEach(ip => console.log(`   局域网: http://${ip}:${PORT}`));
   console.log(`   数据:   ${DATA_DIR}`);
-  console.log(wb ? `   引擎:   WB + AG（默认 ${wb.defaultEngine().toUpperCase()}，模型名加 wb: / ag: 可强制指定）` : '   引擎:   仅 AG');
+  console.log('   引擎:   仅 AG');
   console.log(access.enabled ? `   密钥:   ${access.adminKey}` : '   密钥:   未设置（任何人都能访问，建议设置 ADMIN_KEY）');
   if (PUBLIC_BIND && !access.enabled) {
     const bar = '!'.repeat(64);

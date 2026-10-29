@@ -104,7 +104,6 @@ export class DbVault {
         if (aborted) return; // 忽略超时后迟到的查询结果
 
         let agCount = 0;
-        let wbCount = 0;
 
         for (const row of res.rows) {
           if (row.type === 'ag_account' && typeof onAgAccount === 'function') {
@@ -115,14 +114,9 @@ export class DbVault {
                 agCount++;
               }
             } catch (e) {}
-          } else if (row.type === 'wb_accounts' && typeof onWbAccounts === 'function') {
-            try {
-              onWbAccounts(row.content);
-              wbCount++;
-            } catch (e) {}
           }
         }
-        console.log(`[DbVault] 成功从 Supabase 云数据库恢复账号: ${agCount} 个 Google AG 账号, ${wbCount} 个 WB 账号库`);
+        console.log(`[DbVault] 成功从 Supabase 云数据库恢复账号: ${agCount} 个 Google AG 账号`);
       } catch (e) {
         console.warn('[DbVault] 从云数据库恢复账号异常:', e.message);
       } finally {

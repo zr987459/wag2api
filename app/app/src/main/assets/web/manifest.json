@@ -1,6 +1,6 @@
 {
-  "name": "WorkBuddy Mobile",
-  "short_name": "WBMobile",
+  "name": "wag2api",
+  "short_name": "wag2api",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0b0f17",

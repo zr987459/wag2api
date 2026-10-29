@@ -64,8 +64,7 @@ class MainActivity : AppCompatActivity() {
                         return false
                     }
                     // 官方授权链接跳出到系统浏览器完成登录
-                    if (url.startsWith("https://copilot.tencent.com") ||
-                        url.startsWith("https://www.workbuddy.ai") ||
+                    if (url.startsWith("https://aistudio.google.com") ||
                         url.startsWith("https://accounts.google.com") ||
                         url.startsWith("https://oauth2")) {
                         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))

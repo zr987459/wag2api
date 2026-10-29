@@ -2,7 +2,7 @@
 
 一个 App，两个 AI 网关引擎。
 
-把 **Google Antigravity（Cloud Code）** 和 **腾讯 WorkBuddy / CodeBuddy** 两条上游，统一到同一个本地端口、同一套 API、同一个控制台。
+把 **Google Antigravity（Cloud Code）** 和 **Google AI Studio（AIS / AIStudio2API）** 两条上游，统一到同一个本地端口、同一套 API、同一个控制台。
 
 ```
                     ┌──────────────────────────────────┐
@@ -13,9 +13,9 @@
     任意 OpenAI 客户端)      │                 │
                              ▼                 ▼
                     ┌────────────────┐  ┌──────────────────┐
-                    │  WB 引擎        │  │  AG 引擎          │
-                    │  Kotlin 原生    │  │  Node (:node)     │
-                    │  TencentGateway │  │  Antigravity      │
+                    │  AIS 引擎       │  │  AG 引擎          │
+                    │  Go 原生子进程  │  │  Node (:node)     │
+                    │  AIStudio2API  │  │  Antigravity      │
                     └────────────────┘  └──────────────────┘
 ```
 
@@ -39,14 +39,14 @@
 
 | 包 | 适用 | 大小 |
 | --- | --- | --- |
-| `wag2api.apk` | 主流手机（arm64），含双引擎 | 较大（内置 Node） |
-| `wag2api-lite.apk` | 任意机型 / 32 位 / 模拟器，仅 WB 引擎 | 轻量 |
+| `wag2api.apk` | 主流手机（arm64），含双引擎 | 较大（内置 Node + AIS） |
+| `wag2api-lite.apk` | 主流手机（arm64），仅 AIS 引擎 | 轻量（仅内置 AIS） |
 
 两个包**包名与签名相同**，可以互相覆盖安装，数据不丢。
 
 装好后打开 App：
 
-1. **WB 引擎**：账号页 → 添加账号 → 腾讯授权登录（或粘贴 JWT）
+1. **AIS 引擎**：Google AI Studio 网页协议，账号用粘贴 Cookie 或电脑端 `aistudio2api setup --remote` 远程添加（Linux/Docker 版暂不内置 AIS）
 2. **AG 引擎**：概览页 → AG 控制台 → 添加账号 → Google 登录
 3. **接入客户端**：密钥页 → 复制接入地址 `http://127.0.0.1:8800/v1` 与密钥
 
@@ -88,8 +88,8 @@ WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/
 
 | 顺序 | 规则 | 示例 |
 | --- | --- | --- |
-| 1 | 路径 | `/ag/*` 与 `/api/*` → AG；`/panel/*`、`/m/*` → WB |
-| 2 | 模型名前缀 | `ag:xxx` 强制走 AG，`wb:xxx` 强制走 WB |
+| 1 | 路径 | `/ag/*` 与 `/api/*` → AG；`/ais/*` → AIS |
+| 2 | 模型名前缀 | `ag:xxx` 强制走 AG，`ais:xxx` 强制走 AIS（`wb:xxx` 兼容映射到 `ais`） |
 | 3 | 模型表精确匹配 | 只在一边表里存在 → 走那一边 |
 | 4 | 默认引擎 | 两边重名或未知模型 → 用设置里的默认引擎 |
 
@@ -99,11 +99,11 @@ curl http://127.0.0.1:8800/v1/messages -H "x-api-key: $KEY" \
   -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}'
 
 # 强制指定引擎
-curl ... -d '{"model":"ag:gemini-3.8-flash", ...}'
-curl ... -d '{"model":"wb:deepseek-v4.1-flash-1017", ...}'
+curl ... -d '{"model":"ag:gemini-2.5-pro", ...}'
+curl ... -d '{"model":"ais:gemini-2.5-flash", ...}'
 ```
 
-`GET /v1/models` 返回两边的合并列表，重名模型会额外列出 `ag:` / `wb:` 前缀版本供你显式选择。
+`GET /v1/models` 返回两边的合并列表，重名模型会额外列出 `ag:` / `ais:` 前缀版本供你显式选择。
 
 ## 协议支持
 
@@ -119,8 +119,8 @@ curl ... -d '{"model":"wb:deepseek-v4.1-flash-1017", ...}'
 ```
 ├─ src/                  Node 核心（AG 引擎），Linux / Docker / Android 共用这一份
 ├─ app/                  安卓宿主工程
-│  ├─ app/               Kotlin 宿主：前门、路由、WB 引擎、Web 控制台
-│  │  ├─ src/main/       前门、路由、WB 引擎、UI
+│  ├─ app/               Kotlin 宿主：前门、路由、AIS 引擎、Web 控制台
+│  │  ├─ src/main/       前门、路由、AIS 引擎管理、UI
 │  │  ├─ src/full/       带 Node 引擎（RealNodeEngine）
 │  │  └─ src/lite/       不带 Node 引擎（NoopNodeEngine）
 │  └─ engine-node/       Node 引擎模块：JNI、NodeService、libnode

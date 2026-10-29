@@ -17,7 +17,8 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.Wag2api"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        android:extractNativeLibs="true">
 
         <activity
             android:name=".MainActivity"
@@ -37,7 +38,7 @@
             android:foregroundServiceType="specialUse|dataSync">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="本地 AI 网关守护：保持 WorkBuddy 与 Antigravity 双引擎在后台可访问" />
+                android:value="本地 AI 网关守护：保持 AIS 与 Antigravity 双引擎在后台可访问" />
         </service>
 
         <receiver

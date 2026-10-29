@@ -13,9 +13,9 @@
   <header class="app-header">
     <div class="header-top">
       <div class="brand-wrap">
-        <div class="brand-icon" id="brandIcon">◉</div>
+        <div class="brand-icon" id="brandIcon">✦</div>
         <div>
-          <div class="brand-title">wag2api <span class="brand-badge" id="currentEngineBadge">WorkBuddy</span></div>
+          <div class="brand-title">wag2api <span class="brand-badge" id="currentEngineBadge">AI Studio</span></div>
         </div>
       </div>
       <div class="status-pill" id="headerStatus">
@@ -24,10 +24,10 @@
       </div>
     </div>
 
-    <div class="engine-switcher-bar android-only">
-      <div class="engine-tab active wb-active" id="tabSwitchWb" onclick="switchEngine('wb')">
-        <span>◉ WB 引擎</span>
-        <span class="engine-badge-mini" id="miniWb">腾讯</span>
+    <div class="engine-switcher-bar android-only" id="engineSwitcherBar">
+      <div class="engine-tab active ais-active" id="tabSwitchAis" onclick="switchEngine('ais')">
+        <span>✦ AIS 引擎</span>
+        <span class="engine-badge-mini" id="miniAis">AI Studio</span>
       </div>
       <div class="engine-tab" id="tabSwitchAg" onclick="switchEngine('ag')">
         <span>⚡ AG 引擎</span>
@@ -70,7 +70,7 @@
       </div>
     </div>
 
-    <!-- 概览统计区（AG 引擎展示完整 Token 消费统计；WB 引擎提示仅支持 AG） -->
+    <!-- 概览统计区（AG 引擎展示完整 Token 消费统计；AIS 引擎展示 AIS 概览） -->
     <div id="overviewStatsContainer"></div>
 
     <div class="card">
@@ -89,7 +89,7 @@
           <div class="muted">模型名两边都有或不认识时走这里</div>
         </div>
         <select id="defaultEngineSelect" class="input-field" style="margin-bottom:0; width:auto;" onchange="setDefaultEngine(this.value)">
-          <option value="wb">WB 引擎</option>
+          <option value="ais">AIS 引擎</option>
           <option value="ag">AG 引擎</option>
         </select>
       </div>
@@ -100,7 +100,7 @@
       </div>
       </div>
       <div style="display:flex; gap:8px; margin-top:12px;">
-        <button class="btn btn-outline android-only" style="flex:1;" onclick="openBackupModal()">💾 双引擎备份</button>
+        <button class="btn btn-outline android-only" style="flex:1;" onclick="openBackupModal()">💾 账号备份</button>
         <button class="btn btn-outline" style="flex:1;" onclick="resetStats()">清零本引擎统计</button>
       </div>
     </div>
@@ -178,20 +178,64 @@
       <div class="sheet-handle"></div>
       <div class="section-title" id="authTitle">添加账号</div>
       <p class="muted" id="authDesc" style="margin-bottom: 14px;"></p>
-      <div id="authResultArea" style="display: none; margin-bottom: 14px;">
-        <div style="display: flex; gap: 8px; margin-bottom: 10px;">
-          <input type="text" id="authUrlInput" readonly class="input-field mono" style="margin-bottom: 0; font-size: 12px; flex: 1;" />
-          <button type="button" class="btn btn-outline" onclick="copyText(document.getElementById('authUrlInput').value)" style="white-space: nowrap;">复制</button>
+      
+      <!-- AIS 添加账号专属区域 -->
+      <div id="aisAuthArea" style="display: none; margin-bottom: 14px;">
+        <div class="ais-auth-tabs" style="display:flex; gap:8px; margin-bottom:12px;">
+          <button type="button" class="btn btn-sm btn-outline active" id="tabAisCookieBtn" onclick="switchAisAuthTab('cookie')" style="flex:1;">粘贴 Cookie</button>
+          <button type="button" class="btn btn-sm btn-outline" id="tabAisPairingBtn" onclick="switchAisAuthTab('pairing')" style="flex:1;">远程添加</button>
         </div>
-        <a id="authLinkBtn" href="#" target="_blank" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; justify-content: center;">在浏览器打开</a>
-        <div id="pollStatusText" class="muted" style="text-align:center; margin-top:8px;"></div>
+
+        <!-- 选项 A: 粘贴 Cookie -->
+        <div id="aisAuthCookiePane">
+          <textarea id="aisCookieInput" class="input-field mono" rows="5" style="font-size:12px; resize:vertical; width:100%; box-sizing:border-box;" placeholder="粘贴 Cookie (支持 Cookie-Editor JSON / Cookie 请求头 / cookies.txt)"></textarea>
+          <div id="aisDiscoverArea" style="display:none; margin-bottom:10px;">
+            <div class="muted" style="margin-bottom:6px; font-size:12px;">已识别账号列表：</div>
+            <div id="aisDiscoverList"></div>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:8px;">
+            <button type="button" class="btn btn-outline btn-sm" style="flex:1;" onclick="handleAisDiscover()">🔍 识别邮箱</button>
+            <button type="button" class="btn btn-primary btn-sm" style="flex:1;" onclick="handleAisCookieImport()">📥 立即导入</button>
+          </div>
+        </div>
+
+        <!-- 选项 B: 远程添加 -->
+        <div id="aisAuthPairingPane" style="display:none;">
+          <div class="muted" style="margin-bottom:10px; font-size:12px; line-height:1.6;" id="aisPairingHelp">
+            在能登录 Google 的电脑上运行：<br />
+            <span class="mono" style="color:var(--primary); word-break:break-all;" id="aisPairingCmdText">aistudio2api setup --remote &lt;你的地址&gt;</span><br />
+            并粘贴下方令牌。
+          </div>
+          <div style="background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:10px; margin-bottom:10px; text-align:center;">
+            <div class="mono" id="aisPairingTokenText" style="font-size:16px; font-weight:700; color:var(--accent); word-break:break-all; user-select:all;">--</div>
+            <div class="muted mono" id="aisPairingExpires" style="font-size:11px; margin-top:4px;"></div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button type="button" class="btn btn-outline btn-sm" style="flex:1;" onclick="copyAisPairingToken()">📋 复制令牌</button>
+            <button type="button" class="btn btn-outline btn-sm" style="flex:1;" onclick="copyAisPairingCmd()">📋 复制命令</button>
+            <button type="button" class="btn btn-outline btn-sm" onclick="loadAisPairingToken()">🔄 刷新</button>
+          </div>
+        </div>
       </div>
-      <div id="agPasteArea" style="display:none; margin-bottom: 12px;">
-        <div class="muted" style="margin-bottom:6px;">没自动加上？把浏览器地址栏里含 code= 的整条网址粘贴到这里：</div>
-        <input type="text" id="agCallbackInput" class="input-field mono" style="font-size:12px;" placeholder="http://localhost:51121/oauth-callback?code=..." />
-        <button class="btn btn-outline" style="width:100%;" onclick="submitAgCallback()">提交回调地址</button>
+
+      <!-- AG 添加账号专属区域 -->
+      <div id="agAuthArea">
+        <div id="authResultArea" style="display: none; margin-bottom: 14px;">
+          <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+            <input type="text" id="authUrlInput" readonly class="input-field mono" style="margin-bottom: 0; font-size: 12px; flex: 1;" />
+            <button type="button" class="btn btn-outline" onclick="copyText(document.getElementById('authUrlInput').value)" style="white-space: nowrap;">复制</button>
+          </div>
+          <a id="authLinkBtn" href="#" target="_blank" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; justify-content: center;">在浏览器打开</a>
+          <div id="pollStatusText" class="muted" style="text-align:center; margin-top:8px;"></div>
+        </div>
+        <div id="agPasteArea" style="display:none; margin-bottom: 12px;">
+          <div class="muted" style="margin-bottom:6px;">没自动加上？把浏览器地址栏里含 code= 的整条网址粘贴到这里：</div>
+          <input type="text" id="agCallbackInput" class="input-field mono" style="font-size:12px;" placeholder="http://localhost:51121/oauth-callback?code=..." />
+          <button class="btn btn-outline" style="width:100%;" onclick="submitAgCallback()">提交回调地址</button>
+        </div>
       </div>
-      <div style="display: flex; gap: 8px;">
+
+      <div style="display: flex; gap: 8px; margin-top:10px;">
         <button class="btn btn-primary" style="flex: 1;" id="startAuthBtn" onclick="requestAuthLink()">获取授权链接</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('authModal')">关闭</button>
       </div>

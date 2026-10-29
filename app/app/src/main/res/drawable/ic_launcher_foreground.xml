@@ -6,7 +6,7 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- 左环：WorkBuddy 引擎 -->
+    <!-- 左环：AIS 引擎 -->
     <path
         android:pathData="M42,54 m-19,0 a19,19 0 1,0 38,0 a19,19 0 1,0 -38,0"
         android:strokeColor="#FF6C8CFF"

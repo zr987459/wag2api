@@ -8,7 +8,6 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.UUID
 import kotlin.concurrent.thread
 
 class LocalGatewayServer(
@@ -57,8 +56,8 @@ class LocalGatewayServer(
             try {
                 while (isRunning) {
                     val client = ss.accept()
-                    client.tcpNoDelay = true // 减少小包网络延迟
-                    client.soTimeout = 120000 // 120 秒空闲读超时，适应超长思考模型首字返回
+                    client.tcpNoDelay = true
+                    client.soTimeout = 120000
                     thread {
                         onBusy()
                         try {
@@ -75,7 +74,7 @@ class LocalGatewayServer(
         return true
     }
 
-    /** 关闭监听：新连接立即被拒，已在处理中的请求（含流式）各自跑完 */
+    /** 关闭监听 */
     fun stop() {
         synchronized(this) {
             isRunning = false
@@ -95,7 +94,7 @@ class LocalGatewayServer(
             buf.write(b)
             when (b) {
                 '\n'.code -> {
-                    if (lineLen == 0) return buf.toByteArray() // 遇到空行即头部结束
+                    if (lineLen == 0) return buf.toByteArray()
                     lineLen = 0
                 }
                 '\r'.code -> {}
@@ -116,9 +115,24 @@ class LocalGatewayServer(
         return String(buf, Charsets.UTF_8)
     }
 
+    private fun isStaticPath(path: String): Boolean {
+        return path == "/" ||
+                path.isEmpty() ||
+                path == "/index.html" ||
+                path == "/m" ||
+                path == "/m/" ||
+                (path.startsWith("/m/") && !path.startsWith("/m/api/")) ||
+                path.endsWith(".html") ||
+                path.endsWith(".css") ||
+                path.endsWith(".js") ||
+                path.endsWith(".json") ||
+                path.endsWith(".png") ||
+                path.endsWith(".svg") ||
+                path.endsWith(".ico")
+    }
+
     private fun handleConnection(client: Socket) {
         try {
-            // 全连接统一使用一个 BufferedInputStream，严防 Reader 预读吃掉 Body 字节
             val input = BufferedInputStream(client.getInputStream())
             val output = client.getOutputStream()
 
@@ -158,18 +172,20 @@ class LocalGatewayServer(
                 return
             }
 
-            // 读取 Body：使用精确字节数读取，彻底根除多字节中文卡死挂起
+            // 读取 Body
             val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
             val body = readRequestBody(input, contentLength)
 
             // ── 数据面与控制面安全隔离 ──────────────────────
-            // 控制面白名单：面板网页、静态资源、管理 API、健康检查
             val isControlPlane = path == "/" ||
+                    path.isEmpty() ||
                     path == "/index.html" ||
                     path == "/health" ||
+                    path == "/ais/logs" ||
                     path.startsWith("/panel/") ||
                     path.startsWith("/m/") ||
-                    path.startsWith("/api/") ||   // AG 控制面（推理在 /v1/，不受影响）
+                    path.startsWith("/api/") ||
+                    path.startsWith("/ais/api/") || path == "/ais/api" ||
                     path == "/ag" || (path.startsWith("/ag/") && !path.contains("/v1/")) ||
                     path.endsWith(".css") ||
                     path.endsWith(".js") ||
@@ -178,11 +194,10 @@ class LocalGatewayServer(
                     path.endsWith(".svg") ||
                     path.endsWith(".ico")
 
-            // 网关总开关关闭时：仅放行控制面，数据面外部推理 API (v1/* 等) 安全拦截返回 503
             if (!GatewayService.isGatewayEnabled(context) && !isControlPlane) {
                 val errJson = JSONObject().apply {
                     put("error", JSONObject().apply {
-                        put("message", "WorkBuddy 网关已关闭，请在管理面板开启")
+                        put("message", "wag2api 网关已关闭，请在管理面板开启")
                         put("type", "gateway_disabled")
                         put("code", "gateway_disabled")
                     })
@@ -201,11 +216,77 @@ class LocalGatewayServer(
                 return
             }
 
-            // ── 前门分流：先问 EngineRouter 这条请求归谁 ──────────────
+            // 1. 静态资源
+            if (isStaticPath(path)) {
+                serveStaticAsset(output, path)
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 2. 健康检查
+            if (path == "/health") {
+                val h = JSONObject().apply {
+                    put("status", "ok")
+                    put("ais", AisEngine.isRunning())
+                    put("ag", engine.state.name)
+                }
+                sendJsonResponse(output, 200, h.toString())
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 3. 合并后的模型列表
+            if (path == "/v1/models" || path == "/v1/v1/models") {
+                sendJsonResponse(output, 200, EngineRouter.mergedModels(context).toString())
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 4. AIS 日志
+            if (path == "/ais/logs") {
+                val logs = AisEngine.getLogs()
+                val json = JSONObject().apply {
+                    put("ok", true)
+                    put("logs", JSONArray(logs))
+                }
+                sendJsonResponse(output, 200, json.toString())
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 5. 面板 API
+            if (path.startsWith("/panel/api/") || path.startsWith("/m/api/") || path == "/panel/api/status") {
+                dispatchPanelApi(output, method, path, query, body)
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 6. AIS API 透传：/ais/api/* -> AIS /api/*
+            if (path.startsWith("/ais/api/") || path == "/ais/api") {
+                val targetPath = path.removePrefix("/ais")
+                EngineRouter.proxyToAis(
+                    method = method,
+                    path = targetPath,
+                    query = query,
+                    headers = headers,
+                    body = body,
+                    out = output
+                )
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 7. 路由判断（Node 或 AIS）
             val decision = EngineRouter.decide(context, engine, path, body)
-            when (val d = decision) {
+            when (decision) {
                 is EngineRouter.Route.Reject -> {
-                    sendJsonResponse(output, d.status, d.payload)
+                    sendJsonResponse(output, decision.status, decision.payload)
                     output.flush()
                     client.close()
                     return
@@ -215,31 +296,27 @@ class LocalGatewayServer(
                         engine = engine,
                         token = EngineTokenHolder.token,
                         method = method,
-                        path = d.path,
+                        path = decision.path,
                         query = query,
                         headers = headers,
                         body = body,
                         out = output,
-                        // 只有推理路径需要剥掉 ag: 前缀，控制台路径不动
-                        stripModelPrefix = if (d.path.startsWith("/v1/")) "ag:" else null
+                        stripModelPrefix = if (decision.path.startsWith("/v1/")) "ag:" else null
                     )
                     output.flush()
                     client.close()
                     return
                 }
-                is EngineRouter.Route.ToWorkBuddy -> {
-                    // wb: 前缀在 WB 分支里剥掉
-                    val wbBody = if (d.stripPrefix != null && body.isNotEmpty()) {
-                        try {
-                            val j = JSONObject(body)
-                            val m = j.optString("model", "")
-                            if (m.startsWith(d.stripPrefix)) {
-                                j.put("model", m.removePrefix(d.stripPrefix))
-                            }
-                            j.toString()
-                        } catch (e: Exception) { body }
-                    } else body
-                    dispatchWorkBuddy(output, method, path, query, wbBody, headers)
+                is EngineRouter.Route.ToAis -> {
+                    EngineRouter.proxyToAis(
+                        method = method,
+                        path = decision.path,
+                        query = query,
+                        headers = headers,
+                        body = body,
+                        out = output,
+                        stripModelPrefix = decision.stripPrefix
+                    )
                     output.flush()
                     client.close()
                     return
@@ -250,35 +327,34 @@ class LocalGatewayServer(
         }
     }
 
-    /** 原 WB 路由表，保持不动 */
-    private fun dispatchWorkBuddy(
+    private fun dispatchPanelApi(
         output: OutputStream,
         method: String,
         path: String,
         query: String,
-        body: String,
-        headers: Map<String, String>
+        body: String
     ) {
         when {
-            // 1. API: 状态概览
+            // 状态概览
             path == "/panel/api/overview" || path == "/m/api/overview" -> {
-                val accounts = AccountVault.getAccounts()
-                val healthy = (0 until accounts.length()).count {
-                    !accounts.getJSONObject(it).optBoolean("disabled", false)
-                }
                 val json = JSONObject().apply {
-                    put("healthy", healthy)
-                    put("total", accounts.length())
-                    put("accounts", accounts)
+                    put("healthy", if (AisEngine.isRunning()) 1 else 0)
+                    put("total", if (AisEngine.isAvailable(context)) 1 else 0)
+                    put("accounts", JSONArray())
                     put("today_requests", GatewayMetrics.getTodayRequests())
                     put("today_tokens", GatewayMetrics.getTodayTokens())
                     put("auth_required", false)
                     put("version", "1.3.0-android")
+                    put("ais", JSONObject().apply {
+                        put("available", AisEngine.isAvailable(context))
+                        put("running", AisEngine.isRunning())
+                        put("base_url", AisEngine.baseUrl)
+                    })
                 }
                 sendJsonResponse(output, 200, json.toString())
             }
 
-            // 1.1 API: 请求日志
+            // 请求日志
             path == "/panel/api/logs" || path == "/m/api/logs" -> {
                 val json = JSONObject().apply {
                     put("ok", true)
@@ -289,7 +365,6 @@ class LocalGatewayServer(
                 sendJsonResponse(output, 200, json.toString())
             }
 
-            // 1.1b API: 详细统计（与 AG /api/stats 同口径）
             path == "/panel/api/stats" || path == "/m/api/stats" -> {
                 sendJsonResponse(output, 200, GatewayMetrics.statsJson().toString())
             }
@@ -299,34 +374,13 @@ class LocalGatewayServer(
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
             }
 
-            // 1.2 API: 清空日志
             path == "/panel/api/logs/clear" || path == "/m/api/logs/clear" -> {
                 GatewayMetrics.clearLogs()
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
             }
 
-            // 1.3 API: 导出 Token
-            path == "/panel/api/tokens/export" || path == "/m/api/tokens/export" -> {
-                sendJsonResponse(output, 200, AccountVault.exportTokensJson())
-            }
-
-            // 1.4 API: 导入 Token (支持 JWT 或 JSON 格式)
-            path == "/panel/api/tokens/import" || path == "/m/api/tokens/import" -> {
-                val raw = try { JSONObject(body).optString("raw", body) } catch (e: Exception) { body }
-                val (success, msg) = AccountVault.importToken(raw)
-                val res = JSONObject().put("ok", success).put("msg", msg)
-                sendJsonResponse(output, 200, res.toString())
-            }
-
-            // 1.5 API: 删除账号
-            path == "/panel/api/accounts/delete" || path == "/m/api/accounts/delete" -> {
-                val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
-                val deleted = if (uid.isNotEmpty()) AccountVault.deleteAccount(uid) else false
-                sendJsonResponse(output, 200, JSONObject().put("ok", deleted).toString())
-            }
-
-            // 1.6 API: AG 引擎状态
-            path == "/panel/api/engine/state" || path == "/m/api/engine/state" -> {
+            // 引擎状态
+            path == "/panel/api/engine/state" || path == "/m/api/engine/state" || path == "/panel/api/status" -> {
                 val enabled = context.getSharedPreferences("wag2api_router", Context.MODE_PRIVATE)
                     .getBoolean("node_enabled", true)
                 val json = JSONObject().apply {
@@ -335,11 +389,16 @@ class LocalGatewayServer(
                     put("state", engine.state.name)
                     put("port", engine.port)
                     put("default_engine", EngineRouter.getDefaultEngine(context))
+                    put("ais", JSONObject().apply {
+                        put("available", AisEngine.isAvailable(context))
+                        put("running", AisEngine.isRunning())
+                        put("base_url", AisEngine.baseUrl)
+                    })
                 }
                 sendJsonResponse(output, 200, json.toString())
             }
 
-            // 1.7 API: 开关 AG 引擎
+            // 开关 AG 引擎
             path == "/panel/api/engine/toggle" || path == "/m/api/engine/toggle" -> {
                 val on = try { JSONObject(body).optBoolean("enabled", true) } catch (e: Exception) { true }
                 context.getSharedPreferences("wag2api_router", Context.MODE_PRIVATE)
@@ -348,7 +407,7 @@ class LocalGatewayServer(
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).put("enabled", on).toString())
             }
 
-            // 1.8 API: 重启 AG 引擎
+            // 重启 AG 引擎
             path == "/panel/api/engine/restart" || path == "/m/api/engine/restart" -> {
                 Thread {
                     engine.stop()
@@ -358,64 +417,15 @@ class LocalGatewayServer(
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
             }
 
-            // 1.9 API: 切换默认引擎
+            // 切换默认引擎
             path == "/panel/api/engine/default" || path == "/m/api/engine/default" -> {
-                val e = try { JSONObject(body).optString("engine", "wb") } catch (ex: Exception) { "wb" }
-                EngineRouter.setDefaultEngine(context, if (e == "ag") "ag" else "wb")
-                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("engine", e).toString())
+                val e = try { JSONObject(body).optString("engine", "ais") } catch (ex: Exception) { "ais" }
+                val target = if (e == "ag" && com.wag2api.app.engine.EngineFactory.SUPPORTS_NODE) "ag" else "ais"
+                EngineRouter.setDefaultEngine(context, target)
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("engine", target).toString())
             }
 
-            // 1.10 API: 账号池状态（含冷却、最近使用、请求数）
-            path == "/panel/api/pool" || path == "/m/api/pool" -> {
-                val json = JSONObject().apply {
-                    put("ok", true)
-                    put("accounts", AccountScheduler.poolStatus())
-                    put("selected_uid", AccountScheduler.effectiveSelectedUid(context))
-                }
-                sendJsonResponse(output, 200, json.toString())
-            }
-
-            // 1.11 API: 切换当前账号
-            path == "/panel/api/pool/select" || path == "/m/api/pool/select" -> {
-                val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
-                if (uid.isEmpty()) {
-                    sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "uid 不能为空").toString())
-                } else if (AccountScheduler.isDisabled(uid)) {
-                    sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "该账号已暂停，请先启用").toString())
-                } else {
-                    AccountScheduler.setSelectedUid(context, uid)
-                    sendJsonResponse(output, 200, JSONObject().put("ok", true).put("uid", uid).toString())
-                }
-            }
-
-            // 1.12 API: 清除所有账号冷却
-            path == "/panel/api/pool/clear-cooldown" || path == "/m/api/pool/clear-cooldown" -> {
-                AccountScheduler.clearAllCooldowns()
-                sendJsonResponse(output, 200, JSONObject().put("ok", true).toString())
-            }
-
-            // 1.13 API: 启用 / 禁用账号
-            path == "/panel/api/pool/toggle" || path == "/m/api/pool/toggle" -> {
-                val j = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
-                val uid = j.optString("uid")
-                val disabled = j.optBoolean("disabled", false)
-                if (uid.isNotEmpty()) {
-                    AccountVault.setDisabled(uid, disabled)
-                    // 暂停的正是手动选中的账号：回到「自动」，避免界面还显示它是「当前」
-                    if (disabled && AccountScheduler.getSelectedUid(context) == uid) AccountScheduler.setSelectedUid(context, "")
-                }
-                sendJsonResponse(output, 200, JSONObject().put("ok", uid.isNotEmpty()).toString())
-            }
-
-            // 1.14 API: 手动触发 token 保活刷新
-            path == "/panel/api/tokens/refresh" || path == "/m/api/tokens/refresh" -> {
-                Thread {
-                    try { TokenKeeper.refreshAll() } catch (ignored: Exception) {}
-                }.start()
-                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("msg", "已在后台刷新").toString())
-            }
-
-            // 1.15 API: 读取 / 修改监听端口（保存后热切换前门，不重启 AG 引擎）
+            // 读取 / 修改监听端口
             path == "/panel/api/settings/port" || path == "/m/api/settings/port" -> {
                 if (method == "POST") {
                     val np = try { JSONObject(body).optInt("port", 0) } catch (e: Exception) { 0 }
@@ -438,7 +448,6 @@ class LocalGatewayServer(
                         }
                     }
                     res.put("port", if (switchTo > 0) switchTo else current)
-                    // 先把响应发出去，再由 GatewayService 在后台线程热切换前门
                     sendJsonResponse(output, 200, res.toString())
                     if (switchTo > 0) GatewayService.switchFrontDoorPort(context, switchTo, current)
                 } else {
@@ -452,7 +461,7 @@ class LocalGatewayServer(
                 }
             }
 
-            // 1.16 API: 网关总开关（读状态 / 开关）
+            // 网关总开关
             path == "/panel/api/settings/gateway" || path == "/m/api/settings/gateway" -> {
                 if (method == "POST") {
                     val on = try { JSONObject(body).optBoolean("enabled", true) } catch (e: Exception) { true }
@@ -470,74 +479,19 @@ class LocalGatewayServer(
                 }
             }
 
-            // 1.17 API: 单个账号导出（含完整 token）
-            path == "/panel/api/accounts/export-one" || path == "/m/api/accounts/export-one" -> {
-                val uid = try { JSONObject(body).optString("uid") } catch (e: Exception) { "" }
-                if (uid.isEmpty()) {
-                    sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "uid 不能为空").toString())
-                } else {
-                    val one = AccountVault.exportOneAccount(uid)
-                    if (one == null) {
-                        sendJsonResponse(output, 200, JSONObject().put("ok", false).put("msg", "未找到该账号").toString())
-                    } else {
-                        sendJsonResponse(output, 200, JSONObject().apply {
-                            put("ok", true)
-                            put("account", one)
-                        }.toString())
-                    }
-                }
-            }
-
-            // 1.18 API: 连通性测试（测指定账号能否真正跑通一次请求）
-            path == "/panel/api/accounts/test" || path == "/m/api/accounts/test" -> {
-                val j = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
-                val uid = j.optString("uid", "")
-                val model = j.optString("model", "deepseek-v4.1-flash-1017")
-                val result = ConnectivityTest.run(context, uid, model)
-                sendJsonResponse(output, 200, result.toString())
-            }
-
-            // 2. API: 发起授权
-            path == "/panel/api/login/start" || path == "/m/api/auth/start" -> {
-                val realm = try { JSONObject(body).optString("realm", "global") } catch (e: Exception) { "global" }
-                val res = TencentGateway.startLogin(realm)
-                sendJsonResponse(output, 200, res.toString())
-            }
-
-            // 3. API: 轮询授权
-            path == "/panel/api/login/poll" || path == "/m/api/auth/poll" -> {
-                val state = query.split("&").find { it.startsWith("state=") }?.substringAfter("state=") ?: ""
-                val res = TencentGateway.pollLogin(java.net.URLDecoder.decode(state, "UTF-8"))
-                sendJsonResponse(output, 200, res.toString())
-            }
-
-            // 4. API: 合并后的模型清单（WB + AG，重名项额外提供 ag:/wb: 前缀版本）
-            path == "/v1/models" || path == "/v1/v1/models" -> {
-                sendJsonResponse(output, 200, EngineRouter.mergedModels(context).toString())
-            }
-
-            // 4.1 API: 仅 WB 的模型清单（旧版兼容）
-            path == "/panel/api/models/wb" || path == "/m/api/models/wb" -> {
+            // 模型清单兼容
+            path == "/panel/api/models/wb" || path == "/panel/api/models/ais" ||
+            path == "/m/api/models/wb" || path == "/m/api/models/ais" -> {
                 val json = JSONObject().apply {
                     put("object", "list")
-                    put("data", WbModels.list())
+                    put("data", EngineRouter.getCachedAisModels(context))
                 }
                 sendJsonResponse(output, 200, json.toString())
             }
 
-            // 5. API: OpenAI 标准流式与非流式对话 (完整透传 tools、reasoning_content、多模态)
-            path == "/v1/chat/completions" || path == "/v1/v1/chat/completions" -> {
-                handleOpenAiChat(output, body, headers)
-            }
-
-            // 6. API: Anthropic Messages 协议全功能支持（双向映射 tools 与 thinking）
-            path == "/v1/messages" || path == "/v1/v1/messages" -> {
-                handleAnthropicMessages(output, body, headers)
-            }
-
-            // 7. 静态前端资源
+            // 旧接口占位响应
             else -> {
-                serveStaticAsset(output, path)
+                sendJsonResponse(output, 200, JSONObject().put("ok", true).put("accounts", JSONArray()).toString())
             }
         }
     }
@@ -545,286 +499,6 @@ class LocalGatewayServer(
     private fun sendJsonResponse(output: OutputStream, code: Int, jsonStr: String) {
         val bytes = jsonStr.toByteArray(Charsets.UTF_8)
         val header = "HTTP/1.1 $code OK\r\n" +
-                "Content-Type: application/json; charset=utf-8\r\n" +
-                "Content-Length: ${bytes.size}\r\n" +
-                "Access-Control-Allow-Origin: *\r\n" +
-                "Connection: close\r\n\r\n"
-        output.write(header.toByteArray(Charsets.US_ASCII))
-        output.write(bytes)
-        output.flush()
-    }
-
-    private fun writeChunk(output: OutputStream, chunkStr: String) {
-        val bytes = chunkStr.toByteArray(Charsets.UTF_8)
-        val hex = Integer.toHexString(bytes.size)
-        output.write("$hex\r\n".toByteArray(Charsets.US_ASCII))
-        output.write(bytes)
-        output.write("\r\n".toByteArray(Charsets.US_ASCII))
-        output.flush()
-    }
-
-    private fun endChunked(output: OutputStream) {
-        output.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
-        output.flush()
-    }
-
-    private fun errorPayload(e: Exception): Pair<Int, JSONObject> {
-        val (status, type) = when {
-            e is UpstreamException && e.code == 11128 -> 403 to "upstream_channel_rejected"
-            e is UpstreamException && e.status == 403 -> 403 to "upstream_forbidden"
-            // 限流：映射成客户端能识别的可重试类型（Anthropic 标准 overloaded_error）
-            e is UpstreamException && (e.status == 429 || e.code == 14003) ->
-                529 to "overloaded_error"
-            e is UpstreamException -> 502 to "upstream_error"
-            else -> 500 to "gateway_error"
-        }
-        val msg = if (type == "overloaded_error") {
-            "上游模型繁忙，请稍后重试（已自动尝试切换账号）"
-        } else {
-            e.message ?: type
-        }
-        val err = JSONObject().put("message", msg).put("type", type)
-        if (e is UpstreamException) err.put("code", e.code ?: e.status)
-        return status to JSONObject().put("type", "error").put("error", err)
-    }
-
-    private fun handleOpenAiChat(output: OutputStream, bodyStr: String, reqHeaders: Map<String, String>) {
-        val startTime = System.currentTimeMillis()
-        var model = "deepseek-v4.1-flash-1017"
-        try {
-            val json = JSONObject(bodyStr)
-            val isStream = json.optBoolean("stream", false)
-            model = json.optString("model", "deepseek-v4.1-flash-1017")
-            val convId = ConversationIds.resolve(reqHeaders, json)
-            val used = UsedAccount()
-
-            if (!isStream) {
-                // 非流式响应：上游透传，完整包含 reasoning_content 与 tool_calls
-                try {
-                    val res = TencentGateway.chatSync(json, convId, used)
-                    val reply = res.optString("content")
-                    val reasoning = res.optString("reasoning_content")
-                    val toolCalls = res.optJSONArray("tool_calls")
-                    val promptTokens = res.optInt("prompt_tokens", 20)
-                    val compTokens = res.optInt("completion_tokens", 20)
-                    val totalTokens = promptTokens + compTokens
-
-                    val oaiResp = JSONObject().apply {
-                        put("id", "chatcmpl_${System.currentTimeMillis()}")
-                        put("object", "chat.completion")
-                        put("created", System.currentTimeMillis() / 1000)
-                        put("model", model)
-                        put("choices", JSONArray().apply {
-                            put(JSONObject().apply {
-                                put("index", 0)
-                                put("message", JSONObject().apply {
-                                    put("role", "assistant")
-                                    put("content", reply)
-                                    if (reasoning.isNotEmpty()) {
-                                        put("reasoning_content", reasoning)
-                                    }
-                                    if (toolCalls != null) {
-                                        put("tool_calls", toolCalls)
-                                    }
-                                })
-                                put("finish_reason", if (toolCalls != null) "tool_calls" else "stop")
-                            })
-                        })
-                        put("usage", JSONObject().apply {
-                            put("prompt_tokens", promptTokens)
-                            put("completion_tokens", compTokens)
-                            put("total_tokens", totalTokens)
-                        })
-                    }
-                    finishWb("/v1/chat/completions", model, "sync", 200, syncUsage(res), System.currentTimeMillis() - startTime, null, null, used)
-                    sendJsonResponse(output, 200, oaiResp.toString())
-                } catch (e: Exception) {
-                    val (st, body) = errorPayload(e)
-                    finishWb("/v1/chat/completions", model, "sync", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
-                    sendJsonResponse(output, st, body.toString())
-                }
-            } else {
-                // 流式 Chunked 传输：按字节原样转发 SSE 帧，上游 reasoning_content 与 tool_calls 天然完整送达
-                val sseHeader = "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: text/event-stream; charset=utf-8\r\n" +
-                        "Cache-Control: no-cache, no-transform\r\n" +
-                        "X-Accel-Buffering: no\r\n" +
-                        "Transfer-Encoding: chunked\r\n" +
-                        "Access-Control-Allow-Origin: *\r\n" +
-                        "Connection: keep-alive\r\n\r\n"
-                output.write(sseHeader.toByteArray(Charsets.US_ASCII))
-                output.flush()
-
-                var streamUsage: JSONObject? = null
-                var ttft: Long? = null
-                try {
-                    TencentGateway.streamChat(json, convId, used) { line ->
-                        try {
-                            if (line.startsWith("data: ")) {
-                                val s = line.substring(6).trim()
-                                if (s.startsWith("{") && s != "[DONE]") {
-                                    val c = JSONObject(s)
-                                    c.optJSONObject("usage")?.let { streamUsage = it }
-                                    if (ttft == null && hasDelta(c)) ttft = System.currentTimeMillis() - startTime
-                                }
-                            }
-                            writeChunk(output, line)
-                            true
-                        } catch (e: Exception) {
-                            false
-                        }
-                    }
-                    finishWb("/v1/chat/completions", model, "stream", 200,
-                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft, null, used)
-                } catch (e: Exception) {
-                    val (st, payload) = errorPayload(e)
-                    finishWb("/v1/chat/completions", model, "stream", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
-                    writeChunk(output, "data: $payload\n\n")
-                    writeChunk(output, "data: [DONE]\n\n")
-                } finally {
-                    endChunked(output)
-                }
-            }
-        } catch (e: Exception) {
-            val (st, body) = errorPayload(e)
-            GatewayMetrics.record("POST", "/v1/chat/completions", model, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
-            sendJsonResponse(output, st, body.toString())
-        }
-    }
-
-    private fun handleAnthropicMessages(output: OutputStream, bodyStr: String, reqHeaders: Map<String, String>) {
-        val startTime = System.currentTimeMillis()
-        var modelRaw = "deepseek-v4.1-flash-1017"
-        try {
-            val json = JSONObject(bodyStr)
-            val isStream = json.optBoolean("stream", false)
-            modelRaw = json.optString("model", "deepseek-v4.1-flash-1017")
-
-            // 采用 Hark 工业级转换器：完美解决 tool_use / tool_result 配对、图片、多轮会话锚点
-            val convId = ConversationIds.resolve(reqHeaders, json)
-            val oaiReq = AnthropicToOpenAI.convertRequest(json)
-            val used = UsedAccount()
-
-            if (!isStream) {
-                // 1. 非流式响应
-                try {
-                    val oaiResp = TencentGateway.chatSync(oaiReq, convId, used)
-                    // chatSync 返回扁平结构（content / tool_calls / prompt_tokens），先补成 OpenAI 响应再转换
-                    val anthropicResp = AnthropicToOpenAI.convertResponse(toOpenAiResponse(oaiResp), modelRaw)
-                    val reasoning = oaiResp.optString("reasoning_content", "")
-                    if (reasoning.isNotEmpty()) {
-                        val old = anthropicResp.getJSONArray("content")
-                        val withThinking = JSONArray().put(JSONObject()
-                            .put("type", "thinking").put("thinking", reasoning).put("signature", ""))
-                        for (k in 0 until old.length()) withThinking.put(old.get(k))
-                        anthropicResp.put("content", withThinking)
-                    }
-                    finishWb("/v1/messages", modelRaw, "sync", 200, syncUsage(oaiResp), System.currentTimeMillis() - startTime, null, null, used)
-                    sendJsonResponse(output, 200, anthropicResp.toString())
-                } catch (e: Exception) {
-                    val (st, body) = errorPayload(e)
-                    finishWb("/v1/messages", modelRaw, "sync", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
-                    sendJsonResponse(output, st, body.toString())
-                }
-            } else {
-                // 2. 流式响应 (支持 thinking 与 tool_use 事件)
-                val sseHeader = "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: text/event-stream; charset=utf-8\r\n" +
-                        "Cache-Control: no-cache, no-transform\r\n" +
-                        "X-Accel-Buffering: no\r\n" +
-                        "Transfer-Encoding: chunked\r\n" +
-                        "Access-Control-Allow-Origin: *\r\n" +
-                        "Connection: keep-alive\r\n\r\n"
-                output.write(sseHeader.toByteArray(Charsets.US_ASCII))
-                output.flush()
-
-                val translator = AnthropicStreamTranslator(modelRaw) { event, data ->
-                    writeChunk(output, "event: $event\ndata: $data\n\n")
-                }
-
-                var streamUsage: JSONObject? = null
-                var ttft: Long? = null
-                try {
-                    TencentGateway.streamChat(oaiReq, convId, used) { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.startsWith("data: ") && trimmed != "data: [DONE]") {
-                            try {
-                                val chunk = JSONObject(trimmed.substring(6))
-                                chunk.optJSONObject("usage")?.let { streamUsage = it }
-                                if (ttft == null && hasDelta(chunk)) ttft = System.currentTimeMillis() - startTime
-                                translator.onChunk(chunk)
-                            } catch (ignored: Exception) {}
-                        }
-                        true
-                    }
-                    translator.finish()
-                    finishWb("/v1/messages", modelRaw, "stream", 200,
-                        GatewayMetrics.Usage.fromOpenAi(streamUsage), System.currentTimeMillis() - startTime, ttft, null, used)
-                } catch (e: Exception) {
-                    val (st, body) = errorPayload(e)
-                    finishWb("/v1/messages", modelRaw, "stream", st, null, System.currentTimeMillis() - startTime, null, e.message, used)
-                    try {
-                        translator.abort(body)
-                    } catch (ignored: Exception) {}
-                } finally {
-                    endChunked(output)
-                }
-            }
-        } catch (e: Exception) {
-            val (st, body) = errorPayload(e)
-            GatewayMetrics.record("POST", "/v1/messages", modelRaw, "error", st, 0, System.currentTimeMillis() - startTime, e.message)
-            sendJsonResponse(output, st, body.toString())
-        }
-    }
-
-    /**
-     * 一次 WB 请求结束：写日志 / 统计（带上最终账号），并给该账号累加请求数与 Token。
-     * used 由 TencentGateway 在每次选号时覆盖，重试换号只记在最后一个账号上。与 src/wb/index.mjs finish 一致。
-     */
-    private fun finishWb(
-        path: String, model: String, endpoint: String, status: Int,
-        usage: GatewayMetrics.Usage?, latencyMs: Long, ttftMs: Long?, note: String?, used: UsedAccount
-    ) {
-        GatewayMetrics.record("POST", path, model, endpoint, status, usage, latencyMs, ttftMs, note, used.uid, used.nickname)
-        if (used.uid.isNotEmpty()) {
-            try { AccountScheduler.recordUsage(used.uid, (usage?.total ?: 0).toLong()) } catch (ignored: Exception) {}
-        }
-    }
-
-    /** chatSync 的扁平结果 → OpenAI chat.completion 形状（convertResponse 需要 choices / usage） */
-    private fun toOpenAiResponse(res: JSONObject): JSONObject {
-        val toolCalls = res.optJSONArray("tool_calls")
-        val message = JSONObject().put("role", "assistant").put("content", res.optString("content"))
-        if (toolCalls != null) message.put("tool_calls", toolCalls)
-        return JSONObject()
-            .put("choices", JSONArray().put(JSONObject()
-                .put("index", 0)
-                .put("message", message)
-                .put("finish_reason", if (toolCalls != null) "tool_calls" else "stop")))
-            .put("usage", JSONObject()
-                .put("prompt_tokens", res.optInt("prompt_tokens", 0))
-                .put("completion_tokens", res.optInt("completion_tokens", 0)))
-    }
-
-    /** chatSync 结果里的用量：优先上游原始 usage，否则用扁平的 prompt/completion */
-    private fun syncUsage(res: JSONObject): GatewayMetrics.Usage? =
-        GatewayMetrics.Usage.fromOpenAi(res.optJSONObject("usage"))
-            ?: GatewayMetrics.Usage.fromOpenAi(JSONObject()
-                .put("prompt_tokens", res.optInt("prompt_tokens", 0))
-                .put("completion_tokens", res.optInt("completion_tokens", 0)))
-
-    /** 流式块里是否已有正文 / 思考 / 工具调用（用于首字耗时） */
-    private fun hasDelta(c: JSONObject): Boolean {
-        val d = c.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta") ?: return false
-        return d.optString("content", "").isNotEmpty() ||
-            d.optString("reasoning_content", "").isNotEmpty() ||
-            d.has("tool_calls")
-    }
-
-    private fun sendErrorJson(output: OutputStream, code: Int, msg: String) {
-        val json = JSONObject().apply { put("error", JSONObject().apply { put("message", msg) }) }
-        val bytes = json.toString().toByteArray(Charsets.UTF_8)
-        val header = "HTTP/1.1 $code Error\r\n" +
                 "Content-Type: application/json; charset=utf-8\r\n" +
                 "Content-Length: ${bytes.size}\r\n" +
                 "Access-Control-Allow-Origin: *\r\n" +

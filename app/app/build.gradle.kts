@@ -37,7 +37,8 @@ android {
         }
         create("lite") {
             dimension = "engine"
-            // 不带 Node，全 ABI
+            // 不带 Node，但内置 AIS 引擎（arm64）
+            ndk { abiFilters += listOf("arm64-v8a") }
             versionNameSuffix = "-lite"
         }
     }
@@ -94,6 +95,9 @@ android {
 
     packaging {
         resources.excludes += setOf("META-INF/*.kotlin_module")
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     compileOptions {

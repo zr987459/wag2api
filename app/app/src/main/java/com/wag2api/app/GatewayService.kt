@@ -234,13 +234,25 @@ class GatewayService : Service() {
         super.onCreate()
         instance = this
 
-        AccountVault.init(applicationContext)
         GatewayMetrics.init(applicationContext)
-        AccountScheduler.init(applicationContext)
-        TencentGateway.attach(applicationContext)
-        TokenKeeper.start()          // token 后台保活
         createNotificationChannel()
         startForegroundServiceNotification()   // 必须在 startForegroundService 后 5 秒内调用
+
+        // AIS 引擎启动（两个 flavor 都启动）
+        AisEngine.start(applicationContext)
+        Thread({
+            val deadline = System.currentTimeMillis() + 30_000
+            while (System.currentTimeMillis() < deadline && !AisEngine.isRunning()) {
+                Thread.sleep(500)
+            }
+            if (AisEngine.isRunning()) {
+                EngineRouter.syncAisModels(applicationContext)
+            }
+            updateNotification()
+        }, "Ais-ModelSync-Init").apply {
+            isDaemon = true
+            start()
+        }
 
         engine = EngineFactory.create(applicationContext)
         EngineFactory.injectToken(applicationContext)
@@ -298,6 +310,12 @@ class GatewayService : Service() {
         }
     }
 
+    private fun aisStateLabel(): String = when {
+        AisEngine.isRunning() -> "AIS ✓"
+        AisEngine.isAvailable(this) -> "AIS 启动中"
+        else -> "AIS 未安装"
+    }
+
     private fun nodeStateLabel(): String = when (engine.state) {
         EngineState.READY -> "AG ✓"
         EngineState.STARTING -> "AG 启动中"
@@ -312,7 +330,7 @@ class GatewayService : Service() {
         val text = if (!on) {
             "网关已暂停 · 控制台运行中 (点按打开)"
         } else {
-            "WB ✓ · ${nodeStateLabel()} · 本地端口 :${server?.listenPort ?: getPort(this)}"
+            "${aisStateLabel()} · ${nodeStateLabel()} · 本地端口 :${server?.listenPort ?: getPort(this)}"
         }
         nm.notify(NOTIF_ID, buildNotification(text))
     }
@@ -335,7 +353,7 @@ class GatewayService : Service() {
     }
 
     private fun startForegroundServiceNotification() {
-        val notification = buildNotification("WB ✓ · AG 启动中 · 本地端口 :${getPort(this)}")
+        val notification = buildNotification("网关服务启动中 · 本地端口 :${getPort(this)}")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // Android 14+ 要求显式声明 specialUse，否则后台启动会被拒
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -348,7 +366,7 @@ class GatewayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        TokenKeeper.stop()
+        AisEngine.stop()
         unregisterNetworkPrewarm()
         try { engine.stop() } catch (ignored: Exception) {}
         server?.stop()

@@ -63,6 +63,32 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v3
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 缓存 AIS 二进制
+        uses: actions/cache@v4
+        id: ais-cache
+        with:
+          path: app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so
+          key: ais-${{ hashFiles('ais/UPSTREAM_SHA', 'ais/android.patch') }}-v1
+
+      - name: 编译 AIS 引擎
+        if: steps.ais-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone https://github.com/Mag1cFall/AIStudio2API.git /tmp/ais
+          git -C /tmp/ais checkout $(cat ais/UPSTREAM_SHA)
+          git -C /tmp/ais apply "$GITHUB_WORKSPACE/ais/android.patch"
+          (cd /tmp/ais/web && npm ci && npm run build)
+          mkdir -p app/app/src/main/jniLibs/arm64-v8a
+          (cd /tmp/ais && CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" ./cmd/aistudio2api)
+
       # nodejs-mobile 只保留 arm64，只有 full 用得到
       - name: 缓存 nodejs-mobile
         uses: actions/cache@v4
@@ -147,6 +173,12 @@ jobs:
           FULL=$(ls app/app/build/outputs/apk/full/release/*.apk | head -1)
           LITE=$(ls app/app/build/outputs/apk/lite/release/*.apk | head -1)
           echo "full: $FULL"; echo "lite: $LITE"
+          if ! unzip -l "$FULL" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
+            echo "::error::full 包缺少 libaistudio2api.so"; exit 1
+          fi
+          if ! unzip -l "$LITE" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
+            echo "::error::lite 包缺少 libaistudio2api.so"; exit 1
+          fi
           if ! unzip -l "$FULL" | grep -q 'libnode.so'; then
             echo "::error::full 包缺少 libnode.so"; exit 1
           fi

@@ -242,7 +242,7 @@ object GatewayMetrics {
         val den = last24.input + last24.cached
         return total.summary().apply {
             put("ok", true)
-            put("engine", "wb")
+            put("engine", "ais")
             put("today", today.summary())
             put("last_24h", JSONObject().put("requests", last24.requests).put("errors", last24.errors)
                 .put("input", last24.input).put("cached", last24.cached).put("output", last24.output)

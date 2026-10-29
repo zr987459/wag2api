@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node tests/test-converter.mjs && node tests/test-usage.mjs && node tests/test-engine-router.mjs && node tests/test-ag-import.mjs && node tests/test-wb.mjs && node tests/test-port-switch.mjs && node tests/test-timing.mjs && node tests/test-host-bench.mjs && node tests/test-upstream-fetch.mjs && node tests/test-payload-cpu.mjs && node tests/test-downgrade.mjs && node tests/test-openai-ag.mjs && node tests/test-history-pin.mjs && node tests/test-ag-scheduler.mjs && node tests/test-protocol-compat.mjs && node tests/test-quota-verify.mjs && node tests/test-token-stats.mjs && node tests/test-sched-test.mjs && node tests/test-quota-guard.mjs"
+    "test": "node tests/test-converter.mjs && node tests/test-usage.mjs && node tests/test-engine-router.mjs && node tests/test-ag-import.mjs && node tests/test-port-switch.mjs && node tests/test-timing.mjs && node tests/test-host-bench.mjs && node tests/test-upstream-fetch.mjs && node tests/test-payload-cpu.mjs && node tests/test-downgrade.mjs && node tests/test-openai-ag.mjs && node tests/test-history-pin.mjs && node tests/test-ag-scheduler.mjs && node tests/test-protocol-compat.mjs && node tests/test-quota-verify.mjs && node tests/test-token-stats.mjs && node tests/test-sched-test.mjs && node tests/test-quota-guard.mjs"
   },
   "engines": {
     "node": ">=18.0.0"
