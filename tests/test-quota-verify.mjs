@@ -12,7 +12,14 @@ import {
   buildBuckets,
   normalizeTier,
   toPublic,
+  applyObservedFallback,
+  setObservedQuota,
+  getObservedQuotas,
+  clearObservedQuotas,
+  flushObservedQuotasSync,
+  formatHHMM,
 } from '../src/quota-fetcher.mjs';
+import { DATA_DIR } from '../src/paths.mjs';
 import { AccountPool } from '../src/account-pool.mjs';
 import {
   isValidationRequired,
@@ -418,6 +425,129 @@ await ok('runWithPolicy：遇 validation 换号、调用 onValidationRequired、
   assert.equal(resultAllBlocked.downgraded, false);
   assert.equal(resultAllBlocked.error.kind, 'validation');
   assert.equal(resultAllBlocked.reason, 'validation');
+});
+
+// ==================== 8. 增量观测与断续桶持久化测试 ====================
+await ok('缺失桶沿用观测：summary 缺失 gemini_7d 时沿用上次观测值与时间戳', () => {
+  const email = 'user-observed-test@example.com';
+  const observedAt = Date.now() - 3600000; // 1 小时前
+  const futureReset = new Date(Date.now() + 86400000 * 3).toISOString(); // 3 天后重置
+  setObservedQuota(email, 'gemini_7d', {
+    fraction: 0.68,
+    reset: futureReset,
+    observed_at: observedAt,
+  });
+
+  // Summary 仅包含 Claude，缺失 gemini_7d
+  const summary = {
+    claude_5h: { fraction: 0.9, reset: futureReset, source: 'summary' },
+  };
+  const effective = applyObservedFallback(email, summary);
+  assert.ok(effective.gemini_7d);
+  assert.equal(effective.gemini_7d.fraction, 0.68);
+  assert.equal(effective.gemini_7d.source, 'observed');
+  assert.equal(effective.gemini_7d.observed_at, observedAt);
+  assert.equal(effective.gemini_7d.reset, futureReset);
+
+  // 校验 buckets 列表
+  const buckets = buildBuckets(effective);
+  const g7d = buckets.find(b => b.group === 'gemini' && b.window === '7d');
+  assert.ok(g7d);
+  assert.equal(g7d.missing, false);
+  assert.equal(g7d.percentage, 68);
+  assert.equal(g7d.remaining_fraction, 0.68);
+  assert.equal(g7d.source, 'observed');
+  assert.equal(g7d.observed_at, observedAt);
+  assert.equal(g7d.note, `上次观测于 ${formatHHMM(observedAt)}`);
+});
+
+await ok('过期按满额：观测记录的 reset 已过，视为已刷新 (fraction=1, source=observed-reset, inferred=true, reset=null)', () => {
+  const email = 'user-expired-test@example.com';
+  const observedAt = Date.now() - 86400000 * 2; // 2 天前
+  const pastReset = new Date(Date.now() - 3600000).toISOString(); // 1 小时前（已过重置时间）
+  setObservedQuota(email, 'gemini_7d', {
+    fraction: 0.2,
+    reset: pastReset,
+    observed_at: observedAt,
+  });
+
+  const effective = applyObservedFallback(email, {});
+  assert.ok(effective.gemini_7d);
+  assert.equal(effective.gemini_7d.fraction, 1);
+  assert.equal(effective.gemini_7d.source, 'observed-reset');
+  assert.equal(effective.gemini_7d.inferred, true);
+  assert.equal(effective.gemini_7d.reset, null);
+  assert.equal(effective.gemini_7d.observed_at, observedAt);
+
+  // 校验 buckets 列表
+  const buckets = buildBuckets(effective);
+  const g7d = buckets.find(b => b.group === 'gemini' && b.window === '7d');
+  assert.ok(g7d);
+  assert.equal(g7d.missing, false);
+  assert.equal(g7d.percentage, 100);
+  assert.equal(g7d.remaining_fraction, 1);
+  assert.equal(g7d.source, 'observed-reset');
+  assert.equal(g7d.inferred, true);
+  assert.equal(g7d.reset_time, null);
+  assert.equal(g7d.note, '已过重置时间，按满额估计');
+});
+
+await ok('无记录仍 missing：从未观测过的桶在 summary 缺失时保持 missing', () => {
+  const email = 'user-no-records@example.com';
+  clearObservedQuotas(); // 清空，确保干净状态
+  const effective = applyObservedFallback(email, {
+    claude_5h: { fraction: 0.8, source: 'summary' },
+  });
+  assert.equal(effective.gemini_7d, undefined);
+
+  const buckets = buildBuckets(effective);
+  const g7d = buckets.find(b => b.group === 'gemini' && b.window === '7d');
+  assert.ok(g7d);
+  assert.equal(g7d.missing, true);
+  assert.equal(g7d.percentage, null);
+  assert.equal(g7d.remaining_fraction, null);
+  assert.ok(g7d.note.includes('接口未返回'));
+});
+
+await ok('新观测覆盖旧值：同一桶新旧都有时取 observed_at 更新的那个并持久化', () => {
+  const email = 'user-overwrite-test@example.com';
+  const t1 = 1700000000000;
+  const t2 = 1700000500000;
+  const tOlder = 1700000100000;
+  const futureReset1 = new Date(Date.now() + 86400000).toISOString();
+  const futureReset2 = new Date(Date.now() + 86400000 * 2).toISOString();
+
+  // 1. 存入旧观测 (t1)
+  setObservedQuota(email, 'gemini_7d', {
+    fraction: 0.3,
+    reset: futureReset1,
+    observed_at: t1,
+  });
+
+  // 2. 新一次 summary 带来更新的观测 (t2 > t1)
+  const sumNew = {
+    gemini_7d: { fraction: 0.95, reset: futureReset2, observed_at: t2, source: 'summary' },
+  };
+  const eff1 = applyObservedFallback(email, sumNew, t2);
+  assert.equal(eff1.gemini_7d.fraction, 0.95);
+  assert.equal(eff1.gemini_7d.observed_at, t2);
+  assert.equal(eff1.gemini_7d.reset, futureReset2);
+
+  // 检查持久化落盘
+  flushObservedQuotasSync();
+  const filePath = path.join(DATA_DIR, 'quota_observed.json');
+  assert.ok(fs.existsSync(filePath));
+  const rawDisk = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  assert.equal(rawDisk[email].gemini_7d.fraction, 0.95);
+  assert.equal(rawDisk[email].gemini_7d.observed_at, t2);
+
+  // 3. 上游返回较旧时间戳的滞后响应 (tOlder < t2) 不应覆盖较新观测
+  const sumOlder = {
+    gemini_7d: { fraction: 0.1, reset: futureReset1, observed_at: tOlder, source: 'summary' },
+  };
+  const eff2 = applyObservedFallback(email, sumOlder, tOlder);
+  assert.equal(eff2.gemini_7d.fraction, 0.95, '不应被较旧的观测值覆盖');
+  assert.equal(eff2.gemini_7d.observed_at, t2);
 });
 
 console.log(`\n🎉 test-quota-verify passed: ${passed} / ${passed}`);

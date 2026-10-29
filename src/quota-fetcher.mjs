@@ -11,6 +11,10 @@
  * 7. loadCodeAssist 查询订阅等级 (ULTRA/PRO/FREE)，按 email 缓存 6 小时。
  */
 
+import fs from 'fs';
+import path from 'path';
+import { DATA_DIR } from './paths.mjs';
+
 export function parseResetTime(resetTimeStr) {
   if (!resetTimeStr) return null;
   try {
@@ -38,20 +42,241 @@ export function hoursUntil(resetTimeStr) {
   return Number.isNaN(t) ? -1 : (t - Date.now()) / 3600000;
 }
 
-/** 记住每个账号最近一次看到的周重置时间（进程内缓存，重启后重新学习） */
-const weeklyResetCache = new Map(); // key: `${email}|${family}` -> ISO string
+const OBSERVED_FILE = path.join(DATA_DIR, 'quota_observed.json');
 
-function rememberWeekly(email, family, bucket) {
-  const key = `${email}|${family}`;
-  if (bucket?.reset && hoursUntil(bucket.reset) > 0) {
-    weeklyResetCache.set(key, bucket.reset);
-    return bucket;
+let observedLoaded = false;
+// email -> Map<bucketKey, { fraction, reset, observed_at }>
+const observedStore = new Map();
+let saveTimer = null;
+let isDirty = false;
+
+function getObservedFilePath() {
+  return OBSERVED_FILE;
+}
+
+export function loadObservedQuotas() {
+  if (observedLoaded) return;
+  observedLoaded = true;
+  try {
+    const filePath = getObservedFilePath();
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const data = JSON.parse(content);
+      if (data && typeof data === 'object') {
+        for (const [rawEmail, buckets] of Object.entries(data)) {
+          if (!buckets || typeof buckets !== 'object') continue;
+          const email = String(rawEmail).trim().toLowerCase();
+          let bucketMap = observedStore.get(email);
+          if (!bucketMap) {
+            bucketMap = new Map();
+            observedStore.set(email, bucketMap);
+          }
+          for (const [bKey, val] of Object.entries(buckets)) {
+            if (val && typeof val.fraction === 'number') {
+              bucketMap.set(bKey, {
+                fraction: val.fraction,
+                reset: val.reset || null,
+                observed_at: typeof val.observed_at === 'number' ? val.observed_at : Date.now(),
+              });
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // 读容错
   }
-  const cached = weeklyResetCache.get(key);
-  if (!cached) return bucket;
-  if (hoursUntil(cached) <= 0) { weeklyResetCache.delete(key); return bucket; }
-  if (bucket) return { ...bucket, reset: cached, inferred: true };
-  return { fraction: null, reset: cached, source: 'cached', inferred: true };
+}
+
+export function flushObservedQuotasSync() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (!isDirty) return;
+  try {
+    const filePath = getObservedFilePath();
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const obj = {};
+    for (const [email, bucketMap] of observedStore.entries()) {
+      const emailObj = {};
+      for (const [bKey, val] of bucketMap.entries()) {
+        emailObj[bKey] = {
+          fraction: val.fraction,
+          reset: val.reset,
+          observed_at: val.observed_at,
+        };
+      }
+      obj[email] = emailObj;
+    }
+    fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), 'utf-8');
+    isDirty = false;
+  } catch (e) {
+    // 写容错
+  }
+}
+
+function scheduleSaveObservedQuotas() {
+  isDirty = true;
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    flushObservedQuotasSync();
+  }, 1000);
+  if (typeof saveTimer.unref === 'function') {
+    saveTimer.unref();
+  }
+}
+
+if (typeof process !== 'undefined' && typeof process.on === 'function') {
+  process.on('beforeExit', () => {
+    flushObservedQuotasSync();
+  });
+}
+
+export function setObservedQuota(email, bucketKey, record) {
+  loadObservedQuotas();
+  const normEmail = String(email || 'default').trim().toLowerCase();
+  let bucketMap = observedStore.get(normEmail);
+  if (!bucketMap) {
+    bucketMap = new Map();
+    observedStore.set(normEmail, bucketMap);
+  }
+  bucketMap.set(bucketKey, {
+    fraction: record.fraction,
+    reset: record.reset || null,
+    observed_at: typeof record.observed_at === 'number' ? record.observed_at : Date.now(),
+  });
+  scheduleSaveObservedQuotas();
+}
+
+export function getObservedQuotas(email) {
+  loadObservedQuotas();
+  const normEmail = String(email || 'default').trim().toLowerCase();
+  const bucketMap = observedStore.get(normEmail);
+  if (!bucketMap) return {};
+  const res = {};
+  for (const [k, v] of bucketMap.entries()) {
+    res[k] = { ...v };
+  }
+  return res;
+}
+
+export function clearObservedQuotas() {
+  observedStore.clear();
+  observedLoaded = true;
+  isDirty = true;
+  flushObservedQuotasSync();
+}
+
+/**
+ * 合并新旧观测记录：
+ * 1. 对 summary 真实出现的桶，更新观测记录（observed_at=now，同一桶取 observed_at 更新者）
+ * 2. 对 summary 缺失但有观测记录的桶：
+ *    - reset 在未来：使用记录值，source:'observed'，带 observed_at
+ *    - reset 已过：视为已刷新，fraction=1，source:'observed-reset'，inferred:true，reset 置空
+ *    - 无记录：保持 missing
+ */
+export function applyObservedFallback(email, summary = {}, now = Date.now()) {
+  loadObservedQuotas();
+  const normEmail = String(email || 'default').trim().toLowerCase();
+  let bucketMap = observedStore.get(normEmail);
+  if (!bucketMap) {
+    bucketMap = new Map();
+    observedStore.set(normEmail, bucketMap);
+  }
+
+  const effective = {};
+
+  for (const [bKey, item] of Object.entries(summary || {})) {
+    if (!item || typeof item.fraction !== 'number') continue;
+    const itemObservedAt = (typeof item.observed_at === 'number') ? item.observed_at : now;
+    const existing = bucketMap.get(bKey);
+
+    if (existing && existing.observed_at > itemObservedAt) {
+      // 已有记录更新，沿用已有记录
+      let isExpired = false;
+      if (existing.reset) {
+        const resetMs = new Date(existing.reset).getTime();
+        if (!Number.isNaN(resetMs) && resetMs <= now) isExpired = true;
+      }
+      if (isExpired) {
+        effective[bKey] = {
+          fraction: 1,
+          reset: null,
+          source: 'observed-reset',
+          inferred: true,
+          observed_at: existing.observed_at,
+        };
+      } else {
+        effective[bKey] = {
+          fraction: existing.fraction,
+          reset: existing.reset,
+          source: 'observed',
+          inferred: false,
+          observed_at: existing.observed_at,
+        };
+      }
+    } else {
+      // 新观测更新或并列，更新记录
+      const updated = {
+        fraction: item.fraction,
+        reset: item.reset || null,
+        observed_at: itemObservedAt,
+      };
+      bucketMap.set(bKey, updated);
+      scheduleSaveObservedQuotas();
+
+      effective[bKey] = {
+        ...item,
+        observed_at: itemObservedAt,
+        source: item.source || 'summary',
+      };
+    }
+  }
+
+  // 对 summary 缺失但有观测记录的桶
+  for (const [bKey, rec] of bucketMap.entries()) {
+    if (effective[bKey]) continue;
+
+    let isExpired = false;
+    if (rec.reset) {
+      const resetMs = new Date(rec.reset).getTime();
+      if (!Number.isNaN(resetMs) && resetMs <= now) isExpired = true;
+    }
+
+    if (isExpired) {
+      effective[bKey] = {
+        fraction: 1,
+        reset: null,
+        source: 'observed-reset',
+        inferred: true,
+        observed_at: rec.observed_at,
+      };
+    } else {
+      effective[bKey] = {
+        fraction: rec.fraction,
+        reset: rec.reset,
+        source: 'observed',
+        inferred: false,
+        observed_at: rec.observed_at,
+      };
+    }
+  }
+
+  return effective;
+}
+
+export function formatHHMM(ts) {
+  if (!ts) return '';
+  const d = (ts instanceof Date) ? ts : new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
 }
 
 /** 从一个 quota 条目里抽取数值。支持三种形态，找不到返回 null */
@@ -209,6 +434,7 @@ export function parseSummary(body) {
 
 export function toPublic(r) {
   if (!r) return null;
+  const observedAt = (typeof r.observed_at === 'number') ? r.observed_at : (r.observed_at ?? null);
   return {
     remaining_fraction: r.fraction,
     percentage: typeof r.fraction === 'number' ? Math.round(r.fraction * 100) : null,
@@ -216,6 +442,7 @@ export function toPublic(r) {
     reset_time: r.reset || null,
     reset_text: parseResetTime(r.reset) || '',
     source: r.source || null,
+    observed_at: observedAt,
   };
 }
 
@@ -279,8 +506,16 @@ export function buildBuckets(merged) {
       const resetText = item.reset_text !== undefined ? item.reset_text : (parseResetTime(resetTime) || '');
       const source = item.source || null;
       const inferred = Boolean(item.inferred);
+      const observedAt = item.observed_at !== undefined ? item.observed_at : (item.observedAt ?? null);
 
-      buckets.push({
+      let note = item.note || undefined;
+      if (source === 'observed') {
+        note = observedAt ? `上次观测于 ${formatHHMM(observedAt)}` : '上次观测';
+      } else if (source === 'observed-reset') {
+        note = '已过重置时间，按满额估计';
+      }
+
+      const b = {
         group: spec.group,
         label: spec.label,
         window: spec.window,
@@ -289,9 +524,15 @@ export function buildBuckets(merged) {
         reset_time: resetTime,
         reset_text: resetText,
         source,
+        observed_at: observedAt,
         inferred,
         missing: false,
-      });
+      };
+      if (note !== undefined) {
+        b.note = note;
+      }
+
+      buckets.push(b);
     } else if (spec.core) {
       buckets.push({
         group: spec.group,
@@ -302,6 +543,7 @@ export function buildBuckets(merged) {
         reset_time: null,
         reset_text: '',
         source: null,
+        observed_at: null,
         inferred: false,
         missing: true,
         note: spec.key === 'gemini_7d'
@@ -454,21 +696,29 @@ export async function fetchRealQuota(tokenManager) {
 
     const models = data?.models || data || {};
     const merged = mergeModelQuotas(models);
+    const email = tokenManager.tokenData.email || 'default';
+    const now = Date.now();
+
+    const hasModelsGemini5h = Boolean(merged.gemini_5h && typeof merged.gemini_5h.fraction === 'number');
+    if (hasModelsGemini5h && merged.gemini_5h.observed_at === undefined) {
+      merged.gemini_5h.observed_at = now;
+    }
 
     // 周额度 / 5 小时额度以官方分组接口为准（fetchAvailableModels 不带周额度）
+    let sum = null;
     try {
-      const sum = await fetchQuotaSummary(accessToken, validProj);
-      if (sum) {
-        for (const k of Object.keys(sum)) {
-          if (sum[k]) merged[k] = sum[k];
-        }
-      }
+      sum = await fetchQuotaSummary(accessToken, validProj);
     } catch (e) {}
 
-    const email = tokenManager.tokenData.email || 'default';
-    merged.gemini_7d = rememberWeekly(email, 'gemini', merged.gemini_7d);
-    merged.claude_7d = rememberWeekly(email, 'claude', merged.claude_7d);
-    merged.argon_7d = rememberWeekly(email, 'argon', merged.argon_7d);
+    const effectiveSummary = applyObservedFallback(email, sum || {}, now);
+    for (const k of Object.keys(effectiveSummary)) {
+      if (!effectiveSummary[k]) continue;
+      if (k === 'gemini_5h' && hasModelsGemini5h) {
+        // Gemini 5h 仍然优先用 fetchAvailableModels 的实时值（如果有）
+        continue;
+      }
+      merged[k] = effectiveSummary[k];
+    }
 
     // 订阅等级：异步非阻塞，失败不影响额度
     let tier = null;
