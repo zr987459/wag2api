@@ -25,6 +25,13 @@ let aisRequestsCache = [];           // 缓存 /ais/api/requests
 let aisEditingId = '';               // 当前正在编辑的 AIS 账号 ID
 let aisPairingPollTimer = null;
 let aisPairingInitialCount = 0;
+const aisTestResults = {};           // id -> { ok, latency_ms, model, error }
+const aisTestingAccounts = new Set();// 正在测试的 AIS 账号 ID
+let aisTestingAll = false;           // 是否正在全部测试 AIS 账号
+let aisAccountsLoadedAt = 0;         // 最近一次拉取 AIS 账号列表的时间戳
+let aisRecentRecordsCache = [];      // 最近请求记录缓存（用于计算账号连续失败与成功率）
+let aisHeatmapCache = { ts: 0, list: [] }; // 91天按日分桶缓存
+let aisLogMode = 'requests';         // 'requests' | 'system'
 const agQuota = {};          // email -> quota
 const agTestResults = {};    // email -> test result
 const agTestingAccounts = new Set();
@@ -230,6 +237,8 @@ function applyEngineChrome() {
   $('currentEngineBadge').textContent = m.title;
   if ($('navEngine')) $('navEngine').textContent = isStandalone() ? 'AG' : m.name;
   $('agEngineCard').style.display = engine === 'ag' && engineInfo.supported && !isStandalone() && !isDual() ? 'block' : 'none';
+  if ($('aisEngineCard')) $('aisEngineCard').style.display = engine === 'ais' ? 'block' : 'none';
+  if ($('aisLogSubTabs')) $('aisLogSubTabs').style.display = engine === 'ais' ? 'flex' : 'none';
 }
 
 function switchEngine(e) {
@@ -284,29 +293,42 @@ async function loadOverview() {
         getJson('/ais/api/models').catch(() => ({ models: [] })),
         getJson('/ais/api/accounts').catch(() => ({ accounts: [] })),
       ]);
-      const models = modelsRes.models || [];
+      const models = modelsRes.models || modelsRes.data || [];
       const accounts = accountsRes.accounts || [];
-
-      const to = new Date().toISOString();
-      const from = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-      const usage = await getJson(`/ais/api/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`).catch(() => null);
-      const totals = usage?.totals || {};
+      if (Array.isArray(accountsRes.accounts)) aisAccountsCache = accounts;
 
       const ac = status.accounts || {};
       const readyAccs = ac.ready !== undefined ? ac.ready : accounts.filter(a => a.state === 'ready' || a.enabled).length;
       const totalAccs = ac.total !== undefined ? ac.total : accounts.length;
       $('ovAccounts').textContent = `${readyAccs} / ${totalAccs}`;
-      $('ovReq').textContent = fmtNum(totals.requests || 0);
-      $('ovTokens').textContent = fmtNum(totals.total_tokens || 0);
-      evEl.textContent = status.state || (isRunning ? '● RUNNING' : '● STOPPED');
-      evEl.style.color = isRunning ? 'var(--primary)' : 'var(--warning)';
-      setHeader(isRunning, isRunning ? 'AIS 运行中' : 'AIS 已停止');
 
-      renderAisOverview(status, models, accounts, totals, usage);
+      evEl.textContent = status.state === 'RUNNING' ? (status.ready ? '● 就绪' : '● 运行中') : (status.state === 'LAUNCHING' ? '● 启动中' : '● 已停止');
+      evEl.style.color = isRunning ? 'var(--primary)' : 'var(--warning)';
+      setHeader(isRunning, isRunning ? 'AIS 运行中' : (status.state === 'LAUNCHING' ? 'AIS 启动中' : 'AIS 已停止'));
+
+      if ($('aisVersionBadge')) $('aisVersionBadge').textContent = status.version ? 'v' + status.version : '';
+      if ($('aisEngineSub')) $('aisEngineSub').textContent = '可用模型 ' + models.length + ' 个 · 活跃请求 ' + (status.active_requests || 0) + ' · 就绪 ' + (ac.ready ?? readyAccs) + (ac.busy ? ' / 忙碌 ' + ac.busy : '') + ' / 冷却 ' + (ac.cooldown || 0) + ' / 需认证 ' + (ac.auth_required || 0);
+      if ($('aisEngineStateTag')) {
+        $('aisEngineStateTag').className = 'tag ' + (isRunning ? 'tag-online' : 'tag-warn');
+        $('aisEngineStateTag').textContent = status.state || (isRunning ? 'RUNNING' : 'STOPPED');
+      }
+      if ($('aisStartStopBtn')) {
+        $('aisStartStopBtn').textContent = isRunning ? '⏹ 停止服务' : '▶ 启动服务';
+        $('aisStartStopBtn').className = 'btn btn-sm ' + (isRunning ? 'btn-outline' : 'btn-primary');
+      }
+
+      await loadAisTokenStats(false);
     } catch (e) {
       setHeader(false, 'AIS 未响应');
+      $('ovAccounts').textContent = '-';
+      $('ovReq').textContent = '-';
+      $('ovTokens').textContent = '-';
       evEl.textContent = '● 异常';
       evEl.style.color = 'var(--danger)';
+      if ($('aisEngineStateTag')) {
+        $('aisEngineStateTag').className = 'tag tag-offline';
+        $('aisEngineStateTag').textContent = 'ERROR';
+      }
       renderAisError(e.message);
     }
   } else {
@@ -402,6 +424,27 @@ async function stopAisService() {
     showToast('已请求停止 AIS 服务', 'warn');
     setTimeout(loadOverview, 1000);
   } catch (e) { showToast(`停止失败: ${e.message}`, 'error'); }
+}
+
+async function toggleAisService() {
+  const tag = $('aisEngineStateTag')?.textContent || '';
+  if (tag === 'RUNNING' || tag === 'LAUNCHING') {
+    await stopAisService();
+  } else {
+    await startAisService();
+  }
+}
+
+async function restartAisService() {
+  try {
+    showToast('正在重启 AIS 服务…', 'info');
+    await postJson('/ais/api/control/stop', {});
+    await postJson('/ais/api/control/start', {});
+    showToast('AIS 服务已重启', 'success');
+    setTimeout(loadOverview, 1000);
+  } catch (e) {
+    showToast(`重启失败: ${e.message}`, 'error');
+  }
 }
 
 function renderAgOffOverviewStats() {
@@ -695,11 +738,247 @@ async function loadAgTokenStats(toast = false) {
   }
 }
 
+function loadEngineTokenStats(toast = false) {
+  return engine === 'ais' ? loadAisTokenStats(toast) : loadAgTokenStats(toast);
+}
+
+function buildAisHeatmapList(buckets) {
+  return (buckets || []).map(b => {
+    const d = new Date(b.at);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dayStr = String(d.getDate()).padStart(2, '0');
+    return {
+      day: `${y}-${m}-${dayStr}`,
+      tokens: Number(b.total_tokens) || 0,
+      requests: Number(b.requests) || 0,
+    };
+  });
+}
+
+function adaptAisUsageToTokenStats(report, heatmapList, range) {
+  const totals = report?.totals || {};
+  const totalTokens = Number(totals.total_tokens) || 0;
+  const input = Number(totals.input_tokens) || 0;
+  const cached = Number(totals.cached_tokens) || 0;
+  const output = (Number(totals.reply_tokens) || 0) + (Number(totals.reasoning_tokens) || 0);
+  const thoughts = Number(totals.reasoning_tokens) || 0;
+  const requests = Number(totals.requests) || 0;
+  const success = Number(totals.succeeded) || 0;
+  const errors = (Number(totals.failed) || 0) + (Number(totals.rate_limited) || 0);
+
+  const summary = {
+    requests,
+    success,
+    errors,
+    input,
+    cached,
+    output,
+    thoughts,
+    tokens: totalTokens,
+    cache_hit_rate: (input + cached) > 0 ? (cached / (input + cached)) : null,
+    avg_latency_ms: Math.round(totals.duration?.avg_ms || 0),
+    avg_ttft_ms: totals.first_event?.avg_ms ? Math.round(totals.first_event.avg_ms) : null,
+    active_accounts: 0,
+    active_models: 0,
+  };
+
+  const buckets = Array.isArray(report?.buckets) ? report.buckets : [];
+  const series = buckets.map(b => {
+    const bIn = Number(b.input_tokens) || 0;
+    const bCac = Number(b.cached_tokens) || 0;
+    const bOut = (Number(b.reply_tokens) || 0) + (Number(b.reasoning_tokens) || 0);
+    const bThk = Number(b.reasoning_tokens) || 0;
+    const bTok = Number(b.total_tokens) || (bIn + bCac + bOut);
+    const bReq = Number(b.requests) || 0;
+    const bErr = (Number(b.failed) || 0) + (Number(b.rate_limited) || 0);
+    return {
+      ts: Date.parse(b.at),
+      requests: bReq,
+      errors: bErr,
+      input: bIn,
+      cached: bCac,
+      output: bOut,
+      thoughts: bThk,
+      tokens: bTok,
+    };
+  });
+
+  const rawModels = report?.groups?.model || [];
+  const models = rawModels.map(g => {
+    const mIn = Number(g.input_tokens) || 0;
+    const mCac = Number(g.cached_tokens) || 0;
+    const mOut = (Number(g.reply_tokens) || 0) + (Number(g.reasoning_tokens) || 0);
+    const mThk = Number(g.reasoning_tokens) || 0;
+    const mTok = Number(g.total_tokens) || (mIn + mCac + mOut);
+    const mReq = Number(g.requests) || 0;
+    const mErr = (Number(g.failed) || 0) + (Number(g.rate_limited) || 0);
+    return {
+      model: g.key,
+      requests: mReq,
+      errors: mErr,
+      input: mIn,
+      cached: mCac,
+      output: mOut,
+      thoughts: mThk,
+      tokens: mTok,
+      share: totalTokens > 0 ? (mTok / totalTokens) : 0,
+    };
+  }).filter(m => m.requests > 0 || m.tokens > 0);
+  models.sort((a, b) => b.tokens - a.tokens || b.requests - a.requests);
+
+  const pairs = Array.isArray(report?.pairs) ? report.pairs : [];
+  const rawAccounts = report?.groups?.account || [];
+  const accounts = rawAccounts.map(g => {
+    const aIn = Number(g.input_tokens) || 0;
+    const aCac = Number(g.cached_tokens) || 0;
+    const aOut = (Number(g.reply_tokens) || 0) + (Number(g.reasoning_tokens) || 0);
+    const aThk = Number(g.reasoning_tokens) || 0;
+    const aTok = Number(g.total_tokens) || (aIn + aCac + aOut);
+    const aReq = Number(g.requests) || 0;
+    const aErr = (Number(g.failed) || 0) + (Number(g.rate_limited) || 0);
+
+    const accMatch = aisAccountsCache.find(a => a.id === g.key);
+    const email = accMatch?.label || g.key;
+
+    const accPairs = pairs.filter(p => p.account === g.key);
+    let topModel = null;
+    let maxTok = -1;
+    for (const p of accPairs) {
+      const tok = Number(p.total_tokens) || 0;
+      if (tok > maxTok) {
+        maxTok = tok;
+        topModel = p.model;
+      }
+    }
+
+    return {
+      email,
+      requests: aReq,
+      errors: aErr,
+      input: aIn,
+      cached: aCac,
+      output: aOut,
+      thoughts: aThk,
+      tokens: aTok,
+      share: totalTokens > 0 ? (aTok / totalTokens) : 0,
+      cache_hit_rate: (aIn + aCac) > 0 ? (aCac / (aIn + aCac)) : null,
+      top_model: topModel,
+    };
+  }).filter(a => a.requests > 0 || a.tokens > 0);
+  accounts.sort((a, b) => b.tokens - a.tokens || b.requests - a.requests);
+
+  summary.active_accounts = accounts.length;
+  summary.active_models = models.length;
+
+  let peak = null;
+  for (const p of series) {
+    if (p.tokens > 0 || p.requests > 0) {
+      if (!peak || p.tokens > peak.tokens || (p.tokens === peak.tokens && p.requests > peak.requests)) {
+        peak = { ts: p.ts, tokens: p.tokens, requests: p.requests };
+      }
+    }
+  }
+
+  return {
+    range,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    generated_at: Date.now(),
+    summary,
+    series,
+    models,
+    accounts,
+    peak,
+    heatmap: heatmapList || [],
+  };
+}
+
+async function loadAisTokenStats(toast = false) {
+  const box = $('overviewStatsContainer');
+  if (!box) return;
+
+  const now = Date.now();
+  let spanMs = 24 * 3600e3;
+  let bucket = '3600';
+  if (tokenStatsRange === 'hour') {
+    spanMs = 3600e3;
+    bucket = '60';
+  } else if (tokenStatsRange === 'day') {
+    spanMs = 24 * 3600e3;
+    bucket = '3600';
+  } else if (tokenStatsRange === 'week') {
+    spanMs = 7 * 86400e3;
+    bucket = '3600';
+  } else if (tokenStatsRange === 'month') {
+    spanMs = 30 * 86400e3;
+    bucket = '86400';
+  } else if (tokenStatsRange === 'all') {
+    spanMs = 91 * 86400e3;
+    bucket = '86400';
+  }
+
+  const fromISO = new Date(now - spanMs).toISOString();
+  const toISO = new Date(now).toISOString();
+  const rawTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const tz = /^(GMT|UTC[+-])/i.test(rawTz) ? 'UTC' : rawTz;
+
+  try {
+    const report = await getJson(`/ais/api/usage?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}&bucket=${bucket}&tz=${encodeURIComponent(tz)}`);
+    if (engine !== 'ais') return;
+
+    if (tokenStatsRange === 'month' || tokenStatsRange === 'all') {
+      if (Array.isArray(report?.buckets)) {
+        aisHeatmapCache = {
+          ts: Date.now(),
+          list: buildAisHeatmapList(report.buckets),
+        };
+      }
+    } else if (Date.now() - aisHeatmapCache.ts > 60000) {
+      const hmFrom = new Date(now - 91 * 86400e3).toISOString();
+      getJson(`/ais/api/usage?from=${encodeURIComponent(hmFrom)}&to=${encodeURIComponent(toISO)}&bucket=86400&tz=${encodeURIComponent(tz)}`).then(hmReport => {
+        if (Array.isArray(hmReport?.buckets)) {
+          aisHeatmapCache = {
+            ts: Date.now(),
+            list: buildAisHeatmapList(hmReport.buckets),
+          };
+          if (engine === 'ais' && tokenStatsData && tokenStatsData.range === tokenStatsRange) {
+            tokenStatsData.heatmap = aisHeatmapCache.list;
+            renderStatsHeatmapCard(tokenStatsData);
+          }
+        }
+      }).catch(() => {});
+    }
+
+    const data = adaptAisUsageToTokenStats(report, aisHeatmapCache.list, tokenStatsRange);
+    tokenStatsData = data;
+    renderTokenStatsView(data);
+
+    if (tokenStatsRange === 'day') {
+      if ($('ovReq')) $('ovReq').textContent = fmtNum(data.summary.requests || 0);
+      if ($('ovTokens')) $('ovTokens').textContent = fmtNum(data.summary.tokens || 0);
+    } else {
+      if ($('ovReq')) $('ovReq').textContent = fmtNum(data.summary.requests || 0);
+      if ($('ovTokens')) $('ovTokens').textContent = fmtNum(data.summary.tokens || 0);
+      const dayFrom = new Date(now - 24 * 3600e3).toISOString();
+      getJson(`/ais/api/usage?from=${encodeURIComponent(dayFrom)}&to=${encodeURIComponent(toISO)}&bucket=3600&tz=${encodeURIComponent(tz)}`).then(dayRep => {
+        if (engine !== 'ais') return;
+        const dt = dayRep?.totals || {};
+        if ($('ovReq')) $('ovReq').textContent = fmtNum(dt.requests || 0);
+        if ($('ovTokens')) $('ovTokens').textContent = fmtNum(dt.total_tokens || 0);
+      }).catch(() => {});
+    }
+    if (toast) showToast('统计已刷新', 'success');
+  } catch (e) {
+    if (engine !== 'ais') return;
+    box.innerHTML = `<div class="card empty" style="color:var(--danger)">加载 AIS 统计失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
 function setTokenStatsRange(r) {
   tokenStatsRange = r;
   localStorage.setItem('wag2api_token_stats_range', r);
   tokenStatsTrendIndex = null;
-  loadAgTokenStats(false);
+  loadEngineTokenStats(false);
 }
 
 function setTokenStatsTrendMode(m) {
@@ -774,7 +1053,7 @@ function renderTokenStatsView(data) {
             <span class="sub-tab ${tokenStatsRange === k ? 'active' : ''}" onclick="setTokenStatsRange('${k}')">${name}</span>
           `).join('')}
         </div>
-        <button class="btn btn-outline btn-sm" onclick="loadAgTokenStats(true)">🔄 刷新</button>
+        <button class="btn btn-outline btn-sm" onclick="loadEngineTokenStats(true)">🔄 刷新</button>
       </div>
 
       <div class="metric-label">总 Token 消耗</div>
@@ -1127,18 +1406,95 @@ async function loadAccounts() {
   return loadAgAccounts();
 }
 
+function computeAisAccountPerf(acc) {
+  const accId = acc.id;
+  const accLabel = acc.label;
+  const records = (aisRecentRecordsCache || []).filter(r => r.account === accId || r.account === accLabel);
+  if (!records.length) {
+    return { success_rate: null, avg_latency_ms: null, fail_streak: 0 };
+  }
+
+  let failStreak = 0;
+  let streakBroken = false;
+  let succCount = 0;
+  let latSum = 0;
+  let latCount = 0;
+
+  for (const r of records) {
+    const isSucc = r.state === 'completed' || r.state === 'tool_calls' || (r.status >= 200 && r.status < 300);
+    const isFail = r.state === 'failed' || r.state === 'rate_limited' || (r.status >= 400);
+
+    if (!streakBroken) {
+      if (isFail) {
+        failStreak++;
+      } else if (isSucc) {
+        streakBroken = true;
+      }
+    }
+
+    if (isSucc) succCount++;
+    if (r.duration_ms && Number(r.duration_ms) > 0) {
+      latSum += Number(r.duration_ms);
+      latCount++;
+    }
+  }
+
+  const success_rate = records.length > 0 ? succCount / records.length : null;
+  const avg_latency_ms = latCount > 0 ? Math.round(latSum / latCount) : null;
+  return { success_rate, avg_latency_ms, fail_streak: failStreak };
+}
+
+function aisAccountStatusHtml(a) {
+  const id = a.id || '';
+  const escId = escapeHtml(id);
+  const modelsCount = (a.models && a.models.length) || 0;
+  const changeSummary = aisRefreshResults[id] ? ` <span class="muted" style="font-size:11px;">(${escapeHtml(aisRefreshResults[id])})</span>` : '';
+
+  const accCds = (aisCooldownsCache || []).filter(cd => cd.account_id === id);
+  let cdHtml = '';
+  if (!accCds.length) {
+    cdHtml = `<div class="kv"><span class="k">调度状态</span><span class="v">${a.state === 'disabled' ? '<span class="muted">已手动停用</span>' : '<span style="color:var(--primary)">正常就绪</span>'}</span></div>`;
+  } else {
+    cdHtml = accCds.map(cd => {
+      const untilStr = cd.until ? new Date(cd.until).toLocaleTimeString('zh-CN', { hour12: false }) : '冷却中';
+      const scope = cd.scope || '*';
+      return `<div class="kv" style="color:var(--warning);"><span class="k">冷却状态</span><span class="v" style="display:flex;align-items:center;gap:4px;">❄️ ${escapeHtml(cd.model_id || '全部模型')} (${escapeHtml(cd.channel || '全通道')}) · 恢复于 ${untilStr} <button class="btn btn-outline btn-sm" style="padding:1px 6px; font-size:10px;" data-id="${escId}" data-scope="${escapeHtml(scope)}" onclick="aisClearCooldown(this.dataset.id, this.dataset.scope)">解除</button></span></div>`;
+    }).join('');
+  }
+
+  const timeTs = aisRefreshTimes[id] || aisAccountsLoadedAt;
+  const timeLabel = aisRefreshTimes[id] ? '更新于 ' : '同步于 ';
+  const timeStr = timeTs ? `${timeLabel}${new Date(timeTs).toLocaleTimeString('zh-CN', { hour12: false })}` : '';
+
+  return `
+    <div class="quota-list" style="margin-top:8px;">
+      <div class="kv" style="cursor:pointer;" onclick="showAisAccountModels('${escId}')">
+        <span class="k">可用模型</span>
+        <span class="v"><b>${modelsCount}</b> 个模型${changeSummary}</span>
+      </div>
+      ${cdHtml}
+      ${timeStr ? `<div class="muted" style="text-align:right;font-size:11px;margin-top:4px;">${timeStr}</div>` : ''}
+    </div>
+  `;
+}
+
 async function loadAisAccounts() {
   const box = $('accountList');
   const sch = $('schedulerCard');
   try {
-    const [accRes, cfgRes, cdRes, reqRes] = await Promise.all([
+    const fromTime = new Date(Date.now() - 86400000).toISOString();
+    const toTime = new Date().toISOString();
+    const [accRes, cfgRes, cdRes, reqRes, recRes] = await Promise.all([
       getJson('/ais/api/accounts'),
       getJson('/ais/api/config').catch(() => null),
       getJson('/ais/api/cooldowns').catch(() => ({ cooldowns: [] })),
       getJson('/ais/api/requests').catch(() => ({ requests: [] })),
+      getJson(`/ais/api/usage/records?from=${encodeURIComponent(fromTime)}&to=${encodeURIComponent(toTime)}&limit=100`).catch(() => ({ items: [] })),
     ]);
     if (engine !== 'ais') return;
 
+    aisAccountsLoadedAt = Date.now();
+    aisRecentRecordsCache = recRes.items || [];
     aisAccountsCache = accRes.accounts || [];
     aisConfigCache = cfgRes;
     aisCooldownsCache = cdRes.cooldowns || [];
@@ -1156,28 +1512,36 @@ async function loadAisAccounts() {
       return;
     }
 
-    const stateLabels = {
-      ready: { text: '● 正常', cls: 'tag-online' },
-      disabled: { text: '● 已停用', cls: 'tag-offline' },
-      auth_required: { text: '● 需认证', cls: 'tag-offline' },
-      cooldown: { text: '● 冷却中', cls: 'tag-warn' },
-      busy: { text: '● 忙碌', cls: 'tag-warn' },
-      unavailable: { text: '● 不可用', cls: 'tag-offline' },
-    };
-
     box.innerHTML = aisAccountsCache.map(a => {
       const id = a.id || '';
       const escId = escapeHtml(id);
       const label = a.label || id;
       const escLabel = escapeHtml(label);
-      const stInfo = stateLabels[a.state] || { text: `● ${escapeHtml(a.state || '未知')}`, cls: a.enabled ? 'tag-online' : 'tag-offline' };
-      const lastRef = aisRefreshTimes[id] ? new Date(aisRefreshTimes[id]).toLocaleTimeString('zh-CN', { hour12: false }) : '未手动刷新';
-      const modelsCount = (a.models && a.models.length) || 0;
-      const tierText = a.benefit_tier === 'Unknown' ? '未知权益' : (a.benefit_tier || 'Free');
-      const egressText = a.egress ? maskProxyUrl(a.egress) : '直连';
       const isRefreshing = aisRefreshingIds.has(id);
+      const isTesting = aisTestingAccounts.has(id);
       const errMsg = aisRefreshErrors[id] || a.message;
-      const refreshSummary = aisRefreshResults[id] || ('上次刷新: ' + lastRef);
+      const isAuthReq = a.state === 'auth_required';
+      const showValidation = isAuthReq || Boolean(errMsg);
+      const activeReqs = (aisRequestsCache || []).filter(r => r.account_id === id).length;
+
+      let stateBadge = '';
+      if (a.state === 'ready') {
+        stateBadge = '<span class="tag tag-online">● 正常</span>';
+      } else if (a.state === 'busy') {
+        stateBadge = `<span class="tag tag-warn">● 忙碌${activeReqs > 0 ? ` (${activeReqs} 并发)` : ''}</span>`;
+      } else if (a.state === 'cooldown') {
+        stateBadge = '<span class="tag tag-warn">● 冷却中</span>';
+      } else if (a.state === 'auth_required') {
+        stateBadge = '<span class="tag tag-offline">● 需认证</span>';
+      } else if (a.state === 'unavailable') {
+        stateBadge = '<span class="tag tag-offline">● 不可用</span>';
+      } else if (a.state === 'disabled') {
+        stateBadge = '<span class="tag tag-offline">● 已停用</span>';
+      } else {
+        stateBadge = `<span class="tag ${a.enabled ? 'tag-online' : 'tag-offline'}">● ${escapeHtml(a.state || '未知')}</span>`;
+      }
+
+      const egressText = a.egress ? maskProxyUrl(a.egress) : (a.proxy ? maskProxyUrl(a.proxy) : '直连');
 
       return `
         <div class="account-card">
@@ -1186,33 +1550,41 @@ async function loadAisAccounts() {
             <div class="account-card-info" style="min-width:0; flex:1;">
               <div class="account-title-row" style="flex-wrap:wrap; gap:4px;">
                 <span class="account-name" style="word-break:break-all;">${escLabel}</span>
-                <span class="tag ${stInfo.cls}">${stInfo.text}</span>
-                <span class="tag tag-global">${escapeHtml(tierText)}</span>
+                <span class="tag tag-global">AI Studio</span>
+                ${tierTagHtml(a.benefit_tier)}
+                ${stateBadge}
               </div>
-              <div class="account-meta" style="margin-top:3px; font-size:11px; color:var(--text-muted);">
-                出口: <span class="mono">${escapeHtml(egressText)}</span> · ${escapeHtml(a.locale || '-')} · ${escapeHtml(a.timezone || '-')}
-              </div>
-              <div class="account-meta mono" style="margin-top:2px; font-size:11px;">
-                模型数: <b>${modelsCount}</b> · ${escapeHtml(refreshSummary)}
+              <div class="account-meta mono" style="margin-top:3px; font-size:11px; color:var(--text-muted);">
+                出口 ${escapeHtml(egressText)} · ${escapeHtml(a.locale || '-')} · ${escapeHtml(a.timezone || '-')}
               </div>
             </div>
           </div>
-          ${errMsg ? `
-            <div class="log-note-box" style="margin-top:8px; cursor:pointer;" data-label="${escLabel}" data-err="${escapeHtml(errMsg)}" onclick="showAccountErrorDetail(this.dataset.label, this.dataset.err)">
-              ⚠️ ${escapeHtml(errMsg.slice(0, 100))}${errMsg.length > 100 ? '… (点击查看详情)' : ''}
+          ${showValidation ? `
+            <div class="account-validation-box">
+              <div class="validation-reason">⚠️ ${escapeHtml(errMsg || '登录凭据已失效，请更新此账号的 Cookie')}</div>
+              <div class="validation-actions">
+                ${errMsg && errMsg.length > 80 ? `<button class="btn btn-outline btn-sm" data-label="${escLabel}" data-err="${escapeHtml(errMsg)}" onclick="showAccountErrorDetail(this.dataset.label, this.dataset.err)">详情</button>` : ''}
+                ${isAuthReq ? `<button class="btn btn-primary btn-sm" onclick="openAisReloginCookie('${escId}')">🔑 更新 Cookie</button>` : ''}
+              </div>
             </div>
           ` : ''}
+          ${aisAccountStatusHtml(a)}
+          ${formatAccountPerfRow(computeAisAccountPerf(a))}
+          ${renderAccountTestBanner(aisTestResults[id])}
           <div class="account-actions-wrap" style="margin-top:10px;">
-            <div class="account-actions-row" style="flex-wrap:wrap; gap:6px;">
-              ${a.state === 'auth_required' ? `
-                <button class="btn btn-primary btn-sm" onclick="openAisReloginCookie('${escId}')">🔑 更新 Cookie</button>
-              ` : ''}
-              <button class="btn btn-outline btn-sm" ${isRefreshing ? 'disabled' : ''} onclick="aisRefreshAccount('${escId}')">
+            <div class="account-actions-row">
+              <button class="btn btn-outline btn-sm" style="flex:1;" onclick="aisTestAccount('${escId}', this)" ${isTesting ? 'disabled' : ''}>
+                ${isTesting ? '<span class="spinner"></span>' : '⚡ 测试'}
+              </button>
+              <button class="btn btn-outline btn-sm" style="flex:1;" ${isRefreshing ? 'disabled' : ''} onclick="aisRefreshAccount('${escId}')">
                 ${isRefreshing ? '⏳ 刷新中…' : '🔄 刷新'}
               </button>
-              <button class="btn btn-outline btn-sm" onclick="aisOpenEditModal('${escId}')">✏️ 编辑</button>
-              <button class="btn btn-outline btn-sm" onclick="aisToggleAccount('${escId}', ${!a.enabled})">${a.enabled ? '⏸ 停用' : '▶ 启用'}</button>
-              <button class="btn btn-outline btn-sm" style="color:var(--danger); border-color:rgba(239,68,68,0.4);" onclick="aisDeleteAccount('${escId}')">🗑 删除</button>
+              <button class="btn btn-outline btn-sm" style="flex:1;" onclick="aisOpenEditModal('${escId}')">✏️ 编辑</button>
+              <button class="btn btn-outline btn-sm" style="flex:1;" onclick="aisToggleAccount('${escId}', ${!a.enabled})">${a.enabled ? '⏸ 停用' : '▶ 启用'}</button>
+            </div>
+            <div class="account-actions-row" style="margin-top:6px;">
+              <button class="btn ${isAuthReq ? 'btn-primary' : 'btn-outline'} btn-sm" style="flex:1;" onclick="openAisReloginCookie('${escId}')">🔑 更新 Cookie</button>
+              <button class="btn btn-outline btn-sm" style="flex:1; color:var(--danger); border-color:rgba(239,68,68,0.4);" onclick="aisDeleteAccount('${escId}')">🗑 删除</button>
             </div>
           </div>
         </div>`;
@@ -1231,46 +1603,57 @@ function renderAisSchedulerCard() {
   const channels = cfg.upstream_channels || ['playground', 'build'];
   const hasPlayground = channels.includes('playground');
   const hasBuild = channels.includes('build');
+  const cdCount = (aisCooldownsCache || []).length;
 
   let html = `
-    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+    <div class="section-title">
       <div>
-        <div style="font-weight:600; font-size:14px;">AIS 调度与状态</div>
-        <div class="muted" style="font-size:11px;">控制上游通道、请求分配策略与请求队列</div>
+        <span>账号调度</span>
+        <div class="muted" style="font-size: 11px; margin-top: 2px;">
+          单号并发 ${cfg.per_account_concurrency || 2} · 通道 ${channels.join(' / ')} · 冷却 ${cdCount} 条
+        </div>
       </div>
-      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      <div style="display: flex; gap: 6px; flex-wrap: wrap;">
         <button class="btn btn-outline btn-sm" ${aisRefreshingAll ? 'disabled' : ''} onclick="aisRefreshAllAccounts()">
-          ${aisRefreshingAll ? `🔄 刷新中 (${aisRefreshDone}/${aisRefreshTotal})` : '🔄 刷新全部'}
+          ${aisRefreshingAll ? `<span class="spinner"></span>刷新中 (${aisRefreshDone}/${aisRefreshTotal})` : '🔄 刷新全部'}
         </button>
+        ${cdCount > 0 ? `<button class="btn btn-outline btn-sm" style="color:var(--warning); border-color:rgba(245,158,11,0.4);" onclick="aisClearAllCooldowns()">清除冷却 (${cdCount})</button>` : ''}
         <button class="btn btn-outline btn-sm" onclick="openAisConfigModal()">⚙️ 设置</button>
       </div>
     </div>
 
-    <!-- 策略与通道切换 -->
-    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:10px; margin-bottom:10px;">
-      <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px 10px;">
-        <div class="muted" style="font-size:11px; margin-bottom:6px;">路由策略</div>
-        <div style="display:flex; gap:6px;">
-          <button type="button" class="btn btn-sm ${currentStrategy === 'round-robin' ? 'btn-primary' : 'btn-outline'}" style="flex:1; padding:4px 4px; font-size:11.5px; white-space:nowrap;" onclick="aisSetRoutingStrategy('round-robin')">轮询</button>
-          <button type="button" class="btn btn-sm ${currentStrategy === 'fill-first' ? 'btn-primary' : 'btn-outline'}" style="flex:1; padding:4px 4px; font-size:11.5px; white-space:nowrap;" onclick="aisSetRoutingStrategy('fill-first')">填满优先</button>
-        </div>
+    <!-- 路由策略 -->
+    <div class="sched-modes-wrap" style="margin-top:8px;">
+      <div class="sched-modes-grid cols-2">
+        <button class="sched-mode-btn ${currentStrategy === 'round-robin' ? 'active' : ''}" onclick="aisSetRoutingStrategy('round-robin')">轮询均衡</button>
+        <button class="sched-mode-btn ${currentStrategy === 'fill-first' ? 'active' : ''}" onclick="aisSetRoutingStrategy('fill-first')">填满优先</button>
       </div>
-      <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px 10px;">
-        <div class="muted" style="font-size:11px; margin-bottom:6px;">上游通道</div>
+      <div class="sched-mode-desc muted">
+        ${currentStrategy === 'round-robin' ? '在所有就绪账号间依次轮询分配请求，负载均衡' : '优先打满单个账号的并发上限后再切下一个账号'}
+      </div>
+    </div>
+
+    <!-- 上游通道 -->
+    <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px 10px; margin-top:8px;">
+      <div class="row-between">
+        <div>
+          <div style="font-size:12px; font-weight:600;">上游通道</div>
+          <div class="muted" style="font-size:11px;">启用的 Google AI Studio 上游通道</div>
+        </div>
         <div style="display:flex; gap:6px;">
-          <button type="button" class="btn btn-sm ${hasPlayground ? 'btn-primary' : 'btn-outline'}" style="flex:1; padding:4px 4px; font-size:11.5px; white-space:nowrap;" onclick="aisToggleChannel('playground')">Playground</button>
-          <button type="button" class="btn btn-sm ${hasBuild ? 'btn-primary' : 'btn-outline'}" style="flex:1; padding:4px 4px; font-size:11.5px; white-space:nowrap;" onclick="aisToggleChannel('build')">Build</button>
+          <button type="button" class="btn btn-sm ${hasPlayground ? 'btn-primary' : 'btn-outline'}" style="padding:3px 8px; font-size:11.5px;" onclick="aisToggleChannel('playground')">Playground</button>
+          <button type="button" class="btn btn-sm ${hasBuild ? 'btn-primary' : 'btn-outline'}" style="padding:3px 8px; font-size:11.5px;" onclick="aisToggleChannel('build')">Build</button>
         </div>
       </div>
     </div>
   `;
 
   // 冷却列表
-  if (aisCooldownsCache && aisCooldownsCache.length > 0) {
+  if (cdCount > 0) {
     html += `
       <div style="margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.08);">
         <div class="row-between" style="margin-bottom:8px;">
-          <span style="font-size:12px; font-weight:600; color:var(--warning);">❄️ 冷却中的账号/模型 (${aisCooldownsCache.length})</span>
+          <span style="font-size:12px; font-weight:600; color:var(--warning);">❄️ 冷却中的账号/模型 (${cdCount})</span>
           <button class="btn btn-outline btn-sm" style="font-size:11px; padding:2px 8px; color:var(--warning); border-color:rgba(245,158,11,0.4);" onclick="aisClearAllCooldowns()">一键清除全部</button>
         </div>
         <div style="display:flex; flex-direction:column; gap:6px; max-height:180px; overflow-y:auto;">
@@ -1285,7 +1668,7 @@ function renderAisSchedulerCard() {
                   <div class="mono" style="font-weight:600; word-break:break-all;">${escapeHtml(accLabel)}</div>
                   <div class="muted">${escapeHtml(cd.model_id || '所有模型')} · ${escapeHtml(cd.channel || '全部通道')} · 恢复: ${untilStr}${cd.reason ? ` · ${escapeHtml(cd.reason)}` : ''}</div>
                 </div>
-                <button class="btn btn-outline btn-sm" style="padding:2px 8px; font-size:11px; white-space:nowrap;" onclick="aisClearCooldown('${escapeHtml(accId)}', '${escapeHtml(scope)}')">解除</button>
+                <button class="btn btn-outline btn-sm" style="padding:2px 8px; font-size:11px; white-space:nowrap;" data-id="${escapeHtml(accId)}" data-scope="${escapeHtml(scope)}" onclick="aisClearCooldown(this.dataset.id, this.dataset.scope)">解除</button>
               </div>
             `;
           }).join('')}
@@ -1309,7 +1692,7 @@ function renderAisSchedulerCard() {
                   <div class="mono" style="font-weight:600;">${escapeHtml(req.model || '请求')} <span class="tag tag-online" style="font-size:9px;">${escapeHtml(req.state || 'running')}</span></div>
                   <div class="muted">${escapeHtml(req.account_label || req.account_id || '-')} · ${escapeHtml(req.channel || '-')} · 开始: ${startedStr}</div>
                 </div>
-                <button class="btn btn-outline btn-sm" style="padding:2px 8px; font-size:11px; color:var(--danger); border-color:rgba(239,68,68,0.4);" onclick="aisCancelRequest('${escapeHtml(reqId)}')">⏹ 取消</button>
+                <button class="btn btn-outline btn-sm" style="padding:2px 8px; font-size:11px; color:var(--danger); border-color:rgba(239,68,68,0.4);" data-id="${escapeHtml(reqId)}" onclick="aisCancelRequest(this.dataset.id)">⏹ 取消</button>
               </div>
             `;
           }).join('')}
@@ -1318,7 +1701,100 @@ function renderAisSchedulerCard() {
     `;
   }
 
+  // 底部双按钮行
+  html += `
+    <div style="display: flex; gap: 8px; margin-top: 10px;">
+      <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="aisTestAll(this)" ${aisTestingAll ? 'disabled' : ''}>
+        ${aisTestingAll ? '<span class="spinner"></span>全部测试中…' : '⚡ 全部测试'}
+      </button>
+      <button class="btn btn-outline btn-sm" style="flex: 1;" onclick="aisRefreshAllAccounts()" ${aisRefreshingAll ? 'disabled' : ''}>
+        ${aisRefreshingAll ? `<span class="spinner"></span>刷新中 (${aisRefreshDone}/${aisRefreshTotal})` : '🔄 刷新全部账号'}
+      </button>
+    </div>
+  `;
+
   sch.innerHTML = html;
+}
+
+async function aisTestAccount(id, btn) {
+  if (aisTestingAccounts.has(id)) return;
+  aisTestingAccounts.add(id);
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>测试中…';
+  }
+  const start = Date.now();
+  try {
+    const res = await postJson(`/ais/api/accounts/${encodeURIComponent(id)}/refresh`, {});
+    const latency_ms = Date.now() - start;
+    aisRefreshTimes[id] = Date.now();
+    delete aisRefreshErrors[id];
+    modelCache.ais = null;
+    const currM = Array.isArray(res.models) ? res.models.length : (res.models ?? (res.account?.models?.length ?? 0));
+    const currT = res.tier || res.account?.benefit_tier || 'Free';
+    aisTestResults[id] = { ok: true, latency_ms, model: `${currT} · ${currM}个模型` };
+    showToast(`可用 · ${latency_ms}ms`, 'success');
+  } catch (e) {
+    const latency_ms = Date.now() - start;
+    aisRefreshErrors[id] = e.message;
+    aisTestResults[id] = { ok: false, latency_ms, error: e.message };
+    showToast(`测试未通过：${e.message}`, 'error');
+  } finally {
+    aisTestingAccounts.delete(id);
+    await loadAisAccounts();
+  }
+}
+
+async function aisTestAll(btn) {
+  if (aisTestingAll) return;
+  const targets = aisAccountsCache.filter(a => a.enabled !== false && !aisTestingAccounts.has(a.id));
+  if (!targets.length) {
+    showToast('没有已启用的 AIS 账号可测试', 'info');
+    return;
+  }
+  aisTestingAll = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>全部测试中…';
+  }
+  let okCount = 0;
+  const concurrency = 3;
+  let cursor = 0;
+  async function worker() {
+    while (cursor < targets.length) {
+      const acc = targets[cursor++];
+      const id = acc.id;
+      aisTestingAccounts.add(id);
+      const start = Date.now();
+      try {
+        const res = await postJson(`/ais/api/accounts/${encodeURIComponent(id)}/refresh`, {});
+        const latency_ms = Date.now() - start;
+        aisRefreshTimes[id] = Date.now();
+        delete aisRefreshErrors[id];
+        const currM = Array.isArray(res.models) ? res.models.length : (res.models ?? (res.account?.models?.length ?? 0));
+        const currT = res.tier || res.account?.benefit_tier || 'Free';
+        aisTestResults[id] = { ok: true, latency_ms, model: `${currT} · ${currM}个模型` };
+        okCount++;
+      } catch (e) {
+        aisRefreshErrors[id] = e.message;
+        aisTestResults[id] = { ok: false, latency_ms: Date.now() - start, error: e.message };
+      } finally {
+        aisTestingAccounts.delete(id);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()));
+  if (okCount > 0) modelCache.ais = null;
+  aisTestingAll = false;
+  showToast(`可用 ${okCount} / 共 ${targets.length}`, okCount === targets.length ? 'success' : 'warn');
+  await loadAisAccounts();
+}
+
+function showAisAccountModels(id) {
+  const acc = aisAccountsCache.find(a => a.id === id);
+  if (!acc) return;
+  const list = acc.models || [];
+  showText(`可用模型 (${list.length})`, `账号：${acc.label || acc.id}`, list.length ? list.join('\n') : '暂无模型数据，请点击「刷新」获取');
 }
 
 async function aisSetRoutingStrategy(strategy) {
@@ -1423,6 +1899,8 @@ async function openAisConfigModal() {
   $('aisCfgKeepalive').checked = !!cfg.nonstream_keepalive;
   $('aisCfgFakeStream').checked = !!cfg.fake_stream;
   $('aisCfgYoutube').checked = !!cfg.youtube_links;
+  if ($('aisCfgBuildNative')) $('aisCfgBuildNative').checked = !!cfg.build_native_nonstream;
+  if ($('aisCfgModelMapping')) $('aisCfgModelMapping').value = cfg.model_mapping || '';
   const hedgeVal = String(cfg.first_event_hedge || 'off').trim().toLowerCase() || 'off';
   const hedgeSel = $('aisCfgHedge');
   if (hedgeSel) {
@@ -1444,6 +1922,11 @@ async function saveAisConfigModal() {
   const nonstream_keepalive = $('aisCfgKeepalive').checked;
   const fake_stream = $('aisCfgFakeStream').checked;
   const youtube_links = $('aisCfgYoutube').checked;
+  const build_native_nonstream = $('aisCfgBuildNative') ? $('aisCfgBuildNative').checked : false;
+  const rawMapping = $('aisCfgModelMapping') ? $('aisCfgModelMapping').value.trim() : '';
+  const model_mapping = rawMapping
+    ? rawMapping.split(/[\n,]+/).map(s => s.trim().replace(/^([^=]+)=([^=:]+)$/, '$1:$2')).filter(Boolean).join(',')
+    : '';
   const first_event_hedge = $('aisCfgHedge').value || 'off';
 
   try {
@@ -1454,6 +1937,8 @@ async function saveAisConfigModal() {
       nonstream_keepalive,
       fake_stream,
       youtube_links,
+      build_native_nonstream,
+      model_mapping,
       first_event_hedge,
     });
     showToast('AIS 引擎设置已保存', 'success');
@@ -1483,6 +1968,7 @@ async function aisRefreshAccount(id) {
     const summary = `权益: ${tierPart} · 模型: ${modelPart}`;
 
     aisRefreshResults[id] = summary;
+    modelCache.ais = null;
     showToast(`${id} 刷新成功: ${summary}`, 'success');
   } catch (e) {
     aisRefreshErrors[id] = e.message;
@@ -1537,6 +2023,7 @@ async function aisRefreshAllAccounts() {
   const workers = Array.from({ length: Math.min(concurrency, targets.length) }, () => worker());
   await Promise.all(workers);
 
+  if (successCount > 0) modelCache.ais = null;
   aisRefreshingAll = false;
   showToast(`全部刷新完成：成功 ${successCount} 个，失败 ${failCount} 个`, failCount > 0 ? 'warn' : 'success');
   loadAccounts();
@@ -1605,6 +2092,8 @@ async function aisDeleteAccount(id) {
     delete aisRefreshTimes[id];
     delete aisRefreshErrors[id];
     delete aisRefreshResults[id];
+    delete aisTestResults[id];
+    modelCache.ais = null;
     showToast('已删除账号', 'success');
     loadAccounts();
   } catch (e) {
@@ -1973,8 +2462,9 @@ function tierTagHtml(tier) {
   if (!tier) return '';
   const t = String(tier).toUpperCase();
   if (t === 'ULTRA') return '<span class="tag tag-tier-ultra">ULTRA</span>';
-  if (t === 'PRO') return '<span class="tag tag-tier-pro">PRO</span>';
+  if (t === 'PRO' || t === 'PAID') return `<span class="tag tag-tier-pro">${escapeHtml(t)}</span>`;
   if (t === 'FREE') return '<span class="tag tag-tier-free">FREE</span>';
+  if (t === 'UNKNOWN') return '<span class="tag tag-tier-free">未知权益</span>';
   return `<span class="tag tag-tier-free">${escapeHtml(t)}</span>`;
 }
 
@@ -2458,7 +2948,16 @@ async function submitImport() {
 async function openExportModal() {
   try {
     if (engine === 'ais') {
-      showToast('AIS 账号不支持导出，请妥善保存 Cookie', 'info');
+      const exportList = aisAccountsCache.map(a => ({
+        id: a.id,
+        label: a.label,
+        benefit_tier: a.benefit_tier,
+        proxy: a.proxy || '',
+        locale: a.locale || '',
+        timezone: a.timezone || '',
+        models_count: (a.models || []).length,
+      }));
+      showText('AIS 账号环境清单', '注意：出于安全考虑不包含 Cookie 凭据，请妥善保存登录 Cookie。此清单为当前账号环境与权益配置。', JSON.stringify(exportList, null, 2));
       return;
     }
     if (!agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
@@ -2477,12 +2976,33 @@ async function openBackupModal() {
 // ── 3. 接入 ─────────────────────────────────────────────
 async function loadModels(e) {
   if (modelCache[e]) return modelCache[e];
+  if (e === 'ais') {
+    let list = [];
+    try {
+      const d1 = await getJson('/ais/api/models');
+      list = d1.models || d1.data || [];
+    } catch (_) {}
+    if (!list.length) {
+      try {
+        const d1v = await getJson('/ais/v1/models');
+        list = d1v.data || d1v.models || [];
+      } catch (_) {}
+    }
+    if (!list.length) {
+      try {
+        const d2 = await getJson('/panel/api/models/ais');
+        list = d2.data || d2.models || [];
+      } catch (_) {}
+    }
+    modelCache.ais = list.map(m => ({ id: m.id, name: m.name || m.display_name || m.id, paid: !!m.paid }));
+    return modelCache.ais;
+  }
   try {
-    const d = await getJson(e === 'ais' ? '/panel/api/models/ais' : '/api/models');
+    const d = await getJson('/api/models');
     const list = d.data || d.models || [];
-    modelCache[e] = list.map(m => ({ id: m.id, name: m.name || m.display_name || m.id }));
+    modelCache.ag = list.map(m => ({ id: m.id, name: m.name || m.display_name || m.id }));
+    return modelCache.ag;
   } catch (err) { return []; }
-  return modelCache[e];
 }
 
 async function loadKeys() {
@@ -2494,7 +3014,9 @@ async function loadKeys() {
   if (engine === 'ag' && !agReady()) { box.innerHTML = agOffHtml(); return; }
   const models = await loadModels(engine);
   const pre = engine === 'ais' ? 'ais:' : 'ag:';
-  const eps = `${base}/v1/chat/completions（OpenAI 兼容）\n${base}/v1/messages（Anthropic 原生）`;
+  const eps = engine === 'ais'
+    ? `${base}/v1/chat/completions（OpenAI 兼容）\n${base}/v1/responses（OpenAI 兼容）\n${base}/v1/messages（Anthropic 原生）\n${base}/v1beta/models（Gemini 原生）`
+    : `${base}/v1/chat/completions（OpenAI 兼容）\n${base}/v1/messages（Anthropic 原生）`;
   const sample = models[0] ? models[0].id : (engine === 'ais' ? 'gemini-2.5-flash' : 'gemini-3.8-flash-high');
   box.innerHTML = `
     <div class="section-title">${META[engine].name} 接入</div>
@@ -2512,7 +3034,7 @@ export ANTHROPIC_MODEL=${escapeHtml(pre + sample)}</div>
     <div class="row-between" style="margin-top:14px;">
       <span class="muted">可用模型（${models.length}）· 点一下复制</span>
     </div>
-    <div style="margin-top:4px;">${models.map(m => `<span class="model-chip" onclick="copyText('${escapeHtml(pre + m.id)}')" title="${escapeHtml(m.name)}">${escapeHtml(m.id)}</span>`).join('') || '<span class="muted">暂无</span>'}</div>`;
+    <div style="margin-top:4px;">${models.map(m => `<span class="model-chip" onclick="copyText('${escapeHtml(pre + m.id)}')" title="${escapeHtml(m.name + (m.paid ? ' · 付费模型' : ''))}">${escapeHtml(m.id)}${m.paid ? ' <span class="tag tag-tier-pro" style="font-size:9px;padding:0 3px;">PAID</span>' : ''}</span>`).join('') || '<span class="muted">暂无</span>'}</div>`;
 }
 
 function copyBaseUrl() { copyText($('baseUrlDisplay').textContent); }
@@ -2535,6 +3057,13 @@ async function loadChat() {
   box.innerHTML = chatState[engine].html || welcomeHtml();
   box.scrollTop = box.scrollHeight;
   const models = await loadModels(engine);
+  if (!models.length) {
+    sel.innerHTML = '<option value="">暂无可用模型</option>';
+    if (engine === 'ais' && !chatState.ais.html) {
+      box.innerHTML = '<div class="chat-bubble assistant">当前无可用模型，请先去「账号」页面添加并刷新账号，或在概览中确认 AIS 服务已启动。</div>';
+    }
+    return;
+  }
   const saved = localStorage.getItem('wag2api_chat_model_' + engine);
   sel.innerHTML = models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.name && m.name !== m.id ? `${m.name}` : m.id)}</option>`).join('');
   if (saved && models.some(m => m.id === saved)) sel.value = saved;
@@ -2609,7 +3138,15 @@ async function sendMessage() {
         ? { model: 'ag:' + model, max_tokens: 8192, stream: true, messages: st.history }
         : { model: 'ais:' + model, stream: true, messages: st.history }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    if (!res.ok) {
+      const rawText = await res.text();
+      let errMsg = rawText.slice(0, 300);
+      try {
+        const errObj = JSON.parse(rawText);
+        errMsg = errObj?.error?.message || errObj?.message || errMsg;
+      } catch (_) {}
+      throw new Error(`HTTP ${res.status}: ${errMsg}`);
+    }
 
     const reader = res.body.getReader();
     const dec = new TextDecoder('utf-8');
@@ -2655,6 +3192,23 @@ async function sendMessage() {
 }
 
 // ── 5. 日志 ─────────────────────────────────────────────
+function setAisLogMode(mode) {
+  aisLogMode = mode === 'system' ? 'system' : 'requests';
+  if ($('tabAisLogReq')) $('tabAisLogReq').classList.toggle('active', aisLogMode === 'requests');
+  if ($('tabAisLogSys')) $('tabAisLogSys').classList.toggle('active', aisLogMode === 'system');
+  loadLogs();
+}
+
+async function viewAisRequestBody(id) {
+  try {
+    const b = await getJson(`/ais/api/requests/${encodeURIComponent(id)}/body`);
+    const text = `=== Request (${b.request_size || 0} bytes) ===\n${b.request || '(空)'}\n\n=== Response (${b.response_size || 0} bytes) ===\n${b.response || '(空)'}`;
+    showText(`请求报文：${id}`, b.time ? new Date(b.time).toLocaleString('zh-CN') : '', text);
+  } catch (e) {
+    showToast(`读取报文失败：${e.message}`, 'error');
+  }
+}
+
 async function loadLogs() {
   await refreshEngineInfo();
   applyEngineChrome();
@@ -2662,21 +3216,100 @@ async function loadLogs() {
   if (engine === 'ag' && !agReady()) { $('logTitle').textContent = '请求日志'; box.innerHTML = `<div class="card">${agOffHtml()}</div>`; return; }
   try {
     if (engine === 'ais') {
-      let raw;
-      try {
-        const text = await (await fetch(apiUrl('/ais/logs'), { cache: 'no-store', headers: authHeaders() })).text();
-        try { raw = JSON.parse(text); } catch { raw = text; }
-      } catch (err) { raw = []; }
-      const lines = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.logs) ? raw.logs : (typeof raw === 'string' ? raw.split('\n').filter(Boolean) : []));
-      $('logTitle').textContent = `运行日志 (${lines.length})`;
-      if (!lines.length) {
-        box.innerHTML = '<div class="empty">暂无 AIS 日志。启动 AIS 引擎或调用接口后会在此显示。</div>';
+      if (aisLogMode === 'system') {
+        let raw;
+        try {
+          const text = await (await fetch(apiUrl('/ais/logs'), { cache: 'no-store', headers: authHeaders() })).text();
+          try { raw = JSON.parse(text); } catch { raw = text; }
+        } catch (err) { raw = []; }
+        const lines = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.logs) ? raw.logs : (typeof raw === 'string' ? raw.split('\n').filter(Boolean) : []));
+        $('logTitle').textContent = `运行日志 (${lines.length})`;
+        if (!lines.length) {
+          box.innerHTML = '<div class="empty">暂无 AIS 运行日志。启动 AIS 引擎或调用接口后会在此显示。</div>';
+          return;
+        }
+        box.innerHTML = `
+          <div class="card" style="padding:10px;">
+            <pre class="mono" style="margin:0; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-all; max-height:600px; overflow-y:auto;">${escapeHtml(lines.slice(-200).map(l => typeof l === 'object' ? JSON.stringify(l) : String(l)).join('\n'))}</pre>
+          </div>`;
         return;
       }
-      box.innerHTML = `
-        <div class="card" style="padding:10px;">
-          <pre class="mono" style="margin:0; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-all; max-height:600px; overflow-y:auto;">${escapeHtml(lines.slice(-200).map(l => typeof l === 'object' ? JSON.stringify(l) : String(l)).join('\n'))}</pre>
-        </div>`;
+
+      // 默认 requests 模式：调 AIS 账本 /ais/api/usage/records
+      const fromISO = new Date(Date.now() - 7 * 86400000).toISOString();
+      const toISO = new Date().toISOString();
+      const recRes = await getJson(`/ais/api/usage/records?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}&limit=100`).catch(() => ({ items: [] }));
+      const items = recRes.items || [];
+      $('logTitle').textContent = `请求日志 (${items.length})`;
+      if (!items.length) {
+        box.innerHTML = '<div class="empty">暂无 AIS 请求记录。调用 API 或在「对话」里发一条，就会出现在这里。</div>';
+        return;
+      }
+
+      box.innerHTML = items.map(r => {
+        const ok = r.status >= 200 && r.status < 300;
+        const tm = r.time ? new Date(r.time).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+        const inTok = r.input_tokens || 0;
+        const cacTok = r.cached_tokens || 0;
+        const repTok = r.reply_tokens || 0;
+        const rsnTok = r.reasoning_tokens || 0;
+        const totTok = r.total_tokens || (inTok + cacTok + repTok + rsnTok);
+        const hitRate = (inTok + cacTok) > 0 ? (cacTok / (inTok + cacTok)) : null;
+
+        const tok = [
+          `<span>入 <b>${fmtNum(inTok)}</b></span>`,
+          cacTok ? `<span>缓存 <b>${fmtNum(cacTok)}</b></span>` : '',
+          `<span>出 <b>${fmtNum(repTok)}</b></span>`,
+          rsnTok ? `<span>思考 <b>${fmtNum(rsnTok)}</b></span>` : '',
+          `<span>合计 <b>${fmtNum(totTok)}</b></span>`,
+          hitRate !== null ? `<span>命中 <b>${fmtPct(hitRate)}</b></span>` : '',
+        ].filter(Boolean).join('');
+
+        const timingParts = [
+          r.duration_ms ? fmtMs(r.duration_ms) : '',
+          r.first_event_ms ? '首字 ' + fmtMs(r.first_event_ms) : '',
+        ].filter(x => x && x !== '--').join(' · ');
+
+        const metaParts = [
+          r.queue_ms ? `排队 ${fmtMs(r.queue_ms)}` : '',
+          r.tool_calls ? `工具调用 ${r.tool_calls}` : '',
+          (r.attempts && r.attempts.length) ? `重试 ${r.attempts.length} 次` : '',
+        ].filter(Boolean).join(' · ');
+
+        const accMatch = aisAccountsCache.find(a => a.id === r.account);
+        const who = accMatch?.label || r.account || '';
+        const attemptErr = (!r.error && Array.isArray(r.attempts))
+          ? r.attempts.filter(a => a && a.error).map(a => a.error).join('；')
+          : '';
+        const noteErr = r.error || attemptErr;
+
+        return `
+          <div class="log-card">
+            <div class="log-header-row">
+              <div class="log-path-wrap">
+                <span class="tag ${ok ? 'tag-online' : 'tag-offline'}">${escapeHtml(r.status || '-')}</span>
+                <span class="log-path-text">${escapeHtml('POST ' + (r.path || '/v1/chat/completions'))}</span>
+                <span class="tag tag-global">${escapeHtml(r.channel || r.protocol || 'ais')}</span>
+                ${(r.state === 'canceled' || r.state === 'rate_limited') ? `<span class="tag tag-warn">${escapeHtml(r.state)}</span>` : ''}
+              </div>
+              <span class="mono" style="font-size: 11px; color: var(--text-dim);">${escapeHtml(tm)}</span>
+            </div>
+            <div class="log-detail-row">
+              <span class="log-model-text">${escapeHtml(r.model || '-')}</span>
+              <span class="log-metrics-text">${timingParts}</span>
+            </div>
+            <div class="log-tokens">${tok}</div>
+            ${metaParts ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(metaParts)}</div>` : ''}
+            ${who ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(who)}</div>` : ''}
+            ${noteErr ? `<div class="log-note-box">⚠️ ${escapeHtml(noteErr)}</div>` : ''}
+            ${r.has_body ? `
+              <div style="display:flex; justify-content:flex-end; margin-top:6px;">
+                <button class="btn btn-outline btn-sm" style="font-size:11px; padding:2px 8px;" data-id="${escapeHtml(r.id)}" onclick="viewAisRequestBody(this.dataset.id)">📄 查看报文</button>
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
       return;
     }
 

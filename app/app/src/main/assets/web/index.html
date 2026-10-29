@@ -70,6 +70,21 @@
       </div>
     </div>
 
+    <div class="card" id="aisEngineCard" style="display:none;">
+      <div class="row-between">
+        <div>
+          <div style="font-size: 14px; font-weight: 600;">AIS 引擎服务 <span class="muted mono" id="aisVersionBadge" style="font-size:11px; font-weight:normal;"></span></div>
+          <div class="muted" id="aisEngineSub">加载状态中…</div>
+        </div>
+        <span class="tag tag-online" id="aisEngineStateTag">RUNNING</span>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:12px;">
+        <button class="btn btn-primary btn-sm" style="flex:1;" id="aisStartStopBtn" onclick="toggleAisService()">⏹ 停止服务</button>
+        <button class="btn btn-outline btn-sm" style="flex:1;" onclick="restartAisService()">🔄 重启服务</button>
+        <button class="btn btn-outline btn-sm" style="flex:1;" onclick="openAisConfigModal()">⚙️ 引擎设置</button>
+      </div>
+    </div>
+
     <!-- 概览统计区（AG 引擎展示完整 Token 消费统计；AIS 引擎展示 AIS 概览） -->
     <div id="overviewStatsContainer"></div>
 
@@ -153,8 +168,14 @@
 
   <!-- 5. 日志 -->
   <main id="view-logs" class="tab-content">
-    <div class="section-title">
-      <span id="logTitle">请求日志 (0)</span>
+    <div class="section-title" style="flex-wrap: wrap; gap: 8px;">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span id="logTitle">请求日志 (0)</span>
+        <div class="sub-tabs" id="aisLogSubTabs" style="display:none;">
+          <span class="sub-tab active" id="tabAisLogReq" onclick="setAisLogMode('requests')">请求</span>
+          <span class="sub-tab" id="tabAisLogSys" onclick="setAisLogMode('system')">运行</span>
+        </div>
+      </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-outline btn-sm" onclick="clearLogs()">清空</button>
         <button class="btn btn-primary btn-sm" onclick="loadLogs()">刷新</button>
@@ -333,6 +354,9 @@
         <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
           <input type="checkbox" id="aisCfgYoutube" style="accent-color:var(--primary);" /> 允许 YouTube 链接转换
         </label>
+        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+          <input type="checkbox" id="aisCfgBuildNative" style="accent-color:var(--primary);" /> Build 通道原生非流式 (Build Native Nonstream)
+        </label>
       </div>
 
       <div style="margin-bottom:14px;">
@@ -344,6 +368,11 @@
           <option value="60">60 秒超时对冲</option>
           <option value="120">120 秒超时对冲</option>
         </select>
+      </div>
+
+      <div style="margin-bottom:14px;">
+        <label class="muted" style="font-size:12px; display:block; margin-bottom:4px;">模型别名映射 (逗号或换行分隔 别名:目标模型)</label>
+        <textarea id="aisCfgModelMapping" class="input-field mono" rows="3" style="font-size:12px; margin-bottom:0; resize:vertical;" placeholder="如: gpt-4o:gemini-2.5-pro,sonnet:gemini-2.5-pro"></textarea>
       </div>
 
       <div style="display: flex; gap: 8px;">

@@ -1340,6 +1340,9 @@ body.standalone .host-only { display: none !important; }
   padding: 3px;
   margin-bottom: 6px;
 }
+.sched-modes-grid.cols-2 {
+  grid-template-columns: repeat(2, 1fr);
+}
 .sched-mode-btn {
   padding: 6px 2px;
   font-size: 11.5px;
