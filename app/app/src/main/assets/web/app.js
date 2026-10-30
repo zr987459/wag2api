@@ -52,6 +52,7 @@ const $ = id => document.getElementById(id);
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+const esc = escapeHtml;
 
 function fmtNum(n) {
   n = Number(n) || 0;
@@ -2885,8 +2886,14 @@ async function submitAgCallback() {
 
 // 导入 / 导出
 function openImportModal() {
+  const jumpEl = $('importAisCookieJump');
   if (engine === 'ais') {
-    openAuthModal();
+    $('importTitle').textContent = '导入 AIS 账号';
+    $('importDesc').textContent = '可粘贴：本 App 导出的 JSON（format wag2api-ais）、wag2api-backup 备份、或单个账号 Cookie（JSON / Netscape / Cookie 头）。';
+    $('importInput').value = '';
+    $('importInput').placeholder = '{ "format": "wag2api-ais", "accounts": [...] } 或 Cookie 内容';
+    if (jumpEl) jumpEl.style.display = 'block';
+    openModal('importModal');
     return;
   }
   if (engine === 'ag' && !agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
@@ -2894,6 +2901,7 @@ function openImportModal() {
   $('importDesc').textContent = '粘贴 Refresh Token（1// 开头，一行一个），或导出的账号 JSON。备份也可以直接粘贴。';
   $('importInput').value = '';
   $('importInput').placeholder = '1//0e... 或 { "accounts": [...] }';
+  if (jumpEl) jumpEl.style.display = 'none';
   openModal('importModal');
 }
 
@@ -2908,6 +2916,100 @@ async function importAis(raw) {
   } catch (e) {
     return { ok: false, msg: e.message || '导入失败' };
   }
+}
+
+async function importAisBundle(bundle) {
+  const list = Array.isArray(bundle && bundle.accounts) ? bundle.accounts : [];
+  if (!list.length) {
+    return { ok: false, msg: '没有可导入的 AIS 账号' };
+  }
+  const existing = new Set();
+  try {
+    const cur = await getJson('/ais/api/accounts');
+    if (Array.isArray(cur && cur.accounts)) {
+      aisAccountsCache = cur.accounts;
+    }
+  } catch (e) { /* 读取失败时回退使用缓存 */ }
+  (aisAccountsCache || []).forEach(a => {
+    if (a && a.id) existing.add(String(a.id).trim().toLowerCase());
+    if (a && a.email) existing.add(String(a.email).trim().toLowerCase());
+    if (a && a.label) existing.add(String(a.label).trim().toLowerCase());
+  });
+
+  const defaultLocale = navigator.language || 'en-US';
+  const defaultTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  let okCount = 0;
+  const skipped = [];
+  const failed = [];
+
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const email = String(item.email || item.id || item.label || '').trim();
+    const key = email.toLowerCase();
+    if (key && existing.has(key)) {
+      skipped.push(email);
+      continue;
+    }
+    const rawState = item.storage_state !== undefined ? item.storage_state : item.cookies;
+    const cookiesStr = typeof rawState === 'string'
+      ? rawState.trim()
+      : (rawState && typeof rawState === 'object' ? JSON.stringify(rawState) : '');
+    if (!cookiesStr) {
+      failed.push(`${email || '未知账号'}：缺少 storage_state`);
+      continue;
+    }
+    const label = String(item.label || '').trim(); // 与上游一致：标签留空，邮箱由 AIS 自行识别
+    const proxy = String(item.proxy || '').trim();
+    const locale = String(item.locale || '').trim() || defaultLocale;
+    const timezone = String(item.timezone || '').trim() || defaultTz;
+    const authUser = item.auth_user !== undefined && item.auth_user !== null ? item.auth_user : 0;
+
+    try {
+      const res = await postJson('/ais/api/accounts/import/cookies', {
+        label,
+        cookies: cookiesStr,
+        cdp: '',
+        proxy,
+        locale,
+        timezone,
+        auth_user: authUser,
+      });
+      const importedId = (res && res.account && res.account.id) || email || label;
+      if (item.enabled === false && importedId) {
+        try {
+          await putJson(`/ais/api/accounts/${encodeURIComponent(importedId)}`, {
+            label: label || importedId,
+            enabled: false,
+            proxy,
+            locale,
+            timezone,
+          });
+        } catch (e) { /* 忽略停用状态同步异常 */ }
+      }
+      if (key) existing.add(key);
+      if (importedId) existing.add(String(importedId).trim().toLowerCase());
+      okCount++;
+    } catch (e) {
+      failed.push(`${email || label || '未知账号'}：${e.message || '导入失败'}`);
+    }
+  }
+
+  if (okCount > 0) {
+    try { await postJson('/ais/api/control/start', {}); } catch (e) { /* 服务可能已在运行 */ }
+    modelCache.ais = null;
+    try {
+      const latest = await getJson('/ais/api/accounts');
+      if (Array.isArray(latest && latest.accounts)) aisAccountsCache = latest.accounts;
+    } catch (e) { /* ignore */ }
+  }
+
+  const lines = [`成功 ${okCount} 个，跳过 ${skipped.length} 个，失败 ${failed.length} 个`];
+  if (skipped.length) lines.push(`已存在跳过：${skipped.join(', ')}`);
+  if (failed.length) lines.push(...failed);
+  return {
+    ok: okCount > 0 || (skipped.length > 0 && failed.length === 0),
+    msg: lines.join('\n'),
+  };
 }
 
 async function importAg(raw) {
@@ -2926,15 +3028,30 @@ async function submitImport() {
     try { parsed = JSON.parse(raw); } catch (e) { /* 纯文本 */ }
     const msgs = [];
     let anyOk = false;
-    if (parsed && parsed.format === 'wag2api-backup') {
+    if (parsed && parsed.format === 'wag2api-ais') {
+      const r = await importAisBundle(parsed);
+      anyOk = r.ok;
+      msgs.push(r.msg);
+    } else if (parsed && parsed.format === 'wag2api-backup') {
+      if (parsed.ais && Array.isArray(parsed.ais.accounts) && parsed.ais.accounts.length) {
+        const r = await importAisBundle(parsed.ais);
+        anyOk = anyOk || r.ok;
+        msgs.push('AIS：' + r.msg);
+      }
       if (parsed.ag && (parsed.ag.accounts || []).length) {
-        if (agReady()) { const r = await importAg(JSON.stringify(parsed.ag)); anyOk = anyOk || r.ok; msgs.push('AG：' + r.msg); }
-        else msgs.push('AG：引擎未运行，已跳过');
+        if (agReady()) {
+          const r = await importAg(JSON.stringify(parsed.ag));
+          anyOk = anyOk || r.ok;
+          msgs.push('AG：' + r.msg);
+        } else {
+          msgs.push('AG：引擎未运行，已跳过');
+        }
       }
       if (parsed.note) msgs.push(parsed.note);
     } else {
       const r = engine === 'ais' ? await importAis(raw) : await importAg(raw);
-      anyOk = r.ok; msgs.push(r.msg);
+      anyOk = r.ok;
+      msgs.push(r.msg);
     }
     const text = msgs.join('\n') || '没有可导入的内容';
     if (msgs.length > 1 || text.includes('\n')) showText('导入结果', '', text);
@@ -2948,16 +3065,12 @@ async function submitImport() {
 async function openExportModal() {
   try {
     if (engine === 'ais') {
-      const exportList = aisAccountsCache.map(a => ({
-        id: a.id,
-        label: a.label,
-        benefit_tier: a.benefit_tier,
-        proxy: a.proxy || '',
-        locale: a.locale || '',
-        timezone: a.timezone || '',
-        models_count: (a.models || []).length,
-      }));
-      showText('AIS 账号环境清单', '注意：出于安全考虑不包含 Cookie 凭据，请妥善保存登录 Cookie。此清单为当前账号环境与权益配置。', JSON.stringify(exportList, null, 2));
+      const d = await getJson('/ais-local/export');
+      showText(
+        '导出 AIS 账号',
+        '包含登录 Cookie，等同账号密码，请妥善保管。可在 AIS 引擎「导入」里粘贴恢复。',
+        JSON.stringify(d, null, 2)
+      );
       return;
     }
     if (!agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
@@ -2967,10 +3080,24 @@ async function openExportModal() {
 }
 
 async function openBackupModal() {
-  const out = { format: 'wag2api-backup', version: 2, exported_at: new Date().toISOString(), ag: null, note: 'AIS 账号不支持导出，请使用 Cookie 重新导入' };
-  if (agReady()) { try { out.ag = await getJson('/api/accounts/export'); } catch (e) { /* 空 */ } }
-  const n = ((out.ag && out.ag.accounts) || []).length;
-  showText('账号备份', `已备份 AG 账号共 ${n} 个（AIS 账号请使用 Cookie 重新导入）。可在 AG 引擎「导入」里粘贴恢复。`, JSON.stringify(out, null, 2));
+  const [aisData, agData] = await Promise.all([
+    getJson('/ais-local/export').catch(() => null),
+    agReady() ? getJson('/api/accounts/export').catch(() => null) : Promise.resolve(null),
+  ]);
+  const out = {
+    format: 'wag2api-backup',
+    version: 2,
+    exported_at: new Date().toISOString(),
+    ais: aisData,
+    ag: agData,
+  };
+  const aisCount = ((out.ais && out.ais.accounts) || []).length;
+  const agCount = ((out.ag && out.ag.accounts) || []).length;
+  showText(
+    '账号备份',
+    `已备份 AIS 账号 ${aisCount} 个、AG 账号 ${agCount} 个（包含登录 Cookie 与 Refresh Token，等同账号密码，请妥善保管）。可在任一引擎「导入」里粘贴恢复。`,
+    JSON.stringify(out, null, 2)
+  );
 }
 
 // ── 3. 接入 ─────────────────────────────────────────────

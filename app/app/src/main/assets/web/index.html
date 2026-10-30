@@ -283,6 +283,9 @@
       <div class="section-title" id="importTitle">导入账号</div>
       <p class="muted" id="importDesc" style="margin-bottom: 10px;"></p>
       <textarea id="importInput" class="input-field mono" rows="6" style="font-size: 12px; resize: vertical;"></textarea>
+      <div id="importAisCookieJump" style="display: none; margin-bottom: 10px;">
+        <button type="button" class="btn btn-outline btn-sm" style="width: 100%;" onclick="closeModal('importModal'); openAuthModal();">🔍 用 Cookie 发现账号导入</button>
+      </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-primary" style="flex: 1;" id="importBtn" onclick="submitImport()">确认导入</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('importModal')">取消</button>

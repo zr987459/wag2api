@@ -8,6 +8,10 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import kotlin.concurrent.thread
 
 class LocalGatewayServer(
@@ -186,6 +190,7 @@ class LocalGatewayServer(
                     path.startsWith("/m/") ||
                     path.startsWith("/api/") ||
                     path.startsWith("/ais/api/") || path == "/ais/api" ||
+                    path.startsWith("/ais-local/") ||
                     path == "/ag" || (path.startsWith("/ag/") && !path.contains("/v1/")) ||
                     path.endsWith(".css") ||
                     path.endsWith(".js") ||
@@ -261,6 +266,31 @@ class LocalGatewayServer(
             // 5. 面板 API
             if (path.startsWith("/panel/api/") || path.startsWith("/m/api/") || path == "/panel/api/status") {
                 dispatchPanelApi(output, method, path, query, body)
+                output.flush()
+                client.close()
+                return
+            }
+
+            // 5.5 AIS 本地账号导出（含 storage-state.json Cookie）
+            if (path == "/ais-local/export") {
+                if (method != "GET") {
+                    val err = JSONObject().put(
+                        "error",
+                        JSONObject().put("message", "Method Not Allowed")
+                    ).toString()
+                    sendJsonResponse(output, 405, err)
+                } else {
+                    try {
+                        val exported = exportAisAccounts()
+                        sendJsonResponse(output, 200, exported.toString())
+                    } catch (e: Exception) {
+                        val err = JSONObject().put(
+                            "error",
+                            JSONObject().put("message", e.message ?: "导出 AIS 账号失败")
+                        ).toString()
+                        sendJsonResponse(output, 500, err)
+                    }
+                }
                 output.flush()
                 client.close()
                 return
@@ -493,6 +523,58 @@ class LocalGatewayServer(
             else -> {
                 sendJsonResponse(output, 200, JSONObject().put("ok", true).put("accounts", JSONArray()).toString())
             }
+        }
+    }
+
+    private fun exportAisAccounts(): JSONObject {
+        val authDir = File(context.filesDir, "ais/auth")
+        val accountsArr = JSONArray()
+        if (authDir.isDirectory) {
+            val dirs = authDir.listFiles()
+                ?.filter { it.isDirectory && !it.name.startsWith(".") }
+                ?.sortedBy { it.name }
+                ?: emptyList()
+            for (dir in dirs) {
+                val stateFile = File(dir, "storage-state.json")
+                if (!stateFile.isFile) continue
+                val storageState = try {
+                    JSONObject(stateFile.readText(Charsets.UTF_8))
+                } catch (e: Exception) {
+                    continue
+                }
+                val accFile = File(dir, "account.json")
+                val accMeta = if (accFile.isFile) {
+                    try {
+                        JSONObject(accFile.readText(Charsets.UTF_8))
+                    } catch (e: Exception) {
+                        JSONObject()
+                    }
+                } else {
+                    JSONObject()
+                }
+                val item = JSONObject().apply {
+                    put("email", dir.name)
+                    put("label", accMeta.optString("label", ""))
+                    put("enabled", accMeta.optBoolean("enabled", true))
+                    put("proxy", accMeta.optString("proxy", ""))
+                    put("locale", accMeta.optString("locale", ""))
+                    put("timezone", accMeta.optString("timezone", ""))
+                    if (accMeta.has("auth_user")) {
+                        put("auth_user", accMeta.optInt("auth_user", 0))
+                    }
+                    put("storage_state", storageState)
+                }
+                accountsArr.put(item)
+            }
+        }
+        val isoNow = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+        return JSONObject().apply {
+            put("format", "wag2api-ais")
+            put("version", 1)
+            put("exported_at", isoNow)
+            put("accounts", accountsArr)
         }
     }
 
