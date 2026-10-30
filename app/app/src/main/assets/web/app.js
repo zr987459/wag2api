@@ -72,6 +72,15 @@ function fmtSec(ms) {
   const s = (n / 1000).toFixed(2);
   return (s === '0.00' ? '<0.01' : s) + 's';
 }
+// 生成速度：输出(含思考) token ÷ (总耗时 − 首字)，首字未知时用总耗时
+function fmtTps(outTok, totalMs, ttftMs) {
+  const t = Number(outTok) || 0, total = Number(totalMs) || 0, ttft = Number(ttftMs) || 0;
+  if (t <= 0 || total <= 0) return '';
+  let gen = total - ttft;
+  if (gen < 200) gen = total;
+  const v = t / (gen / 1000);
+  return (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' tok/s';
+}
 function fmtMs(ms) {
   const n = Number(ms);
   if (ms === null || ms === undefined || ms === '' || isNaN(n) || n <= 0) return '--';
@@ -3459,6 +3468,7 @@ async function loadLogs() {
         const timingParts = [
           r.duration_ms ? fmtMs(r.duration_ms) : '',
           r.first_event_ms ? '首字 ' + fmtMs(r.first_event_ms) : '',
+          fmtTps(repTok + rsnTok, r.duration_ms, r.first_event_ms),
         ].filter(x => x && x !== '--').join(' · ');
 
         const metaParts = [
@@ -3538,7 +3548,7 @@ async function loadLogs() {
           </div>
           <div class="log-detail-row">
             <span class="log-model-text">${escapeHtml(l.model || '')}</span>
-            <span class="log-metrics-text">${[fmtMs(l.ms), l.ttft ? '首字 ' + fmtMs(l.ttft) : ''].filter(x => x && x !== '--').join(' · ')}</span>
+            <span class="log-metrics-text">${[fmtMs(l.ms), l.ttft ? '首字 ' + fmtMs(l.ttft) : '', fmtTps((l.u || {}).output + ((l.u || {}).thoughts || 0), l.ms, l.ttft)].filter(x => x && x !== '--').join(' · ')}</span>
           </div>
           <div class="log-tokens">${tok}</div>
           ${l.timing ? `<div class="muted mono" style="font-size:11px;">${[
