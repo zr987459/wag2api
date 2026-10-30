@@ -63,7 +63,20 @@ function fmtNum(n) {
 }
 
 function fmtPct(r) { return r === null || r === undefined ? '--' : (r * 100).toFixed(1) + '%'; }
-function fmtMs(ms) { return ms === null || ms === undefined || ms === 0 ? '--' : ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
+function fmtSec(ms) {
+  if (ms === null || ms === undefined || ms === '') return '--';
+  const n = Number(ms);
+  if (isNaN(n) || n < 0) return '--';
+  if (n === 0) return '0s';
+  if (n >= 10000) return (n / 1000).toFixed(1) + 's';
+  const s = (n / 1000).toFixed(2);
+  return (s === '0.00' ? '<0.01' : s) + 's';
+}
+function fmtMs(ms) {
+  const n = Number(ms);
+  if (ms === null || ms === undefined || ms === '' || isNaN(n) || n <= 0) return '--';
+  return fmtSec(n);
+}
 
 // 独立运行：standalone=只有 AG；dual=Linux / 源码版（没有安卓宿主）。
 // 设置了 ADMIN_KEY 时管理接口需带密钥
@@ -1585,6 +1598,7 @@ async function loadAisAccounts() {
             </div>
             <div class="account-actions-row" style="margin-top:6px;">
               <button class="btn ${isAuthReq ? 'btn-primary' : 'btn-outline'} btn-sm" style="flex:1;" onclick="openAisReloginCookie('${escId}')">🔑 更新 Cookie</button>
+              <button class="btn btn-outline btn-sm" style="flex:1;" onclick="aisExportAccount('${escId}')">📤 导出</button>
               <button class="btn btn-outline btn-sm" style="flex:1; color:var(--danger); border-color:rgba(239,68,68,0.4);" onclick="aisDeleteAccount('${escId}')">🗑 删除</button>
             </div>
           </div>
@@ -1734,7 +1748,7 @@ async function aisTestAccount(id, btn) {
     const currM = Array.isArray(res.models) ? res.models.length : (res.models ?? (res.account?.models?.length ?? 0));
     const currT = res.tier || res.account?.benefit_tier || 'Free';
     aisTestResults[id] = { ok: true, latency_ms, model: `${currT} · ${currM}个模型` };
-    showToast(`可用 · ${latency_ms}ms`, 'success');
+    showToast(`可用 · ${fmtSec(latency_ms)}`, 'success');
   } catch (e) {
     const latency_ms = Date.now() - start;
     aisRefreshErrors[id] = e.message;
@@ -2102,6 +2116,43 @@ async function aisDeleteAccount(id) {
   }
 }
 
+async function aisExportAccount(id) {
+  try {
+    const d = await getJson('/ais-local/export');
+    const acc = aisAccountsCache.find(a => a.id === id) || {};
+    const targets = new Set(
+      [id, acc.id, acc.email, acc.label]
+        .filter(Boolean)
+        .map(v => String(v).trim().toLowerCase())
+    );
+    const list = Array.isArray(d && d.accounts) ? d.accounts : [];
+    const matched = list.filter(item => {
+      if (!item || typeof item !== 'object') return false;
+      return [item.email, item.id, item.label]
+        .filter(Boolean)
+        .some(v => targets.has(String(v).trim().toLowerCase()));
+    });
+    if (!matched.length) {
+      showToast('未找到该账号的导出数据', 'error');
+      return;
+    }
+    const email = matched[0].email || matched[0].id || acc.label || id;
+    const out = {
+      format: (d && d.format) || 'wag2api-ais',
+      version: (d && d.version) || 1,
+      exported_at: (d && d.exported_at) || new Date().toISOString(),
+      accounts: [matched[0]],
+    };
+    showText(
+      '导出 ' + email,
+      '包含登录 Cookie，等同账号密码，请妥善保管。可在 AIS「导入」里粘贴恢复。',
+      JSON.stringify(out, null, 2)
+    );
+  } catch (e) {
+    showToast('导出失败：' + e.message, 'error');
+  }
+}
+
 function showAccountErrorDetail(label, detail) {
   showText(`账号异常：${label}`, '完整错误原因及堆栈，可复制排查：', detail || '无详细错误信息');
 }
@@ -2124,11 +2175,7 @@ function formatAccountPerfRow(p) {
   const rate = p.success_rate;
   const rateText = (rate === null || rate === undefined) ? '--' : Math.round(Number(rate) * 100) + '%';
   const lat = p.avg_latency_ms;
-  let latText = '--';
-  if (lat !== null && lat !== undefined && Number(lat) > 0) {
-    const num = Number(lat);
-    latText = num >= 1000 ? (num / 1000).toFixed(1) + 's' : Math.round(num) + 'ms';
-  }
+  const latText = fmtMs(lat);
   const failStreak = Number(p.fail_streak) || 0;
   return `
 ${failStreak >= 3 ? `<div class="account-perf-row mono"><span class="fail-streak-warn">连续失败 ${failStreak} 次</span></div>` : ''}
@@ -2138,7 +2185,7 @@ ${failStreak >= 3 ? `<div class="account-perf-row mono"><span class="fail-streak
 function renderAccountTestBanner(res) {
   if (!res) return '';
   if (res.ok) {
-    const lat = res.latency_ms !== null && res.latency_ms !== undefined ? res.latency_ms + 'ms' : '--';
+    const lat = res.latency_ms !== null && res.latency_ms !== undefined ? fmtSec(res.latency_ms) : '--';
     const mod = escapeHtml(res.model || '');
     return `
       <div class="account-test-banner success" style="display:block;">
@@ -2169,7 +2216,7 @@ async function agTestAccount(email, btn) {
     const res = await postJson('/api/accounts/test', { email });
     agTestResults[email] = res || { ok: false, error: '无响应' };
     if (res && res.ok) {
-      showToast(`可用 · ${res.latency_ms ?? 0}ms`, 'success');
+      showToast(`可用 · ${fmtSec(res.latency_ms ?? 0)}`, 'success');
     } else {
       const err = (res && (res.error || res.reply)) || '测试未通过';
       showToast(`测试未通过：${err}`, 'error');
@@ -2390,7 +2437,7 @@ async function loadAgAccounts() {
                 ${agTestingAccounts.has(a.email) ? '<span class="spinner"></span>测试中…' : '⚡ 测试'}
               </button>
               <button class="btn btn-outline btn-sm" onclick="agLoadQuota('${em}', true)">🔄 额度</button>
-              <button class="btn btn-outline btn-sm" onclick="agExportOne('${em}')">📤 导出</button>
+              <button class="btn btn-outline btn-sm" onclick="agExportAccount('${em}')">📤 导出</button>
               <button class="btn btn-outline btn-sm" onclick="agSwitch('${em}')" ${a.isActive ? 'disabled' : ''}>🌟 使用</button>
             </div>
             <div class="account-actions-row">
@@ -2515,10 +2562,27 @@ async function agRemove(email) {
   showToast('已删除', 'success');
   loadAgAccounts();
 }
-async function agExportOne(email) {
-  const d = await getJson('/api/accounts/export?email=' + encodeURIComponent(email));
-  showText('导出账号', '含 Refresh Token，可在任意 wag2api 的 AG 引擎导入。请妥善保管。', JSON.stringify(d, null, 2));
+async function agExportAccount(email) {
+  try {
+    const d = await getJson('/api/accounts/export');
+    const target = String(email || '').trim().toLowerCase();
+    const list = Array.isArray(d && d.accounts) ? d.accounts : [];
+    const matched = list.filter(a => a && String(a.email || a.id || '').trim().toLowerCase() === target);
+    if (!matched.length) {
+      showToast('未找到该账号的导出数据', 'error');
+      return;
+    }
+    const out = { ...d, accounts: [matched[0]] };
+    showText(
+      '导出 ' + (matched[0].email || email),
+      '含 Refresh Token，可在任意 wag2api 的 AG 引擎导入。请妥善保管。',
+      JSON.stringify(out, null, 2)
+    );
+  } catch (e) {
+    showToast('导出失败：' + e.message, 'error');
+  }
 }
+const agExportOne = agExportAccount;
 async function agTestActive(btn) {
   const orig = btn.textContent;
   btn.textContent = '测试中…'; btn.disabled = true;
@@ -3415,11 +3479,11 @@ async function loadLogs() {
             <div class="log-header-row">
               <div class="log-path-wrap">
                 <span class="tag ${ok ? 'tag-online' : 'tag-offline'}">${escapeHtml(r.status || '-')}</span>
-                <span class="log-path-text">${escapeHtml('POST ' + (r.path || '/v1/chat/completions'))}</span>
                 <span class="tag tag-global">${escapeHtml(r.channel || r.protocol || 'ais')}</span>
                 ${(r.state === 'canceled' || r.state === 'rate_limited') ? `<span class="tag tag-warn">${escapeHtml(r.state)}</span>` : ''}
+                <span class="log-path-text">${escapeHtml('POST ' + (r.path || '/v1/chat/completions'))}</span>
               </div>
-              <span class="mono" style="font-size: 11px; color: var(--text-dim);">${escapeHtml(tm)}</span>
+              <span class="log-time mono">${escapeHtml(tm)}</span>
             </div>
             <div class="log-detail-row">
               <span class="log-model-text">${escapeHtml(r.model || '-')}</span>
@@ -3466,11 +3530,11 @@ async function loadLogs() {
           <div class="log-header-row">
             <div class="log-path-wrap">
               <span class="tag ${ok ? 'tag-online' : 'tag-offline'}">${escapeHtml(l.status)}</span>
-              <span class="log-path-text">${escapeHtml(l.path)}</span>
               ${l.stream ? '<span class="tag tag-global">流式</span>' : ''}
               ${l.dg ? `<span class="tag tag-offline" title="${escapeHtml(l.dg.reason || '')}">降级→${escapeHtml(l.dg.to || '?')}</span>` : ''}
+              <span class="log-path-text">${escapeHtml(l.path)}</span>
             </div>
-            <span class="mono" style="font-size: 11px; color: var(--text-dim);">${escapeHtml(tm)}</span>
+            <span class="log-time mono">${escapeHtml(tm)}</span>
           </div>
           <div class="log-detail-row">
             <span class="log-model-text">${escapeHtml(l.model || '')}</span>
@@ -3480,7 +3544,7 @@ async function loadLogs() {
           ${l.timing ? `<div class="muted mono" style="font-size:11px;">${[
             ['token', l.timing.t_token], ['组包', l.timing.t_payload], ['握手', l.timing.conn_reused === false ? l.timing.t_tls : null], ['头', l.timing.t_headers],
             ['思考', l.timing.t_first_thought], ['正文', l.timing.t_first_text],
-          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${v}ms`).join(' · ')}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
+          ].filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k} ${fmtSec(v)}`).join(' · ')}${l.timing.conn_reused === true ? ' · 复用连接' : l.timing.conn_reused === false ? ' · 新建连接' : ''}${l.timing.attempts > 1 ? ` · 尝试 ${l.timing.attempts}` : ''}${l.timing.host ? ` · ${escapeHtml(l.timing.host.split('.')[0])}` : ''}</div>` : ''}
           ${l.who ? `<div class="muted mono" style="font-size:11px;">${escapeHtml(l.who)}</div>` : ''}
           ${l.note ? `<div class="log-note-box">⚠️ ${escapeHtml(l.note)}</div>` : ''}
         </div>`;
