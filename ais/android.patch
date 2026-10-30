@@ -1,10 +1,10 @@
-diff --git a/cmd/aistudio2api/dns_android.go b/cmd/aistudio2api/dns_android.go
+diff --git a/cmd/aistudio2api/dns_fallback.go b/cmd/aistudio2api/dns_fallback.go
 new file mode 100644
-index 0000000..c0bb04c
+index 0000000..4724125
 --- /dev/null
-+++ b/cmd/aistudio2api/dns_android.go
-@@ -0,0 +1,33 @@
-+//go:build android
++++ b/cmd/aistudio2api/dns_fallback.go
+@@ -0,0 +1,44 @@
++//go:build linux || android
 +
 +package main
 +
@@ -12,15 +12,26 @@ index 0000000..c0bb04c
 +	"context"
 +	"net"
 +	"os"
++	"strings"
 +	"time"
 +)
 +
-+// 安卓没有 /etc/resolv.conf，纯 Go 解析器默认问 127.0.0.1:53 会失败，改为直连公共 DNS
++// 安卓没有 /etc/resolv.conf，纯 Go 解析器默认问 127.0.0.1:53 会失败；
++// 此时优先使用宿主传入的 AIS_DNS（逗号分隔），否则直连公共 DNS
 +func init() {
 +	if _, err := os.Stat("/etc/resolv.conf"); err == nil {
 +		return
 +	}
-+	servers := []string{"223.5.5.5:53", "1.1.1.1:53", "8.8.8.8:53"}
++	var servers []string
++	for _, s := range strings.Split(os.Getenv("AIS_DNS"), ",") {
++		if s = strings.TrimSpace(s); s != "" {
++			if _, _, err := net.SplitHostPort(s); err != nil {
++				s = net.JoinHostPort(s, "53")
++			}
++			servers = append(servers, s)
++		}
++	}
++	servers = append(servers, "223.5.5.5:53", "1.1.1.1:53", "8.8.8.8:53")
 +	net.DefaultResolver = &net.Resolver{
 +		PreferGo: true,
 +		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -36,209 +47,4 @@ index 0000000..c0bb04c
 +			return nil, last
 +		},
 +	}
-+}
-diff --git a/go.mod b/go.mod
-index f1e8a36..821fec9 100644
---- a/go.mod
-+++ b/go.mod
-@@ -31,11 +31,12 @@ require (
- 	github.com/vearutop/statigz v1.5.0
- 	github.com/wailsapp/wails/v3 v3.0.0-beta.29
- 	github.com/zaf/g711 v1.4.0
--	golang.org/x/mod v0.41.0
-+	golang.org/x/mod v0.42.0
- 	golang.org/x/net v0.59.0
--	golang.org/x/sys v0.48.0
-+	golang.org/x/sys v0.49.0
- 	golang.org/x/text v0.42.0
- 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-+	modernc.org/sqlite v1.61.0
- )
- 
- require (
-@@ -48,11 +49,12 @@ require (
- 	github.com/bogdanfinn/quic-go-utls v1.0.9-utls // indirect
- 	github.com/bogdanfinn/websocket v1.5.5-barnius // indirect
- 	github.com/coder/websocket v1.8.14 // indirect
-+	github.com/dustin/go-humanize v1.1.0 // indirect
- 	github.com/ebitengine/purego v0.11.1 // indirect
- 	github.com/go-ole/go-ole v1.3.0 // indirect
- 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
- 	github.com/godbus/dbus/v5 v5.2.2 // indirect
--	github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 // indirect
-+	github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50 // indirect
- 	github.com/icza/bitio v1.1.0 // indirect
- 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
- 	github.com/mattn/go-colorable v0.1.14 // indirect
-@@ -60,8 +62,10 @@ require (
- 	github.com/mewkiz/pkg v0.0.0-20250417130911-3f050ff8c56d // indirect
- 	github.com/mewpkg/term v0.0.0-20241026122259-37a80af23985 // indirect
- 	github.com/molecule-man/go-brrr v1.2.0 // indirect
-+	github.com/ncruces/go-strftime v1.1.0 // indirect
- 	github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6 // indirect
- 	github.com/quic-go/qpack v0.6.0 // indirect
-+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
- 	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect
- 	github.com/tklauser/go-sysconf v0.4.0 // indirect
- 	github.com/tklauser/numcpus v0.12.0 // indirect
-@@ -69,4 +73,7 @@ require (
- 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
- 	golang.org/x/crypto v0.57.0 // indirect
- 	google.golang.org/protobuf v1.36.6 // indirect
-+	modernc.org/libc v1.79.0 // indirect
-+	modernc.org/mathutil v1.7.1 // indirect
-+	modernc.org/memory v1.12.1 // indirect
- )
-diff --git a/go.sum b/go.sum
-index ee3a8ca..f8d85cb 100644
---- a/go.sum
-+++ b/go.sum
-@@ -42,6 +42,8 @@ github.com/dlclark/regexp2 v1.11.5 h1:Q/sSnsKerHeCkc/jSTNq1oCm7KiVgUMZRDUoRu0JQZ
- github.com/dlclark/regexp2 v1.11.5/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
- github.com/dlclark/regexp2/v2 v2.5.2 h1:HAsucWRhsqcDzl6Ua9aR8JwYOTzrZyPrF0/FNxJVAI0=
- github.com/dlclark/regexp2/v2 v2.5.2/go.mod h1:avUrQvPaLz2DrFNHJF0taWAFFX2C1GMSSoeiqFjcBmU=
-+github.com/dustin/go-humanize v1.1.0 h1:dbKTrvD0klcbBV/h4AWJdMuZogJACoMlvWIWZ5b2xWg=
-+github.com/dustin/go-humanize v1.1.0/go.mod h1:hc1CvRkJMsgxqjmjMQF3QNRAZBwY8AXBAzKYoSX9sFI=
- github.com/ebitengine/purego v0.11.1 h1:2zpWRSQNVKN4eKsKO9eM1ILDgWfYMY9GwqRmK6XeQ/0=
- github.com/ebitengine/purego v0.11.1/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
- github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e h1:Lf/gRkoycfOBPa42vU2bbgPurFong6zXeFtPoxholzU=
-@@ -63,6 +65,8 @@ github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
- github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
- github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 h1:LMLX+LgTNWpfvCBdFebv6EsYotImrt/Ppc5cXIriCSo=
- github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3/go.mod h1:jl5iWTm0/hd5PjEYEOuwAJ57L/CibdZfrqZ5XA5GrCk=
-+github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50 h1:PlNWJRxu5APSV0pWqfIsZ0qt9OOGHSWfZQ4zvx+WgWs=
-+github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50/go.mod h1:yUo1AMMpsPIDFGuwDK8nLcf8+vvAd5l2O6JDZ6hpwrM=
- github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
- github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
- github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
-@@ -93,6 +97,8 @@ github.com/minio/selfupdate v0.6.0 h1:i76PgT0K5xO9+hjzKcacQtO7+MjJ4JKA8Ak8XQ9DDw
- github.com/minio/selfupdate v0.6.0/go.mod h1:bO02GTIPCMQFTEvE5h4DjYB58bCoZ35XLeBf0buTDdM=
- github.com/molecule-man/go-brrr v1.2.0 h1:dOJU45BC3Gc2WXoxAW0rgCAgVuu2gruAOGncfieA0Jw=
- github.com/molecule-man/go-brrr v1.2.0/go.mod h1:7ybW6/7gA3oKY45jOfVNjSJDtrr6ea4tzbsTkjmQDC4=
-+github.com/ncruces/go-strftime v1.1.0 h1:vtPmPWMkb539RGV9WpWT9EwJGvrOCKvMNI4obWL47Hk=
-+github.com/ncruces/go-strftime v1.1.0/go.mod h1:yVaq7iwCN09vHRrKBrrflXT0M9tTMG2KmZ9Fj7xeG/g=
- github.com/nlnwa/whatwg-url v0.6.2 h1:jU61lU2ig4LANydbEJmA2nPrtCGiKdtgT0rmMd2VZ/Q=
- github.com/nlnwa/whatwg-url v0.6.2/go.mod h1:x0FPXJzzOEieQtsBT/AKvbiBbQ46YlL6Xa7m02M1ECk=
- github.com/oov/audio v0.0.0-20171004131523-88a2be6dbe38 h1:4Upfs5rLQdx7KwBct3bmPYAhWsDDJdx660gYb7Lv9TQ=
-@@ -101,6 +107,8 @@ github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6 h1:jL3a8soXd
- github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6/go.mod h1:OmDBASR4679mdNQnz2pUhc2G8CO2JrUAVFDRBDP/hJE=
- github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
- github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
-+github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
-+github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
- github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=
- github.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
- github.com/shirou/gopsutil/v4 v4.26.9 h1:CaBo/hBFqvlJoLvAQEKdHdf5GD97/MN2ACfyv63+2Ig=
-@@ -155,6 +163,8 @@ golang.org/x/mod v0.15.0/go.mod h1:hTbmBsO62+eylJbnUtE2MGJUyE7QWk4xUqPFrRgJ+7c=
- golang.org/x/mod v0.17.0/go.mod h1:hTbmBsO62+eylJbnUtE2MGJUyE7QWk4xUqPFrRgJ+7c=
- golang.org/x/mod v0.41.0 h1:qJmnOUb4YB+FsEuM3HcWucdZASCPGhsX6uljO6pog0c=
- golang.org/x/mod v0.41.0/go.mod h1:Ek9pY8RKWXwsWvd3rQiHYtMqkjSUV+s1Rj7j4H5Ur6o=
-+golang.org/x/mod v0.42.0 h1:ICeL3t2L30ljSPHHxDnR4fqVcBt/zR2zJAb9juavmQg=
-+golang.org/x/mod v0.42.0/go.mod h1:u5fzIrRInkL8MaO1cbRkUHT64v303YIT5KEqpNr7jRs=
- golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
- golang.org/x/net v0.0.0-20190620200207-3b0461eec859/go.mod h1:z5CRVTTTmAJ677TzLLGU+0bjPO0LkuOLi4/5GtJWs/s=
- golang.org/x/net v0.0.0-20210226172049-e18ecbb05110/go.mod h1:m0MpNAwzfU5UDzcl9v0D8zg8gWTRqZa9RBIspLL5mdg=
-@@ -195,6 +205,8 @@ golang.org/x/sys v0.20.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
- golang.org/x/sys v0.29.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
- golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
- golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
-+golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
-+golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
- golang.org/x/telemetry v0.0.0-20240228155512-f48c80bd79b2/go.mod h1:TeRTkGYfJXctD9OcfyVLyj2J3IxLnKwHJR8f4D8a3YE=
- golang.org/x/term v0.0.0-20201117132131-f5c789dd3221/go.mod h1:Nr5EML6q2oocZ2LXRh80K7BxOlk5/8JxuGnuhpl+muw=
- golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
-@@ -231,3 +243,11 @@ google.golang.org/protobuf v1.36.6 h1:z1NpPI8ku2WgiWnf+t9wTPsn6eP1L7ksHUlkfLvd9x
- google.golang.org/protobuf v1.36.6/go.mod h1:jduwjTPXsFjZGTmRluh+L6NjiWu7pchiJ2/5YcXBHnY=
- gopkg.in/natefinch/lumberjack.v2 v2.2.1 h1:bBRl1b0OH9s/DuPhuXpNl+VtCaJXFZ5/uEFST95x9zc=
- gopkg.in/natefinch/lumberjack.v2 v2.2.1/go.mod h1:YD8tP3GAjkrDg1eZH7EGmyESg/lsYskCTPBJVb9jqSc=
-+modernc.org/libc v1.79.0 h1:9Dvvv++bAMSkSuBzuOFAatbTV5OIoq6Y6FohmD3e7q8=
-+modernc.org/libc v1.79.0/go.mod h1:uT3kR61NsbeKJSLqq83GJwSnZMVLlSjyAz4DfTaBy1M=
-+modernc.org/mathutil v1.7.1 h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vAGGP4jZMCxOU=
-+modernc.org/mathutil v1.7.1/go.mod h1:4p5IwJITfppl0G4sUEDtCr4DthTaT47/N3aT6MhfgJg=
-+modernc.org/memory v1.12.1 h1:nFMiWrpStgZczNl6XI9GnIk/rWhYIyHGUaR04pGbp9g=
-+modernc.org/memory v1.12.1/go.mod h1:/JP4VbVC+K5sU2wZi9bHoq2MAkCnrt2r98UGeSK7Mjw=
-+modernc.org/sqlite v1.61.0 h1:sQi63oLQ9uquAUA4CzOisH35Q3pEszkPBuHM0tFL8CY=
-+modernc.org/sqlite v1.61.0/go.mod h1:f4gr5tbpx2umklaT/QVtbi/50hNdM+4ng+2zMo8KXJ0=
-diff --git a/internal/sqlitedb/sqlitedb.go b/internal/sqlitedb/sqlitedb.go
-index ce19471..ddec7d5 100644
---- a/internal/sqlitedb/sqlitedb.go
-+++ b/internal/sqlitedb/sqlitedb.go
-@@ -1,3 +1,5 @@
-+//go:build cgo
-+
- // Package sqlitedb 以原生 SQLite 打开服务的本地数据库
- package sqlitedb
- 
-diff --git a/internal/sqlitedb/sqlitedb_purego.go b/internal/sqlitedb/sqlitedb_purego.go
-new file mode 100644
-index 0000000..9c2d05b
---- /dev/null
-+++ b/internal/sqlitedb/sqlitedb_purego.go
-@@ -0,0 +1,67 @@
-+//go:build !cgo
-+
-+// Package sqlitedb 以原生 SQLite 打开服务的本地数据库
-+package sqlitedb
-+
-+import (
-+	"context"
-+	"database/sql"
-+	"errors"
-+	"fmt"
-+	"path/filepath"
-+
-+	"net/url"
-+
-+	_ "modernc.org/sqlite"
-+)
-+
-+const incrementalVacuum = 2
-+
-+// dsnPragmas 是纯 Go 驱动每个新连接按顺序执行的设置，增量收缩须在启用 WAL 之前
-+var dsnPragmas = []string{"auto_vacuum(INCREMENTAL)", "busy_timeout(10000)", "journal_mode(WAL)", "synchronous(NORMAL)", "journal_size_limit(524288)"}
-+
-+// Open 打开或创建数据库，非增量收缩的已有库先整理为增量收缩，再交还空闲页
-+func Open(path string) (*sql.DB, error) {
-+	db, err := sql.Open("sqlite", pureDSN(path))
-+	if err != nil {
-+		return nil, err
-+	}
-+	var mode int
-+	if err := db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
-+		return nil, errors.Join(fmt.Errorf("读取收缩模式: %w", err), db.Close())
-+	}
-+	if mode != incrementalVacuum {
-+		if _, err := db.Exec(`VACUUM`); err != nil {
-+			return nil, errors.Join(fmt.Errorf("整理数据库: %w", err), db.Close())
-+		}
-+	}
-+	if err := Reclaim(context.Background(), db); err != nil {
-+		return nil, errors.Join(err, db.Close())
-+	}
-+	return db, nil
-+}
-+
-+// Reclaim 把空闲页交还文件系统并截短 WAL 文件，incremental_vacuum 每交还一页返回一行，读完全部行才交还全部空闲页
-+func Reclaim(ctx context.Context, db *sql.DB) error {
-+	rows, err := db.QueryContext(ctx, `PRAGMA incremental_vacuum`)
-+	if err != nil {
-+		return fmt.Errorf("交还空闲页: %w", err)
-+	}
-+	for rows.Next() {
-+	}
-+	if err := rows.Err(); err != nil {
-+		return fmt.Errorf("交还空闲页: %w", err)
-+	}
-+	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-+		return fmt.Errorf("截短 WAL: %w", err)
-+	}
-+	return nil
-+}
-+
-+func pureDSN(path string) string {
-+	q := url.Values{}
-+	for _, p := range dsnPragmas {
-+		q.Add("_pragma", p)
-+	}
-+	return "file:" + filepath.ToSlash(path) + "?" + q.Encode()
 +}

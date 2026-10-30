@@ -76,7 +76,7 @@ jobs:
         id: ais-cache
         with:
           path: app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so
-          key: ais-${{ hashFiles('ais/UPSTREAM_SHA', 'ais/android.patch') }}-v1
+          key: ais-${{ hashFiles('ais/UPSTREAM_SHA', 'ais/android.patch') }}-sm-v2
 
       - name: 编译 AIS 引擎
         if: steps.ais-cache.outputs.cache-hit != 'true'
@@ -87,7 +87,16 @@ jobs:
           git -C /tmp/ais apply "$GITHUB_WORKSPACE/ais/android.patch"
           (cd /tmp/ais/web && npm ci && npm run build)
           mkdir -p app/app/src/main/jniLibs/arm64-v8a
-          (cd /tmp/ais && CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" ./cmd/aistudio2api)
+          # v0.2.18 起 WAA 用 SpiderMonkey（cgo），按上游 Dockerfile 用 zig 交叉编译为全静态 musl arm64，可直接在安卓上运行
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C /tmp && mv /tmp/zig-x86_64-linux-0.16.0 /tmp/zig
+          SM=v152.0.4-aistudio2api.1
+          mkdir -p /tmp/sm && curl -fsSL "https://github.com/Mag1cFall/firefox/releases/download/$SM/spidermonkey-$SM-linux-arm64.tar.gz" | tar -xz -C /tmp/sm
+          (cd /tmp/ais && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+            CC="/tmp/zig/zig cc -target aarch64-linux-musl" CXX="/tmp/zig/zig c++ -target aarch64-linux-musl" \
+            CGO_CXXFLAGS=-I/tmp/sm/include CGO_LDFLAGS=-L/tmp/sm/lib \
+            go build -trimpath -tags netgo,osusergo -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all'" \
+            -o "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" ./cmd/aistudio2api)
+          file "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" || true
 
       # nodejs-mobile 只保留 arm64，只有 full 用得到
       - name: 缓存 nodejs-mobile

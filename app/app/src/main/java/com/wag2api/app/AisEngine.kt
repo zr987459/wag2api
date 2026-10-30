@@ -97,6 +97,10 @@ object AisEngine {
             val env = pb.environment()
             env["HOME"] = dataDir.absolutePath
             env["TMPDIR"] = ctx.cacheDir.absolutePath
+            // 静态 musl 二进制：安卓没有 /etc/resolv.conf 与 /etc/ssl，显式给出系统 DNS 与证书目录
+            systemDns(ctx)?.let { env["AIS_DNS"] = it }
+            env["SSL_CERT_DIR"] = listOf("/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts")
+                .filter { File(it).isDirectory }.joinToString(":")
             pb.redirectErrorStream(true)
 
             val p = pb.start()
@@ -125,12 +129,22 @@ object AisEngine {
         }
     }
 
+    private fun systemDns(ctx: Context): String? = try {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val lp = cm.getLinkProperties(cm.activeNetwork)
+        lp?.dnsServers?.mapNotNull { it.hostAddress }
+            ?.map { if (it.contains(':')) "[${it.substringBefore('%')}]:53" else "$it:53" }
+            ?.joinToString(",")?.ifEmpty { null }
+    } catch (e: Exception) {
+        null
+    }
+
     private fun updateEnvFile(dataDir: File) {
         val envFile = File(dataDir, ".env")
         val overrides = linkedMapOf(
             "LISTEN_ADDR" to "127.0.0.1:8820",
             "PREVIEW_LISTEN_ADDR" to "127.0.0.1:8821",
-            "WAA_BACKEND" to "go",
+            "WAA_BACKEND" to "spidermonkey",
             "AUTO_START" to "true",
             "AISTUDIO_AUTH_STATES" to "auth",
             "WARM_WORKER_LIMIT" to "1",
