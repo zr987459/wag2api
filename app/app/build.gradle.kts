@@ -12,6 +12,9 @@ val versionProps = Properties().apply {
 val appVersionCode = versionProps.getProperty("VERSION_CODE").trim().toInt()
 val appVersionName = versionProps.getProperty("VERSION_NAME").trim()
 
+// AIS 后端：webview（默认，系统 WebView 实现，不打包 libaistudio2api.so）或 go（-PaisBackend=go，Go + SpiderMonkey 子进程）
+val aisBackend = ((project.findProperty("aisBackend") as String?) ?: "webview").trim().lowercase()
+
 android {
     namespace = "com.wag2api.app"
     compileSdk = 34
@@ -26,6 +29,12 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
         // 只保留中英文资源，去掉依赖库带来的几十种语言
         resourceConfigurations += listOf("zh", "en")
+        buildConfigField("String", "AIS_BACKEND", "\"$aisBackend\"")
+    }
+
+    testOptions {
+        // JVM 单测：android.* 调用返回默认值（单测只覆盖纯 JVM 的协议代码）
+        unitTests.isReturnDefaultValues = true
     }
 
     signingConfigs {
@@ -93,6 +102,8 @@ android {
             // useLegacyPackaging=false 时安装器不会把 .so 解压到 nativeLibraryDir，文件不存在就无法 exec，
             // 而 Android 10+ 又禁止从 filesDir 执行文件，所以这里必须保持 true（合同 M5 条目的例外，见 PR 说明）。
             useLegacyPackaging = true
+            // WebView 版 AIS 不需要 Go 二进制：即使本地 jniLibs 里有，也不打进 APK
+            if (aisBackend == "webview") excludes += setOf("**/libaistudio2api.so")
         }
     }
 
@@ -111,6 +122,12 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     // M3 UpstreamFetch.client 与 EngineRouter 用；全局只建一个 OkHttpClient
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // WebView 版 AIS：多 Profile（每账号独立 Cookie）、WebMessageListener、去掉 X-Requested-With、改写 UA Client Hints
+    implementation("androidx.webkit:webkit:1.11.0")
+
+    testImplementation("junit:junit:4.13.2")
+    // Android 自带的 org.json 在 JVM 单测里是空桩，单测用真实实现
+    testImplementation("org.json:json:20231013")
     // 已删：core-ktx（无 ktx 扩展调用，通知改平台 API）、material（无引用）、
     //       okhttp-sse（无引用）、kotlinx-coroutines（合同规定不用协程）
 }
