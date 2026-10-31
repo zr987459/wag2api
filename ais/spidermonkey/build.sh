@@ -86,9 +86,7 @@ cp "$JS_A" "$PKG/lib/libjs_static.a"
 if [ -n "$RS_A" ]; then
   cp "$RS_A" "$PKG/lib/libjsrust.a"
 else
-  # 新版构建把 Rust 部分并进了 libjs_static.a；AIS 的 cgo 仍写 -ljsrust，放一个空归档保持目录结构兼容
-  echo "::notice::没有单独的 libjsrust.a（Rust 代码已在 libjs_static.a 内），生成空归档"
-  llvm-ar rc "$PKG/lib/libjsrust.a"
+  echo "找不到 libjsrust.a"; exit 1
 fi
 llvm-strip --strip-debug "$PKG/lib/libjs_static.a" "$PKG/lib/libjsrust.a" || true
 mkdir -p "$(dirname "$OUT")"
