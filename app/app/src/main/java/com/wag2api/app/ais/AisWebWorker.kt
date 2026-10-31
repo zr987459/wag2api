@@ -575,11 +575,8 @@ class AisWebWorker(
 
     @Synchronized
     private fun saveMeta(edit: (JSONObject) -> Unit) {
-        try {
-            val m = readMeta()
-            edit(m)
-            File(dir, "account.json").writeText(m.toString(), Charsets.UTF_8)
-        } catch (_: Throwable) {}
+        // [beta] 与引擎共用一把锁读-改-写，不会覆盖引擎刚写的模型表/权益/更新时间
+        try { AisAccountInfo.update(dir, edit) } catch (_: Throwable) {}
     }
 
     companion object {

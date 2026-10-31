@@ -80,7 +80,10 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
     private val workers = ConcurrentHashMap<String, AisWebWorker>()
     private val cooldownUntil = ConcurrentHashMap<String, Long>()
     private val logBuf = ArrayDeque<String>()
-    private val records = ArrayDeque<JSONObject>()
+    /** [beta] 请求账本（持久化到 filesDir/ais/usage.jsonl，重启后概览统计仍在） */
+    private val ledger: AisUsageLedger by lazy { AisUsageLedger(File(ctx.filesDir, "ais/usage.jsonl")) }
+    /** 当前线程正在处理的对话请求的入口协议（每个请求一个线程） */
+    private val curProtocol = ThreadLocal<String>()
     @Volatile private var dataPlaneOn = true
     @Volatile private var lastModels: List<MakerSuiteWire.ModelInfo> = emptyList()
     private var rr = 0
@@ -167,9 +170,33 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         .filter { it.isDirectory && !it.name.startsWith(".") && File(it, "storage-state.json").isFile }
         .sortedBy { it.name }
 
-    private fun meta(dir: File): JSONObject = try { JSONObject(File(dir, "account.json").readText(Charsets.UTF_8)) } catch (e: Exception) { JSONObject() }
+    private fun meta(dir: File): JSONObject = AisAccountInfo.read(dir)
 
-    private fun writeMeta(dir: File, m: JSONObject) = File(dir, "account.json").writeText(m.toString(), Charsets.UTF_8)
+    /** [beta] 只覆盖 m 里给出的键，其余（模型表、权益、更新时间等）保留 */
+    private fun writeMeta(dir: File, m: JSONObject) { AisAccountInfo.update(dir) { cur -> for (k in m.keys()) cur.put(k, m.get(k)) } }
+
+    /**
+     * [beta] 测试/刷新/初始化成功后把模型列表、权益、更新时间写回 account.json（重启后仍在）。
+     * 返回变化（刷新接口回给控制台显示「权益: A → B · 模型: x → y」）。
+     */
+    private fun persistAccountInfo(id: String, w: AisWebWorker): AisAccountInfo.Change? {
+        val ids = w.models.map { it.id }
+        if (ids.isEmpty()) return null
+        var change: AisAccountInfo.Change? = null
+        AisAccountInfo.update(File(authDir, id)) { m -> change = AisAccountInfo.applyRefresh(m, ids, System.currentTimeMillis(), w.email) }
+        return change
+    }
+
+    /** [beta] 对话/模型接口里初始化出的模型表和已存的不同才写，避免每次请求都写文件 */
+    private fun persistIfChanged(id: String, w: AisWebWorker) {
+        if (w.models.isEmpty()) return
+        val stored = AisAccountInfo.modelIds(meta(File(authDir, id)))
+        if (stored != w.models.map { it.id }) persistAccountInfo(id, w)
+    }
+
+    private fun recordError(id: String, msg: String?) {
+        try { AisAccountInfo.update(File(authDir, id)) { it.put("last_error", (msg ?: "").take(300)) } } catch (_: Exception) {}
+    }
 
     private fun accountState(id: String, m: JSONObject): Pair<String, String?> {
         if (!m.optBoolean("enabled", true)) return "disabled" to null
@@ -199,8 +226,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
             .put("message", msg ?: JSONObject.NULL)
             .put("auth_user", m.optInt("auth_user", 0))
             .put("proxy", m.optString("proxy", ""))
-            .put("locale", m.optString("locale", ""))
-            .put("timezone", m.optString("timezone", ""))
+            .also { AisAccountInfo.putCardFields(it, m, w?.models?.map { x -> x.id } ?: emptyList(), Locale.getDefault().toLanguageTag(), TimeZone.getDefault().id) }
             .put("webview", JSONObject()
                 .put("phase", w?.phase?.name ?: "NEW")
                 .put("page", w?.pageUrl ?: "")
@@ -238,7 +264,50 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         workers.remove(dir.name)?.close()
         cooldownUntil.remove(dir.name)
         log("导入账号 ${dir.name}（${st.cookies.size} 个 Cookie）")
+        // [beta] 导入后后台初始化一次，把模型列表/权益/更新时间写回卡片（失败只记日志；随后点「刷新」会复用这次初始化）
+        val id = dir.name
+        if (dataPlaneOn) Thread({
+            try { refreshAccount(id) } catch (e: Exception) { log("导入后初始化账号 $id 失败：${e.message}") }
+        }, "ais-wv-import").apply { isDaemon = true }.start()
         return accountJson(dir)
+    }
+
+    /**
+     * [beta] 测试/刷新账号：
+     *  - WebView 刚创建或正在初始化（例如导入后的后台初始化）：等它完成，不重复加载页面；
+     *  - 已就绪：重新拉一次模型表（同时验证登录仍有效），失败再重建 WebView；
+     *  - 其他：重建 WebView 并初始化。
+     * 成功后写回模型列表、权益、更新时间。
+     */
+    private fun refreshAccount(id: String): Pair<AisWebWorker, AisAccountInfo.Change?> {
+        cooldownUntil.remove(id)
+        var w = workers[id]
+        if (w != null && w.phase == AisWebWorker.Phase.READY) {
+            try {
+                w.inflight.incrementAndGet()
+                try {
+                    val fresh = MakerSuiteWire.parseModels(w.rpcUnary("ListModels", "[]", 30_000))
+                    if (fresh.isNotEmpty()) w.models = fresh
+                } finally { w.inflight.decrementAndGet() }
+            } catch (e: Exception) {
+                log("[$id] 刷新模型表失败，重建 WebView：${e.message}")
+                workers.remove(id)?.close(); w = null
+            }
+        } else if (w != null && (w.phase == AisWebWorker.Phase.FAILED || w.phase == AisWebWorker.Phase.AUTH_REQUIRED || w.phase == AisWebWorker.Phase.CLOSED)) {
+            // NEW / BOOTING：别的线程刚建好或正在初始化，ensureReady 会等它完成
+            workers.remove(id)?.close(); w = null
+        }
+        val worker = w ?: workerFor(id)
+        try {
+            worker.ensureReady()
+            if (worker.models.isEmpty()) worker.models = MakerSuiteWire.parseModels(worker.rpcUnary("ListModels", "[]", 30_000))
+        } catch (e: Exception) {
+            recordError(id, e.message)
+            throw e
+        }
+        worker.lastUsed = System.currentTimeMillis()
+        if (worker.models.isNotEmpty()) lastModels = worker.models
+        return worker to persistAccountInfo(id, worker)
     }
 
     private fun deleteAccount(id: String): Boolean {
@@ -392,8 +461,14 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                 res.sendJson(200, JSONObject().put("cooldowns", arr))
             }
             p == "/api/requests" -> res.sendJson(200, JSONObject().put("requests", JSONArray()))
-            p == "/api/usage/records" -> res.sendJson(200, JSONObject().put("items", JSONArray(synchronized(records) { records.toList().reversed() })))
-            p == "/api/usage" -> res.sendJson(200, usageSummary())
+            p == "/api/usage/records" -> {
+                val (from, to) = range(req, 7 * 86_400_000L)
+                res.sendJson(200, JSONObject().put("items", ledger.records(from, to, req.query["limit"]?.toIntOrNull() ?: 100)))
+            }
+            p == "/api/usage" -> {
+                val (from, to) = range(req, 86_400_000L)
+                res.sendJson(200, ledger.report(from, to, req.query["bucket"]?.toLongOrNull() ?: 3600L, req.query["tz"]))
+            }
             p == "/api/logs" -> res.sendJson(200, JSONObject().put("logs", JSONArray(getLogs())).put("lines", JSONArray(getLogs())))
             p == "/api/webview" -> res.sendJson(200, webviewDiag())
             else -> res.sendJson(404, errorObj("WebView 版 AIS 原型未实现 $m $p", "not_found"))
@@ -418,14 +493,17 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
             }
             segs.size == 1 -> res.sendJson(200, JSONObject().put("account", accountJson(dir)))
             segs.getOrNull(1) == "refresh" || segs.getOrNull(1) == "test" -> {
-                // 重新初始化 WebView 并拉一次模型表，当作“测试账号”
-                workers.remove(id)?.close()
-                cooldownUntil.remove(id)
                 try {
-                    val w = workerFor(id)
-                    w.ensureReady()
-                    if (w.models.isNotEmpty()) lastModels = w.models
-                    res.sendJson(200, JSONObject().put("ok", true).put("account", accountJson(dir)).put("models", w.models.size))
+                    val prev = meta(dir)
+                    val (w, ch) = refreshAccount(id)
+                    val acc = accountJson(dir)
+                    res.sendJson(200, JSONObject().put("ok", true).put("account", acc)
+                        .put("models", w.models.size)
+                        .put("model_list", JSONArray(w.models.map { it.id }))
+                        .put("previous_models", ch?.previousModels ?: AisAccountInfo.modelIds(prev).size)
+                        .put("tier", ch?.tier ?: acc.opt("benefit_tier"))
+                        .put("previous_tier", ch?.previousTier ?: AisAccountInfo.tier(prev) ?: JSONObject.NULL)
+                        .put("refreshed_at", acc.opt("refreshed_at")))
                 } catch (e: Exception) {
                     res.sendJson(502, errorObj(e.message ?: "初始化失败", "api_error").put("account", accountJson(dir)))
                 }
@@ -473,27 +551,31 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
 
     private fun iso(ms: Long) = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(ms))
 
-    private fun usageSummary(): JSONObject {
-        var ok = 0; var failed = 0; var limited = 0; var inTok = 0L; var outTok = 0L; var cached = 0L
-        synchronized(records) {
-            for (r in records) {
-                val st = r.optInt("status")
-                when { st == 200 -> ok++; st == 429 -> limited++; else -> failed++ }
-                inTok += r.optLong("input_tokens"); outTok += r.optLong("output_tokens"); cached += r.optLong("cached_tokens")
+    /** from/to 查询参数（ISO 或毫秒），缺省为最近 [defaultSpan] */
+    private fun range(req: Req, defaultSpan: Long): Pair<Long, Long> {
+        val now = System.currentTimeMillis()
+        fun parse(v: String?): Long? {
+            if (v.isNullOrEmpty()) return null
+            v.toLongOrNull()?.let { return it }
+            for (f in listOf("yyyy-MM-dd'T'HH:mm:ss.SSSX", "yyyy-MM-dd'T'HH:mm:ssX")) {
+                try { return SimpleDateFormat(f, Locale.US).parse(v)?.time } catch (_: Exception) {}
             }
+            return null
         }
-        val totals = JSONObject().put("succeeded", ok).put("failed", failed).put("rate_limited", limited)
-            .put("input_tokens", inTok).put("output_tokens", outTok).put("cached_tokens", cached)
-        return JSONObject().put("totals", totals).put("buckets", JSONArray()).put("items", JSONArray())
+        val to = parse(req.query["to"]) ?: now
+        val from = parse(req.query["from"]) ?: (to - defaultSpan)
+        return from to to
     }
 
+    /** usage 为 SseStreamer / Usage.normalizeGeminiUsage 的口径：input 不含缓存，output 含思考 */
     private fun record(account: String?, model: String, status: Int, stream: Boolean, startMs: Long, usage: JSONObject?, error: String?) {
-        val r = JSONObject().put("time", iso(System.currentTimeMillis())).put("account_id", account ?: "").put("model", model)
-            .put("status", status).put("stream", stream).put("latency_ms", System.currentTimeMillis() - startMs)
-            .put("input_tokens", usage?.optLong("input_tokens") ?: 0).put("output_tokens", usage?.optLong("output_tokens") ?: 0)
-            .put("cached_tokens", usage?.optLong("cached_tokens") ?: 0)
-        if (error != null) r.put("error", error.take(300))
-        synchronized(records) { if (records.size >= 200) records.removeFirst(); records.addLast(r) }
+        val isOai = curProtocol.get() != "anthropic"
+        val out = usage?.optLong("output_tokens") ?: 0L
+        val thoughts = usage?.optLong("thoughts_tokens") ?: 0L
+        val fe = usage?.opt("ttft_ms").let { if (it is Number && it.toLong() > 0) it.toLong() else null }
+        ledger.add(account, model, status, stream, if (isOai) "openai" else "anthropic", if (isOai) "/v1/chat/completions" else "/v1/messages",
+            startMs, System.currentTimeMillis(), usage?.optLong("input_tokens") ?: 0L, usage?.optLong("cached_tokens") ?: 0L,
+            Math.max(0L, out - thoughts), thoughts, fe, error)
     }
 
     // ------------------------------------------------------------------ 模型
@@ -507,6 +589,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                     w.ensureReady()
                     w.lastUsed = System.currentTimeMillis()
                     if (w.models.isEmpty()) w.models = MakerSuiteWire.parseModels(w.rpcUnary("ListModels", "[]", 30_000))
+                    persistIfChanged(id, w)
                     list = w.models
                     if (list.isNotEmpty()) break
                 } catch (e: Exception) {
@@ -530,6 +613,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
 
     private fun handleChat(req: Req, res: AgServer.AgResponse, isOai: Boolean) {
         val start = System.currentTimeMillis()
+        curProtocol.set(if (isOai) "openai" else "anthropic")
         if (!dataPlaneOn) { sendError(res, isOai, 503, "AIS 服务已停止"); return }
         val raw = try { JSONObject(req.body) } catch (e: Exception) { sendError(res, isOai, 400, "请求体不是 JSON"); return }
         val anthropicReq = try { if (isOai) OpenaiAgConverter.openaiRequestToAnthropic(raw) else raw } catch (e: Exception) {
@@ -561,6 +645,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                         lastErr = e.message; lastStatus = if (w.phase == AisWebWorker.Phase.AUTH_REQUIRED) 401 else 502
                         continue
                     }
+                    persistIfChanged(id, w)
                     val info = (w.models.ifEmpty { lastModels }).firstOrNull { it.id == model }
                     val tz = meta(File(authDir, id)).optString("timezone", "").ifEmpty { TimeZone.getDefault().id }
                     val wire = MakerSuiteWire.buildGenerateContent(model, google, anthropicReq, info, tz)
@@ -643,9 +728,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                         val out = if (isOai) OpenaiAgConverter.convertGoogleToOpenAI(googleData, model) else ContentConverter.convertGoogleToAnthropic(googleData, model)
                         res.sendJson(200, out)
                         val u = googleData.optJSONObject("usageMetadata")
-                        record(id, model, 200, false, start, JSONObject()
-                            .put("input_tokens", u?.optLong("promptTokenCount") ?: 0).put("output_tokens", u?.optLong("candidatesTokenCount") ?: 0)
-                            .put("cached_tokens", u?.optLong("cachedContentTokenCount") ?: 0), null)
+                        record(id, model, 200, false, start, com.wag2api.ag.Usage.normalizeGeminiUsage(u), null)
                         log("[$id] $model 非流式完成（${decoder.frames} 帧，${System.currentTimeMillis() - start}ms）")
                     }
                     return

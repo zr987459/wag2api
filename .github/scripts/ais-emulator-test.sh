@@ -118,6 +118,16 @@ try:
 except Exception: print("")')
 if [ -z "$AID" ]; then say "1b. 面板账号列表为空"; FAIL=1; exit 1; fi
 AIDQ=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$AID")
+# [beta] 账号卡片字段（只打印数量/状态/时间戳，不含账号信息）
+card() { curl -s -m 20 "$BASE/ais/api/accounts" | python3 -c 'import sys,json
+try:
+  a=json.load(sys.stdin).get("accounts",[])[0]
+  ms=a.get("models") if isinstance(a.get("models"),list) else []
+  print("model_count=%s models_len=%d tier=%s refreshed_ms=%s state=%s" % (a.get("model_count",0), len(ms), a.get("benefit_tier"), a.get("refreshed_at_ms") or 0, a.get("state","?")))
+except Exception: print("model_count=0 models_len=0 tier=None refreshed_ms=0 state=?")'; }
+kv() { echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }
+BEFORE=$(card)
+say "   刷新前卡片: $BEFORE"
 code=$(curl -s -m 300 -o "$OUT/.resp.json" -w '%{http_code}' -X POST "$BASE/ais/api/accounts/$AIDQ/refresh" -H 'content-type: application/json' --data-binary '{}')
 RINFO=$(python3 -c 'import json,sys
 try:
@@ -139,6 +149,15 @@ try:
 except Exception: print("?")')
 say "   面板账号卡片: $STATE"
 case "$STATE" in *"UI thread"*) FAIL=1 ;; esac
+# [beta] 刷新后账号列表接口：模型数 >0、models 数组非空、权益有值、更新时间比刷新前新且接近设备当前时间
+AFTER=$(card)
+DEV_NOW=$(adb shell date +%s 2>/dev/null | tr -d '\r')
+B_MS=$(kv "$BEFORE" refreshed_ms); A_MS=$(kv "$AFTER" refreshed_ms); A_MC=$(kv "$AFTER" model_count); A_ML=$(kv "$AFTER" models_len); A_T=$(kv "$AFTER" tier)
+AGE=$(( ${DEV_NOW:-0} - ${A_MS:-0} / 1000 ))
+say "1c. 刷新后账号列表: $AFTER（距设备当前 ${AGE}s）"
+if [ "${A_MC:-0}" -le 0 ] || [ "${A_ML:-0}" -le 0 ] || [ "$A_T" = "None" ] || [ "${A_MS:-0}" -le "${B_MS:-0}" ] || [ "$AGE" -lt -5 ] || [ "$AGE" -gt 600 ]; then
+  say "   ::error::刷新结果没有写回账号列表（模型数/权益/更新时间）"; FAIL=1
+fi
 
 # 2. 模型列表（第一次会创建 WebView 并完成 WAA 初始化，给足时间）
 code=$(curl -s -m 300 -o "$OUT/.resp.json" -w '%{http_code}' "$BASE/ais/v1/models")
@@ -213,6 +232,29 @@ except Exception: print("解析失败")' "$OUT/.resp.json" | redact)
 say "5. /v1/messages: HTTP $code，回复: $TXT"
 [ "$code" = "200" ] || FAIL=1
 
+# [beta] 概览统计 / 请求日志字段（对齐控制台：totals.requests、total_tokens、buckets、groups.account、records.account/duration_ms）
+usage_info() { python3 - "$BASE" <<'PY'
+import json,sys,urllib.request,datetime
+base=sys.argv[1]
+now=datetime.datetime.utcnow(); fr=(now-datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z"); to=(now+datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+try:
+  u=json.load(urllib.request.urlopen(base+"/ais/api/usage?from=%s&to=%s&bucket=3600&tz=UTC"%(fr,to),timeout=20))
+  r=json.load(urllib.request.urlopen(base+"/ais/api/usage/records?from=%s&to=%s&limit=100"%(fr,to),timeout=20))
+  t=u.get("totals",{}); items=r.get("items",[])
+  ok_rec=all(("account" in x and "duration_ms" in x and "state" in x) for x in items)
+  print("requests=%s succeeded=%s total_tokens=%s buckets=%d bucket_req=%d acc_groups=%d records=%d record_fields=%s" % (
+    t.get("requests",0), t.get("succeeded",0), t.get("total_tokens",0), len(u.get("buckets",[])),
+    sum(int(b.get("requests",0)) for b in u.get("buckets",[])), len((u.get("groups") or {}).get("account",[])), len(items), "ok" if ok_rec and items else "bad"))
+except Exception as e: print("requests=0 解析失败 %s" % type(e).__name__)
+PY
+}
+UI=$(usage_info)
+say "6. 概览统计: $UI"
+U_REQ=$(kv "$UI" requests); U_BR=$(kv "$UI" bucket_req); U_REC=$(kv "$UI" records); U_AG=$(kv "$UI" acc_groups)
+if [ "${U_REQ:-0}" -lt 3 ] || [ "${U_BR:-0}" != "${U_REQ:-0}" ] || [ "${U_REC:-0}" -lt 3 ] || [ "$(kv "$UI" record_fields)" != "ok" ] || [ "${U_AG:-0}" -lt 1 ]; then
+  say "   ::error::概览统计字段不对"; FAIL=1
+fi
+
 
 # [P4] 内存：请求后（WebView 存活）→ 空闲超过 10 分钟（WebView 应被回收）
 sleep 5
@@ -228,6 +270,24 @@ sleep 30
 say "内存 C：空闲 $(( i * 30 / 60 + 1 )) 分钟左右"
 snap "C 空闲回收后"
 [ "$(live_wv)" = "0" ] || { say "   ::error::空闲后 AIS WebView 未回收"; FAIL=1; }
+# [beta] 重启 App 后账号卡片与统计仍在（只读本地文件，不创建 WebView、不请求 Google）
+adb shell am force-stop "$PKG" >/dev/null 2>&1 || true
+sleep 2
+adb shell am start -n $PKG/com.wag2api.app.MainActivity >/dev/null
+ok=0
+for i in $(seq 1 60); do
+  c=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE/health" || true)
+  [ "$c" = "200" ] && { ok=1; break; }
+  sleep 2
+done
+adb shell input keyevent KEYCODE_HOME >/dev/null 2>&1 || true
+R_CARD=$(card); R_UI=$(usage_info)
+say "7. 重启后: 卡片 $R_CARD；统计 $R_UI"
+R_MC=$(kv "$R_CARD" model_count); R_MS=$(kv "$R_CARD" refreshed_ms); R_REQ=$(kv "$R_UI" requests)
+if [ $ok -ne 1 ] || [ "${R_MC:-0}" -le 0 ] || [ "${R_MS:-0}" -lt "${A_MS:-1}" ] || [ "${R_REQ:-0}" -lt 3 ]; then
+  say "   ::error::重启后账号信息或统计丢失"; FAIL=1
+fi
+
 # 安装体积（debug 包，未经 R8，仅供参考）
 apkdir=$(adb shell pm path "$PKG" 2>/dev/null | tr -d '\r' | head -1 | cut -d: -f2 | xargs dirname 2>/dev/null)
 code_kb=$(adb shell su 0 du -sk "$apkdir" 2>/dev/null | tr -d '\r' | awk '{print $1}')

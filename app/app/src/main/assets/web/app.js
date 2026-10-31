@@ -1386,7 +1386,7 @@ async function loadAccounts() {
 function computeAisAccountPerf(acc) {
   const accId = acc.id;
   const accLabel = acc.label;
-  const records = (aisRecentRecordsCache || []).filter(r => r.account === accId || r.account === accLabel);
+  const records = (aisRecentRecordsCache || []).filter(r => { const ra = r.account || r.account_id; return ra === accId || ra === accLabel; });
   if (!records.length) {
     return { success_rate: null, avg_latency_ms: null, fail_streak: 0 };
   }
@@ -1410,8 +1410,9 @@ function computeAisAccountPerf(acc) {
     }
 
     if (isSucc) succCount++;
-    if (r.duration_ms && Number(r.duration_ms) > 0) {
-      latSum += Number(r.duration_ms);
+    const dur = Number(r.duration_ms || r.latency_ms) || 0;
+    if (dur > 0) {
+      latSum += dur;
       latCount++;
     }
   }
@@ -1424,7 +1425,7 @@ function computeAisAccountPerf(acc) {
 function aisAccountStatusHtml(a) {
   const id = a.id || '';
   const escId = escapeHtml(id);
-  const modelsCount = (a.models && a.models.length) || 0;
+  const modelsCount = Number.isFinite(Number(a.model_count)) && a.model_count !== null ? Number(a.model_count) : ((Array.isArray(a.models) && a.models.length) || 0);
   const changeSummary = aisRefreshResults[id] ? ` <span class="muted" style="font-size:11px;">(${escapeHtml(aisRefreshResults[id])})</span>` : '';
 
   const accCds = (aisCooldownsCache || []).filter(cd => cd.account_id === id);
@@ -1439,8 +1440,11 @@ function aisAccountStatusHtml(a) {
     }).join('');
   }
 
-  const timeTs = aisRefreshTimes[id] || aisAccountsLoadedAt;
-  const timeLabel = aisRefreshTimes[id] ? '更新于 ' : '同步于 ';
+  // [beta] 更新时间以服务端持久化的 refreshed_at 为准（重启 App 后仍在），本地记录只作兜底
+  const srvTs = Number(a.refreshed_at_ms) || (a.refreshed_at ? Date.parse(a.refreshed_at) : 0) || 0;
+  const refTs = Math.max(srvTs, aisRefreshTimes[id] || 0);
+  const timeTs = refTs || aisAccountsLoadedAt;
+  const timeLabel = refTs ? '更新于 ' : '同步于 ';
   const timeStr = timeTs ? `${timeLabel}${new Date(timeTs).toLocaleTimeString('zh-CN', { hour12: false })}` : '';
 
   return `
