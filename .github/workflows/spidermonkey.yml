@@ -52,12 +52,13 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld llvm m4 make unzip zip
+          sudo apt-get install -y -qq clang lld llvm libclang-dev m4 make unzip zip
           curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /tmp
           echo "ZIG=/tmp/zig-x86_64-linux-$ZIG_VERSION/zig" >> "$GITHUB_ENV"
           rustup update stable --no-self-update
           rustup default stable
           rustup target add aarch64-unknown-linux-musl
+          cargo install --locked cbindgen
           rustc --version; clang --version | head -1; /tmp/zig-x86_64-linux-$ZIG_VERSION/zig version
 
       - name: 拉取上游 Firefox 源码（浅克隆指定提交）
