@@ -107,6 +107,39 @@ except Exception: print("   错误: 无法解析")' "$OUT/.import.out" | redact 
   FAIL=1; exit 1
 fi
 
+# 1b. [beta] 控制台面板路径：账号「刷新/测试」（真机 v2.0.0-beta.1 在这里报 Must be called on the UI thread）
+MP=$(curl -s -m 20 "$BASE/ais/api/webview" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("multi_profile"))
+except Exception: print("?")')
+say "   WebView 多 Profile: $MP"
+AID=$(curl -s -m 20 "$BASE/ais/api/accounts" | python3 -c 'import sys,json
+try:
+  a=json.load(sys.stdin).get("accounts",[]); print(a[0]["id"] if a else "")
+except Exception: print("")')
+if [ -z "$AID" ]; then say "1b. 面板账号列表为空"; FAIL=1; exit 1; fi
+AIDQ=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$AID")
+code=$(curl -s -m 300 -o "$OUT/.resp.json" -w '%{http_code}' -X POST "$BASE/ais/api/accounts/$AIDQ/refresh" -H 'content-type: application/json' --data-binary '{}')
+RINFO=$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1])); acc=d.get("account") or {}
+  err=(d.get("error") or {}).get("message","") if isinstance(d.get("error"),dict) else str(d.get("error") or "")
+  ui="UI thread" in json.dumps(d,ensure_ascii=False)
+  print("models=%s state=%s ui_thread_error=%s %s" % (d.get("models",0), acc.get("state","?"), "yes" if ui else "no", ("错误: "+err[:150]) if err else ""))
+except Exception: print("models=0 解析失败")' "$OUT/.resp.json" | redact)
+say "1b. 面板 刷新/测试账号: HTTP $code，$RINFO"
+case "$RINFO" in
+  *"ui_thread_error=yes"*) FAIL=1 ;;
+esac
+RM=$(echo "$RINFO" | sed -n 's/^models=\([0-9]*\).*/\1/p')
+if [ "$code" != "200" ] || [ -z "$RM" ] || [ "$RM" -le 0 ]; then FAIL=1; fi
+# 再查一次账号卡片状态（控制台展示用）
+STATE=$(curl -s -m 20 "$BASE/ais/api/accounts" | python3 -c 'import sys,json
+try:
+  a=json.load(sys.stdin).get("accounts",[])[0]; print(a.get("state","?"), "message=" + ("UI thread" if "UI thread" in str(a.get("message")) else ("有" if a.get("message") else "无")))
+except Exception: print("?")')
+say "   面板账号卡片: $STATE"
+case "$STATE" in *"UI thread"*) FAIL=1 ;; esac
+
 # 2. 模型列表（第一次会创建 WebView 并完成 WAA 初始化，给足时间）
 code=$(curl -s -m 300 -o "$OUT/.resp.json" -w '%{http_code}' "$BASE/ais/v1/models")
 read -r N MODEL < <(python3 -c 'import json,sys

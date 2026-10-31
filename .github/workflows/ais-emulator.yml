@@ -48,7 +48,7 @@ jobs:
         env:
           AIS_TEST_COOKIE: ${{ secrets.AIS_TEST_COOKIE }}
         with:
-          api-level: 34
+          api-level: 35  # [beta] API 35 自带的 WebView 支持 MULTI_PROFILE，与真机一致（API 34 镜像的 WebView 113 不支持，复现不了主线程问题）
           target: google_apis
           arch: x86_64
           profile: pixel_6

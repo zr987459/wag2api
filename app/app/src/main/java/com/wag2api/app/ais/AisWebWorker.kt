@@ -363,19 +363,26 @@ class AisWebWorker(
         web = w
     }
 
+    /** 只能在主线程调用（ProfileStore / Profile.getCookieManager 会检查）；后台线程请用 [withCookies] */
     private fun cookieManager(): CookieManager =
         if (multiProfile()) ProfileStore.getInstance().getOrCreateProfile(profileName).cookieManager else CookieManager.getInstance()
 
+    /** [beta] 在主线程上拿到本账号的 CookieManager 并执行 block，调用线程等待结果 */
+    private fun <T> withCookies(block: (CookieManager) -> T): T = MainThread.call(10_000) { block(cookieManager()) }
+
+    /** 本账号对 aistudio 可见的 Cookie 串（主线程读取） */
+    private fun liveCookieHeader(): String? = withCookies { it.getCookie(StorageState.AISTUDIO_ORIGIN + "/") }
+
     private fun installCookies(state: StorageState, meta: JSONObject) {
-        val cm = cookieManager()
         // 独立 Profile 里已经有登录 Cookie 且导入后装过：沿用 WebView 自己维护（已轮换）的 Cookie
-        val existing = Sapisid.parseCookieHeader(cm.getCookie(StorageState.AISTUDIO_ORIGIN + "/"))
+        val existing = Sapisid.parseCookieHeader(liveCookieHeader())
         if (multiProfile() && meta.optBoolean("cookies_installed", false) && !existing["SAPISID"].isNullOrEmpty()) {
             log("[$accountId] 沿用 WebView Profile 里的 Cookie")
             return
         }
         val done = CountDownLatch(1)
         onMain {
+            val cm = cookieManager()
             cm.removeAllCookies {
                 for (c in state.cookies) cm.setCookie(c.url(), c.setCookieHeader())
                 cm.flush()
@@ -383,7 +390,7 @@ class AisWebWorker(
             }
         }
         if (!done.await(15, TimeUnit.SECONDS)) throw IOException("写入 Cookie 超时")
-        val after = Sapisid.parseCookieHeader(cm.getCookie(StorageState.AISTUDIO_ORIGIN + "/"))
+        val after = Sapisid.parseCookieHeader(liveCookieHeader())
         val missing = StorageState.REQUIRED_COOKIES.filter { after[it].isNullOrEmpty() }
         if (missing.isNotEmpty()) {
             phase = Phase.AUTH_REQUIRED
@@ -398,7 +405,7 @@ class AisWebWorker(
         try {
             val f = File(dir, "storage-state.json")
             if (!f.isFile) return
-            val live = Sapisid.parseCookieHeader(cookieManager().getCookie(StorageState.AISTUDIO_ORIGIN + "/"))
+            val live = Sapisid.parseCookieHeader(liveCookieHeader())
             if (live.isEmpty()) return
             val doc = JSONObject(f.readText(Charsets.UTF_8))
             val cs = doc.optJSONArray("cookies") ?: return
@@ -438,7 +445,7 @@ class AisWebWorker(
     }
 
     /** 当前对 aistudio 可见的 Cookie 生成的 Authorization（不落日志） */
-    fun authorization(): String = Sapisid.authorization(Sapisid.parseCookieHeader(cookieManager().getCookie(StorageState.AISTUDIO_ORIGIN + "/")))
+    fun authorization(): String = Sapisid.authorization(Sapisid.parseCookieHeader(liveCookieHeader()))
 
     /** 页面内发出的一次 RPC；next() 依次给出 {t:h,status} / {t:d,s} / {t:end} / {t:err,e} */
     inner class Stream(val id: String, private val q: LinkedBlockingQueue<JSONObject>) {
@@ -548,14 +555,7 @@ class AisWebWorker(
         pageFinished = null
     }
 
-    private fun onMain(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) { block(); return }
-        val done = CountDownLatch(1)
-        var err: Throwable? = null
-        main.post { try { block() } catch (t: Throwable) { err = t } finally { done.countDown() } }
-        if (!done.await(20, TimeUnit.SECONDS)) throw IOException("主线程繁忙")
-        err?.let { throw IOException(it.message ?: it.toString(), it) }
-    }
+    private fun onMain(block: () -> Unit) = MainThread.call(20_000, block)
 
     private fun <T> poll(timeoutMs: Long, intervalMs: Long, probe: () -> T?): T? {
         val end = System.currentTimeMillis() + timeoutMs

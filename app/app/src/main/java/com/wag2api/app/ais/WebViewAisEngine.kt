@@ -247,7 +247,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         workers.remove(id)?.close()
         dir.deleteRecursively()
         if (AisWebWorker.multiProfile()) {
-            try { ProfileStore.getInstance().deleteProfile("ais_" + id.replace(Regex("[^A-Za-z0-9_]"), "_")) } catch (t: Throwable) { log("删除 WebView Profile 失败：${t.message}") }
+            // [beta] ProfileStore 只能在主线程调用
+            try { MainThread.call { ProfileStore.getInstance().deleteProfile("ais_" + id.replace(Regex("[^A-Za-z0-9_]"), "_")) } } catch (t: Throwable) { log("删除 WebView Profile 失败：${t.message}") }
         }
         log("删除账号 $id")
         return true
