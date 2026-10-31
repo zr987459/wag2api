@@ -5,6 +5,7 @@ name: AIS WebView 模拟器实测
 on:
   push:
     branches: ['refactor/v2', 'proto/webview-ais']
+    paths-ignore: ['.github/workflows/publish-prerelease.yml']  # [beta] 只改发布流程时不再真实请求 Google
   workflow_dispatch:
 
 concurrency:

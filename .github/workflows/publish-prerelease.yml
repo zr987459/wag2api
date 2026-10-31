@@ -1,0 +1,56 @@
+name: 发布 v2 预发布（复用已通过实测的 CI 构建）
+
+# [beta] 只在本文件变更时运行：把指定 run 的 apk 产物上传到指定的草稿 Release，校验哈希后发布为 prerelease。
+# 用 GITHUB_TOKEN 发布，生成的 tag 不会再触发 build.yml 的 tag 流程。
+on:
+  push:
+    branches: ['refactor/v2']
+    paths: ['.github/workflows/publish-prerelease.yml']
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SOURCE_RUN_ID: '41202532100'          # build.yml @ 9615228（模拟器实测 41202532210 全部通过）
+  RELEASE_ID: '429942329'               # v2.0.0-beta.2 草稿
+  EXPECTED_SHA256: '16f126770f430538368d8a2d09c42b64a640ab118f51b3b4258ad0ae736c5714'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: dist
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 校验哈希并生成 SHA256SUMS
+        working-directory: dist
+        run: |
+          set -e
+          ls -l
+          sha256sum wag2api.apk > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(cut -d' ' -f1 SHA256SUMS)" = "$EXPECTED_SHA256" ] || { echo "::error::APK 哈希与预期不一致"; exit 1; }
+
+      - name: 上传附件并发布 prerelease
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          API=https://api.github.com/repos/$REPO/releases
+          for f in wag2api.apk SHA256SUMS; do
+            # 已存在同名附件时先删除（可重跑）
+            old=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" "$API/$RELEASE_ID/assets" | jq -r --arg n "$f" '.[]|select(.name==$n)|.id')
+            [ -n "$old" ] && curl -fsS -X DELETE -H "Authorization: Bearer $GH_TOKEN" "$API/assets/$old"
+            ct=application/octet-stream; [ "$f" = SHA256SUMS ] && ct=text/plain
+            curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: $ct" --data-binary @"$f" \
+              "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$f" | jq -r '.name + " " + (.size|tostring)'
+          done
+          curl -fsS -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+            -d '{"draft":false,"prerelease":true}' "$API/$RELEASE_ID" | jq -r '.html_url, .tag_name, .prerelease'
