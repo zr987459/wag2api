@@ -45,10 +45,20 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:compileReleaseKotlin --no-daemon --console=plain
 
-      # AIS（WebView 版）的 JVM 单测（storage-state 解析、请求体构造、流式响应解析）
-      - name: AIS 协议单测
+      # JVM 单测（app/app/src/test）：
+      #  - AIS（WebView 版）：storage-state 解析、请求体构造、流式响应解析
+      #  - AG 引擎（Kotlin）：协议转换 / SSE 解析 / usage 记账 / Schema 清洗 / 数据目录迁移（移植自 tests/*.mjs）
+      - name: JVM 单测（AIS + AG）
         working-directory: app
         run: ./gradlew :app:testReleaseUnitTest --no-daemon --console=plain
+
+      - name: 上传单测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: app/app/build/reports/tests/
+          if-no-files-found: ignore
 
   # ─────────────────────────────────────────────
   # 2. APK：v2 只出一个 wag2api.apk（没有 Node 和 .so：AG 引擎是 Kotlin，AIS 是系统 WebView）
