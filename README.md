@@ -25,7 +25,7 @@
 - 🏠 全程本地运行，账号只存在自己设备上
 - 🎯 **统一入口**：一个端口、一套密钥，同时访问两家上游
 - 🧠 **双引擎独立**：任一上游失效，另一个照常可用
-- 📦 **一个安装包**：`wag2api.apk` 约 1 MB，不含任何原生库，全机型通用
+- 📦 **一个安装包**：`wag2api.apk` 约 961 KB，不含任何原生库，全机型通用
 - 👥 多账号池、自动切换、额度查询
 - 📊 精确 Token 统计与请求日志
 - 🌓 白天 / 黑夜主题自动适配
@@ -39,7 +39,7 @@
 
 | 包 | 适用 | 大小 |
 | --- | --- | --- |
-| `wag2api.apk` | 安卓 7.0+ 全机型，含双引擎 | 约 1 MB |
+| `wag2api.apk` | 安卓 7.0+ 全机型，含双引擎 | 约 961 KB |
 
 AIS 引擎借用系统 WebView（建议在应用商店把 Android System WebView 更新到较新版本）。包名与签名不变，可直接覆盖旧版安装，账号保留。
 
@@ -62,24 +62,20 @@ xz -d wag2api-linux-x64.xz && chmod +x wag2api-linux-x64
 ./wag2api-linux-x64          # 数据保存在 ~/.wag2api
 ```
 
-Linux / 源码版（`node src/server.mjs`）同样是 **WB + AG 双引擎**，界面、`/panel/api/*` 接口与分流规则和安卓一致：
+Linux / 源码版（`node src/server.mjs`）目前只有 **AG 引擎**（AIS 依赖安卓系统 WebView，暂不内置），控制台与安卓共用一份：
 
 | 环境变量 | 作用 |
 | --- | --- |
 | `PORT` / `HOST` | 监听端口与地址（默认 8790 / 0.0.0.0） |
-| `ADMIN_KEY` | 管理密钥；设置后 `/panel/api/*`、`/api/*`、`/v1/*` 都要带 `x-admin-key` / `x-api-key` |
-| `DEFAULT_ENGINE` | 首次启动的默认引擎 `wb`（默认）或 `ag`，之后以界面设置为准 |
-| `WB_ENGINE=0` | 关闭 WB，退回只有 AG 的旧行为 |
-| `DATA_DIR` | 数据目录；WB 账号、统计、设置在 `DATA_DIR/wb/` |
-
-WB 账号也可以直接把官方凭证 `workbuddy-<uid>.json` 放进 `DATA_DIR/wb/auths/`，启动时自动并入。
+| `ADMIN_KEY` | 管理密钥；设置后 `/api/*`、`/v1/*` 都要带 `x-admin-key` / `x-api-key` |
+| `DATA_DIR` | 数据目录 |
 
 > ⚠️ **安全**：默认监听 `0.0.0.0`。如果没设 `ADMIN_KEY`，同一网络 / 公网上的任何人都能调用
-> `/panel/api/tokens/export`、`/api/accounts/export` **导出你全部 WB / AG Token**，并用你的额度调用 `/v1/*`。
+> `/api/accounts/export` **导出你全部 AG Token**，并用你的额度调用 `/v1/*`。
 > 启动日志会醒目警告。对外部署务必设置 `ADMIN_KEY`（足够长的随机串），或只在本机监听 `HOST=127.0.0.1`。
 > 单文件版首次运行会自动生成密钥（`NO_AUTH=1` 可关闭，不建议）。
 
-配置了 `GH_TOKEN` + `GH_REPO`（见 `src/persist.mjs`）时，AG 账号、WB 账号与设置、两边统计都会同步到仓库的 `state` 分支，重新部署后自动恢复。
+配置了 `GH_TOKEN` + `GH_REPO`（见 `src/persist.mjs`）时，AG 账号、设置与统计会同步到仓库的 `state` 分支，重新部署后自动恢复。
 
 ## 模型分流规则
 
@@ -113,42 +109,65 @@ curl ... -d '{"model":"ais:gemini-2.5-flash", ...}'
 | `GET /v1/models` | ✅ 双引擎合并列表 |
 | `GET /health` | ✅ 含引擎状态 |
 
+## v2 架构与体积
+
+v2（`2.0.0-beta.*`）把安卓端改成纯 Kotlin：前门、AG 引擎都在 App 进程内，AIS 引擎用系统 WebView 打开 AI Studio 页面完成签名与请求。
+不再包含 nodejs-mobile（libnode）、Go 版 `libaistudio2api.so`、SpiderMonkey，也不再区分 full / lite 两个包。
+
+| | v1.3.10（full） | v2.0.0-beta.1 |
+| --- | --- | --- |
+| APK | 55.8 MB | 961 KB（CI release 包实测） |
+| 安装后 | 约 203 MB | 约 12 MB（模拟器 debug 包实测：代码 3.8 MB + 数据 8.4 MB；release 包更小） |
+| 原生库 | libnode.so、libaistudio2api.so | 无 |
+
+### 内存（模拟器实测）
+
+AIS 的 WebView 按账号**按需创建**，空闲 10 分钟后自动销毁；HTTP 线程池空闲 60 秒后连核心线程也回收；控制台退到后台时暂停渲染。
+CI 在 Android 14 x86_64 模拟器（debug 包）上用 `dumpsys meminfo` 记录（见 `ais-emulator` 工作流产物 `meminfo.txt`）：
+
+| 时刻 | App 进程 PSS | WebView 渲染进程 PSS | 存活 AIS WebView |
+| --- | --- | --- | --- |
+| 启动后空闲（控制台已加载、未用 AIS） | 81 MB | 58 MB | 0 |
+| AIS 请求刚结束 | 88 MB | 141 MB | 1 |
+| 空闲约 12 分钟后 | 95 MB | 79 MB | 0 |
+
+渲染进程是 App 内所有 WebView（控制台 + AIS）共用的一个，AIS WebView 回收后回落约 60 MB；Java 堆不会立即归还，App 进程 PSS 有小幅波动。数值随设备与 WebView 版本不同。
+
 ## 目录结构
 
 ```
-├─ src/                  Node 核心（AG 引擎），Linux / Docker / Android 共用这一份
-├─ app/                  安卓宿主工程
-│  ├─ app/               Kotlin 宿主：前门、路由、AIS 引擎、Web 控制台
-│  │  ├─ src/main/       前门、路由、AIS 引擎管理、UI
-│  │  ├─ src/full/       带 Node 引擎（RealNodeEngine）
-│  │  └─ src/lite/       不带 Node 引擎（NoopNodeEngine）
-│  └─ engine-node/       Node 引擎模块：JNI、NodeService、libnode
-├─ linux/                Linux 服务端（Python 单脚本）
-├─ src/wb/               WB 引擎 Node 版（Linux / 源码版用；安卓由 Kotlin 处理）
-├─ tests/                协议转换、usage、路由规则、WB 引擎测试
-└─ docs/merge-plan.md    双引擎融合设计文档
+├─ app/                  安卓工程（v2：纯 Kotlin，无原生库）
+│  └─ app/src/main/
+│     ├─ java/com/wag2api/app/   前门 LocalGatewayServer、EngineRouter、GatewayService
+│     │  └─ ais/                 WebView 版 AIS 引擎（WebViewAisEngine / AisWebWorker / MakerSuite 协议）
+│     ├─ java/com/wag2api/ag/    AG 引擎（Kotlin，自 Node 版移植）
+│     └─ assets/web/             Web 控制台（打包时压缩）
+├─ src/                  Node 版 AG 引擎（Linux / Docker / 源码版用）
+├─ tests/                Node 版协议转换、usage、路由规则测试
+├─ docs/                 设计文档（refactor-v2.md、ais-webview.md）
+└─ .github/              CI：构建、单测、模拟器实测
 ```
 
 ## 构建
 
-本地构建需要 JDK 17 + Android SDK + NDK：
+本地构建需要 JDK 17 + Android SDK（不需要 NDK）：
 
 ```bash
 cd app
-./gradlew assembleFullRelease assembleLiteRelease
+./gradlew assembleRelease        # 或 assembleDebug
 ```
-
-`full` 包需要 nodejs-mobile 运行时，CI 会自动下载到 `app/engine-node/libnode`。
 
 日常构建全部走 GitHub Actions（`.github/workflows/build.yml`）：
 
-- push `main` → 只产出 artifact，不发布
-- push `v*` tag → 校验 tag 与 `version.properties` 一致后发布 Release
+- push `refactor/**` → 单测 + 出 APK artifact，不发布
+- push `v*` tag → 校验 tag 与 `app/version.properties` 一致后发布 Release（`v2.*` 为预发布）
+- `ais-emulator.yml`：模拟器实测 AIS（导入账号、OpenAI / Anthropic 接口、内存记录）
 
 ## 测试
 
 ```bash
-npm test        # 协议转换 + usage 统计 + 前门路由规则
+npm test                                   # Node 版：协议转换 + usage 统计 + 前门路由规则
+cd app && ./gradlew :app:testReleaseUnitTest   # Kotlin：AIS 协议 + AG 引擎单测
 ```
 
 ## 免责声明
