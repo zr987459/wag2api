@@ -64,7 +64,8 @@ android {
             // 注意：只编译 Kotlin 的检查任务不涉及签名，不触发此保护。
             val inCi = !System.getenv("GITHUB_ACTIONS").isNullOrEmpty()
             val packagingTask = gradle.startParameter.taskNames.any {
-                it.contains("assemble", ignoreCase = true) || it.contains("bundle", ignoreCase = true)
+                (it.contains("assemble", ignoreCase = true) || it.contains("bundle", ignoreCase = true)) &&
+                    !it.contains("Debug", ignoreCase = true) // debug 包（模拟器实测）用 debug 签名，不需要正式密钥
             }
             if (inCi && packagingTask && !hasKs) {
                 throw GradleException(
