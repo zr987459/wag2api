@@ -141,8 +141,8 @@ jobs:
           }
           build /tmp/sm-orig /tmp/ais-orig ""
           build /tmp/sm-lite /tmp/ais-lite ""
-          build /tmp/sm-orig /tmp/ais-orig-gc "-Wl,--gc-sections -Wl,--icf=all"
-          build /tmp/sm-lite /tmp/ais-lite-gc "-Wl,--gc-sections -Wl,--icf=all"
+          build /tmp/sm-orig /tmp/ais-orig-gc "-Wl,--gc-sections"
+          build /tmp/sm-lite /tmp/ais-lite-gc "-Wl,--gc-sections"
           sz() { stat -c %s "$1"; }
           mb() { awk "BEGIN{printf \"%.2f MB\", $1/1048576}"; }
           gz() { gzip -9 -c "$1" | wc -c; }
@@ -155,7 +155,7 @@ jobs:
             echo "| 解压后合计 | $(du -sm /tmp/sm-orig | cut -f1) MB | $(du -sm /tmp/sm-lite | cut -f1) MB |"
             echo "| libaistudio2api.so（build.yml 现参数） | $(mb $(sz /tmp/ais-orig)) | $(mb $(sz /tmp/ais-lite)) |"
             echo "| 同上 gzip -9（≈APK 内压缩后） | $(mb $(gz /tmp/ais-orig)) | $(mb $(gz /tmp/ais-lite)) |"
-            echo "| .so 加 -Wl,--gc-sections -Wl,--icf=all | $(mb $(sz /tmp/ais-orig-gc)) | $(mb $(sz /tmp/ais-lite-gc)) |"
+            echo "| .so 加 -Wl,--gc-sections | $(mb $(sz /tmp/ais-orig-gc)) | $(mb $(sz /tmp/ais-lite-gc)) |"
           } | tee /tmp/sizes.md
           cat /tmp/sizes.md >> "$GITHUB_STEP_SUMMARY"
           mkdir -p dist && cp /tmp/sizes.md dist/sizes.md
