@@ -201,12 +201,6 @@ body.theme-ag .brand-icon {
   .engine-badge-mini { display: none; }
 }
 
-.ais-auth-tabs button.active {
-  background: var(--primary);
-  color: #fff;
-  border-color: var(--primary);
-}
-
 /* Tab 主内容区域 */
 .tab-content {
   display: none;
@@ -407,7 +401,6 @@ body.theme-ag .brand-icon {
 }
 
 .tag-global { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
-.tag-google { background: rgba(234, 67, 53, 0.15); color: #ea4335; }
 .tag-online { background: rgba(16, 185, 129, 0.15); color: #10b981; }
 .tag-offline { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
 .tag-warn { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
@@ -733,11 +726,6 @@ select.input-field option {
 .switch input:checked + .slider { background: var(--primary); }
 .switch input:checked + .slider:before { transform: translateX(20px); }
 
-/* 优雅展示切换动画 */
-.engine-view-wrap {
-  animation: fadeIn 0.25s ease;
-}
-  
 /* ── 弹窗（沿用旧版） ── */
 .modal-overlay {
   display: none;
@@ -1362,9 +1350,6 @@ body.standalone .host-only { display: none !important; }
   border-radius: var(--radius-sm);
   padding: 3px;
   margin-bottom: 6px;
-}
-.sched-modes-grid.cols-2 {
-  grid-template-columns: repeat(2, 1fr);
 }
 .sched-mode-btn {
   padding: 6px 2px;

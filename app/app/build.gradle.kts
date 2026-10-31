@@ -23,7 +23,7 @@ android {
         targetSdk = 34
         versionCode = appVersionCode
         versionName = appVersionName
-        // v2：一个 APK、没有 Node。只剩内置 AIS 引擎（arm64 静态二进制）
+        // v2：一个 APK、没有 Node、没有原生库（AG 引擎是 Kotlin，AIS 用系统 WebView）
         // 只保留中英文资源，去掉依赖库带来的几十种语言
         resourceConfigurations += listOf("zh", "en")
     }

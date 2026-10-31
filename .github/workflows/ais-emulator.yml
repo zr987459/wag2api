@@ -14,7 +14,7 @@ concurrency:
 jobs:
   emulator:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +26,10 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
 
       # debug 包用 debug 签名，不需要 keystore；APK 没有 .so，可以直接装在 x86_64 模拟器上
+      # [P4] 与 release 一致：用压缩后的控制台静态资源实测
+      - name: 压缩控制台静态资源
+        run: bash .github/scripts/minify-web.sh
+
       - name: 构建 debug APK
         working-directory: app
         run: |
@@ -64,4 +68,5 @@ jobs:
             emu-out/logcat-filtered.txt
             emu-out/ais-logs.txt
             emu-out/webview.json
+            emu-out/meminfo.txt
           if-no-files-found: ignore

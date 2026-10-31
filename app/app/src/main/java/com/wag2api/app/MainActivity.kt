@@ -111,6 +111,17 @@ class MainActivity : AppCompatActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
+    // [P4] 控制台退到后台时暂停它自己的渲染/动画（只作用于这个 WebView；不用 pauseTimers，那是全局的，会卡住 AIS 隐藏 WebView）
+    override fun onPause() {
+        super.onPause()
+        if (::webView.isInitialized) webView.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized) webView.onResume()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         webView.destroy()

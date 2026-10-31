@@ -103,6 +103,8 @@ object AgServer {
         }
         // [P3] 线程池满时直接回 503 并关连接；CallerRunsPolicy 会让 accept 线程去跑一个可能长达几分钟的流式请求，期间整个端口不再接新连接
         p.rejectedExecutionHandler = java.util.concurrent.RejectedExecutionHandler { r, _ -> (r as? ServeTask)?.reject() }
+        // [P4] 空闲 60 秒后连核心线程也回收
+        p.allowCoreThreadTimeOut(true)
         pool = p
 
         Thread({

@@ -49,7 +49,6 @@ const $ = id => document.getElementById(id);
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-const esc = escapeHtml;
 
 function fmtNum(n) {
   n = Number(n) || 0;
@@ -380,47 +379,6 @@ async function loadOverview() {
       }
     }
   }
-}
-
-function renderAisOverview(status, models, accounts, totals, usage) {
-  const box = $('overviewStatsContainer');
-  if (!box) return;
-  const isRunning = status.state === 'RUNNING' || status.running;
-  const costStr = usage && usage.cost !== undefined ? `$${Number(usage.cost).toFixed(4)}` : '--';
-  const ac = status.accounts || {};
-  const acReady = ac.ready !== undefined ? ac.ready : accounts.filter(a => a.state === 'ready' || a.enabled).length;
-  const acBusy = ac.busy || 0;
-  const acCooldown = ac.cooldown || 0;
-  const acAuthReq = ac.auth_required || 0;
-  const acSummary = `就绪 ${acReady} · 忙碌 ${acBusy} · 冷却 ${acCooldown} · 需认证 ${acAuthReq}`;
-
-  box.innerHTML = `
-    <div class="card">
-      <div class="row-between">
-        <div>
-          <div style="font-size: 14px; font-weight: 600;">AIS 引擎服务${status.version ? `<span class="muted" style="font-size:12px; font-weight:normal; margin-left:6px;">v${escapeHtml(status.version)}</span>` : ''}</div>
-          <div class="muted">状态：<span class="tag ${isRunning ? 'tag-online' : 'tag-offline'}">${escapeHtml(status.state || (isRunning ? 'RUNNING' : 'STOPPED'))}</span> · 可用模型：<b>${models.length}</b> 个 · 活跃请求：<b>${status.active_requests || 0}</b></div>
-          <div class="muted" style="margin-top:4px; font-size:12px;">账号：${acSummary}</div>
-        </div>
-        <button class="btn btn-sm ${isRunning ? 'btn-outline' : 'btn-primary'}" onclick="${isRunning ? 'stopAisService()' : 'startAisService()'}">
-          ${isRunning ? '⏹ 停止服务' : '▶ 启动服务'}
-        </button>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="section-title"><span>近 24 小时用量摘要</span></div>
-      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:8px;">
-        <div class="kv"><span class="k">成功请求</span><span class="v" style="color:var(--primary); font-weight:600;">${fmtNum(totals.succeeded || 0)}</span></div>
-        <div class="kv"><span class="k">失败 / 限流</span><span class="v" style="color:var(--danger); font-weight:600;">${fmtNum((totals.failed || 0) + (totals.rate_limited || 0))}</span></div>
-        <div class="kv"><span class="k">输入 Token</span><span class="v mono">${fmtNum(totals.input_tokens || 0)}</span></div>
-        <div class="kv"><span class="k">输出 Token</span><span class="v mono">${fmtNum(totals.output_tokens || totals.reply_tokens || 0)}</span></div>
-        <div class="kv"><span class="k">缓存 Token</span><span class="v mono">${fmtNum(totals.cached_tokens || 0)}</span></div>
-        <div class="kv"><span class="k">预估费用</span><span class="v mono">${costStr}</span></div>
-      </div>
-      ${usage && usage.recent ? `<div class="muted" style="margin-top:10px; font-size:12px;">最近 ${usage.recent.minutes} 分钟内：${usage.recent.requests} 次请求 · ${fmtNum(usage.recent.tokens)} Tokens</div>` : ''}
-    </div>
-  `;
 }
 
 function renderAisError(msg) {
@@ -2400,11 +2358,6 @@ async function agClearValidation(email) {
   }
 }
 
-async function agSelect(email) {
-  await postJson('/api/accounts/select', { email });
-  showToast(email ? `已锁定账号 ${email}` : '已切换为全自动智能轮询', 'success');
-  loadAgAccounts();
-}
 async function agClearCooldowns() {
   await postJson('/api/accounts/clear-cooldown');
   showToast('AG 账号冷却已清除', 'success');
@@ -2442,20 +2395,6 @@ async function agExportAccount(email) {
   } catch (e) {
     showToast('导出失败：' + e.message, 'error');
   }
-}
-const agExportOne = agExportAccount;
-async function agTestActive(btn) {
-  const orig = btn.textContent;
-  btn.textContent = '测试中…'; btn.disabled = true;
-  testBanner('ag-test-banner', '', '正在请求 Google…');
-  try {
-    const d = await postJson('/api/gemini/test', {});
-    const lines = (d.models || []).map(m => `${m.ok ? '✅' : '❌'} ${m.name} · ${m.message || ''}`);
-    testBanner('ag-test-banner', d.all_ok ? 'success' : d.ok ? 'warning' : 'error',
-      `${d.validation_account || ''}\n${lines.join('\n') || d.message || ''}`);
-    $('ag-test-banner').style.whiteSpace = 'pre-line';
-  } catch (e) { testBanner('ag-test-banner', 'error', `❌ ${e.message}`); }
-  finally { btn.textContent = orig; btn.disabled = false; }
 }
 
 // 集群测速：同一提示词交替发给 daily / autopush / prod，各 2 轮，比较首字与真实生成速度

@@ -29,7 +29,7 @@ try:
   print(json.dumps(d,ensure_ascii=False,indent=1))
 except Exception as e: print("{}")' > "$OUT/webview.json" 2>/dev/null || true
   adb logcat -d -v time 2>/dev/null | grep -E 'AIS-WV|AIS |chromium|cr_|WebView|AndroidRuntime|FATAL|wag2api' | redact | tail -n 1500 > "$OUT/logcat-filtered.txt" || true
-  rm -f "$OUT"/.req.json "$OUT"/.resp.json "$OUT"/.resp.sse "$OUT"/.import.json "$OUT"/.import.out
+  rm -f "$OUT"/.thr "$OUT"/.req.json "$OUT"/.resp.json "$OUT"/.resp.sse "$OUT"/.import.json "$OUT"/.import.out
   say "== 结束：$( [ $FAIL -eq 0 ] && echo 全部通过 || echo 有失败 )"
 }
 trap finish EXIT
@@ -38,6 +38,25 @@ if [ -z "${AIS_TEST_COOKIE:-}" ]; then
   say "::error::缺少 AIS_TEST_COOKIE"
   FAIL=1; exit 1
 fi
+
+
+# [P4] 内存/线程快照：只记 PSS、线程名统计、存活 WebView 数，不含任何账号信息
+MEM="$OUT/meminfo.txt"
+: > "$MEM"
+pss_app() { adb shell dumpsys meminfo "$PKG" 2>/dev/null | tr -d '\r' | awk '/TOTAL PSS:/{print $3; exit} /^ *TOTAL /{print $2; exit}'; }
+pss_renderer() { adb shell dumpsys meminfo 2>/dev/null | tr -d '\r' | awk '/Total PSS by process/{f=1;next} f&&/^$/{exit} f&&/sandboxed_process/{gsub(/[K,:]/,"",$1); s+=$1; n++} END{printf "%d %d\n", s+0, n+0}'; }
+threads() { local pid; pid=$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r' | awk '{print $1}'); [ -n "$pid" ] || { echo "0"; return; }
+  adb shell "cat /proc/$pid/task/*/comm" 2>/dev/null | tr -d '\r' | sed -E 's/[-_:]?[0-9]+$//' | sort | uniq -c | sort -rn > "$OUT/.thr"
+  echo "$(awk '{s+=$1} END{print s+0}' "$OUT/.thr")"; }
+live_wv() { curl -s -m 10 "$BASE/ais/api/webview" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("live_webviews","?"))
+except Exception: print("?")'; }
+snap() {  # $1=标签
+  local app r t w
+  app=$(pss_app); r=$(pss_renderer); t=$(threads); w=$(live_wv)
+  say "   [$1] App PSS $(( ${app:-0} / 1024 )) MB；WebView 渲染进程 ${r#* } 个共 $(( ${r%% *} / 1024 )) MB；线程 $t；存活 AIS WebView $w"
+  { echo "== $1"; echo "app_pss_kb=${app:-0} renderer_pss_kb=${r%% *} renderer_procs=${r#* } threads=$t live_webviews=$w"; echo "-- 线程（名称去编号后计数）"; cat "$OUT/.thr" 2>/dev/null; } >> "$MEM"
+}
 
 APK=$(ls app/app/build/outputs/apk/debug/*.apk | head -1)
 say "APK: $(basename "$APK") $(( $(stat -c %s "$APK") / 1024 )) KB"
@@ -56,6 +75,24 @@ for i in $(seq 1 60); do
 done
 say "前门 /health: $( [ $ok -eq 1 ] && echo 200 || echo 未就绪 )"
 [ $ok -eq 1 ] || { FAIL=1; exit 1; }
+
+# [P4] 控制台（压缩后的 app.js/style.css）能取到且无脚本错误
+sleep 15
+for f in / /app.js /style.css; do
+  c=$(curl -s -o /dev/null -m 10 -w '%{http_code} %{size_download}' "$BASE$f")
+  say "   控制台 $f: $c 字节"
+  [ "${c%% *}" = "200" ] || FAIL=1
+done
+if adb logcat -d 2>/dev/null | grep -E 'Uncaught' | grep -q 'source: http://127.0.0.1'; then
+  say "   ::error::控制台脚本报错："; adb logcat -d | grep -E 'Uncaught' | grep 'source: http://127.0.0.1' | head -5 | redact | tee -a "$RESULT"; FAIL=1
+else
+  say "   控制台脚本无报错"
+fi
+# 回桌面（控制台 Activity 退到后台），空闲 20 秒后记第一组数
+adb shell input keyevent KEYCODE_HOME >/dev/null 2>&1 || true
+sleep 20
+say "内存 A：启动后空闲（未创建 AIS WebView）"
+snap "A 空闲·未用 AIS"
 
 # 1. 导入账号（Cookie 经 stdin 交给 python 写成请求体文件，不进命令行参数、不打印）
 printf '%s' "$AIS_TEST_COOKIE" | python3 -c 'import json,sys
@@ -142,5 +179,27 @@ try:
 except Exception: print("解析失败")' "$OUT/.resp.json" | redact)
 say "5. /v1/messages: HTTP $code，回复: $TXT"
 [ "$code" = "200" ] || FAIL=1
+
+
+# [P4] 内存：请求后（WebView 存活）→ 空闲超过 10 分钟（WebView 应被回收）
+sleep 5
+say "内存 B：AIS 请求刚结束（账号 WebView 存活）"
+snap "B 请求后"
+say "等待空闲回收（IDLE 10 分钟 + 回收器 60 秒周期，最多等 13 分钟）…"
+for i in $(seq 1 26); do
+  sleep 30
+  w=$(live_wv)
+  [ "$w" = "0" ] && break
+done
+sleep 30
+say "内存 C：空闲 $(( i * 30 / 60 + 1 )) 分钟左右"
+snap "C 空闲回收后"
+[ "$(live_wv)" = "0" ] || { say "   ::error::空闲后 AIS WebView 未回收"; FAIL=1; }
+# 安装体积（debug 包，未经 R8，仅供参考）
+apkdir=$(adb shell pm path "$PKG" 2>/dev/null | tr -d '\r' | head -1 | cut -d: -f2 | xargs dirname 2>/dev/null)
+code_kb=$(adb shell su 0 du -sk "$apkdir" 2>/dev/null | tr -d '\r' | awk '{print $1}')
+data_kb=$(adb shell su 0 du -sk /data/data/$PKG 2>/dev/null | tr -d '\r' | awk '{print $1}')
+say "安装体积（debug 包）：代码 ${code_kb:-?} KB，数据 ${data_kb:-?} KB"
+echo "install_code_kb=${code_kb:-?} install_data_kb=${data_kb:-?}" >> "$MEM"
 
 [ $FAIL -eq 0 ]

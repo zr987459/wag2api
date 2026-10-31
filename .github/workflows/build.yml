@@ -96,6 +96,10 @@ jobs:
             -out app/keystore/release.p12 -pass env:KS_PW
           echo "密钥已解密"
 
+      # [P4] 控制台静态资源压缩（只改 CI 工作区副本；脚本内核对顶层函数名，不改行为）
+      - name: 压缩控制台静态资源
+        run: bash .github/scripts/minify-web.sh
+
       - name: 构建 release
         working-directory: app
         env:

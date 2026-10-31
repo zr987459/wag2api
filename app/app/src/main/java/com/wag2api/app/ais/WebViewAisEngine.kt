@@ -107,6 +107,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                 val p = ThreadPoolExecutor(2, 32, 60, TimeUnit.SECONDS, SynchronousQueue()) { r -> Thread(r, "ais-wv-http-" + n.incrementAndGet()).apply { isDaemon = true } }
                 // [P3] 满载时拒绝并关连接（下面 catch 里 close），不再让 accept 线程自己去跑长请求而卡住整个端口
                 p.rejectedExecutionHandler = ThreadPoolExecutor.AbortPolicy()
+                // [P4] 空闲 60 秒后连核心线程也回收，平时不常驻 HTTP 工作线程
+                p.allowCoreThreadTimeOut(true)
                 pool = p
                 Thread({
                     while (!ss.isClosed) {
@@ -457,6 +459,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
     private fun webviewDiag(): JSONObject = JSONObject()
         .put("webview_version", webViewVersion())
         .put("multi_profile", AisWebWorker.multiProfile())
+        .put("live_webviews", workers.size)   // [P4] 当前存活的账号 WebView 数（空闲 10 分钟后回收为 0）
         .put("features", JSONObject()
             .put("WEB_MESSAGE_LISTENER", feature(androidx.webkit.WebViewFeature.WEB_MESSAGE_LISTENER))
             .put("REQUESTED_WITH_HEADER_ALLOW_LIST", feature(androidx.webkit.WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST))
