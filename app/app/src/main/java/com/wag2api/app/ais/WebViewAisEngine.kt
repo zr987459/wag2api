@@ -54,6 +54,9 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         const val VERSION = "webview-proto-1"
         private const val IDLE_MS = 10 * 60 * 1000L
         private const val MAX_LOG = 200
+        /** [P3] GenerateContent 403 code=7 时同账号重新生成 proof 重试的次数与间隔（第 n 次等 n×间隔） */
+        private const val PERM_RETRIES = 2
+        private const val PERM_RETRY_DELAY_MS = 800L
 
         @Volatile private var instance: WebViewAisEngine? = null
 
@@ -558,13 +561,39 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                     val tz = meta(File(authDir, id)).optString("timezone", "").ifEmpty { TimeZone.getDefault().id }
                     val wire = MakerSuiteWire.buildGenerateContent(model, google, anthropicReq, info, tz)
                     val contents = wire.getJSONArray(1)
-                    val proof = w.proof(MakerSuiteWire.bindingPrompt(contents), MakerSuiteWire.pagePrompt(contents))
-                    val body = MakerSuiteWire.withProof(wire, proof)
-                    val s = w.send("GenerateContent", body)
-                    // 等响应头
-                    val first = s.next(120_000) ?: run { s.cancel(); throw IOException("上游 120 秒无响应") }
-                    if (first.optString("t") == "err") throw IOException("页面请求失败：" + first.optString("e"))
-                    val status = first.optInt("status", 0)
+                    // [P3] GenerateContent 偶发 403 code=7（PERMISSION_DENIED）：WAA proof 与页面输入框状态没对上时 Google 拒绝，
+                    // 与入口协议无关（同一次实测里 OpenAI / Anthropic 入口都出现过成功和 403）。同一账号重新生成 proof 再发一次。
+                    var sOrNull: AisWebWorker.Stream? = null
+                    var status = 0
+                    var permRetry = 0
+                    while (true) {
+                        val proof = w.proof(MakerSuiteWire.bindingPrompt(contents), MakerSuiteWire.pagePrompt(contents))
+                        val body = MakerSuiteWire.withProof(wire, proof)
+                        val sNew = w.send("GenerateContent", body)
+                        sOrNull = sNew
+                        // 等响应头
+                        val first = sNew.next(120_000) ?: run { sNew.cancel(); throw IOException("上游 120 秒无响应") }
+                        if (first.optString("t") == "err") throw IOException("页面请求失败：" + first.optString("e"))
+                        status = first.optInt("status", 0)
+                        if (status == 403 && permRetry < PERM_RETRIES) {
+                            val e403 = MakerSuiteWire.decodeError(status, drain(sNew))
+                            sNew.cancel() // 已读完，从等待表里移除
+                            if (e403.code == 7 || e403.code == 0) {
+                                permRetry++
+                                log("[$id] GenerateContent HTTP 403 code=${e403.code}，重新生成 proof 重试（$permRetry/$PERM_RETRIES）")
+                                try { Thread.sleep(PERM_RETRY_DELAY_MS * permRetry) } catch (_: InterruptedException) {}
+                                continue
+                            }
+                            val cs403 = e403.clientStatus()
+                            log("[$id] GenerateContent HTTP 403 code=${e403.code}：${e403.message.take(200)}")
+                            lastErr = e403.message; lastStatus = cs403
+                            sendError(res, isOai, cs403, e403.message)
+                            record(id, model, cs403, stream, start, null, e403.message)
+                            return
+                        }
+                        break
+                    }
+                    val s = sOrNull!!
                     if (status != 200) {
                         val errText = drain(s)
                         val e = if (status == 0) MakerSuiteWire.RpcError(502, 0, "页面请求被浏览器拦截（status 0，可能是 CORS 或网络）")
