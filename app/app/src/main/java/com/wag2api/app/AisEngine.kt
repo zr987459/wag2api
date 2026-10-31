@@ -8,6 +8,17 @@ object AisEngine {
     private const val TAG = "AIS"
     const val baseUrl = "http://127.0.0.1:8820"
 
+    /**
+     * AIS 后端：webview（默认，[com.wag2api.app.ais.WebViewAisEngine]，进程内、无 .so）或 go（libaistudio2api.so 子进程）。
+     * 由 BuildConfig.AIS_BACKEND 决定（gradle -PaisBackend=go 切回 Go 版）。两者都监听 127.0.0.1:8820，前门与控制台不用改。
+     */
+    val useWebView: Boolean get() = BuildConfig.AIS_BACKEND == "webview"
+
+    private fun webView(ctx: Context? = null): com.wag2api.app.ais.WebViewAisEngine? {
+        val c = ctx ?: appContext
+        return if (c != null) com.wag2api.app.ais.WebViewAisEngine.get(c) else com.wag2api.app.ais.WebViewAisEngine.peek()
+    }
+
     /** 只保留最近 200 行日志（环形缓冲） */
     private const val MAX_LOG_LINES = 200
 
@@ -33,6 +44,10 @@ object AisEngine {
      */
     fun isAvailable(ctx: Context? = null): Boolean {
         val c = ctx ?: appContext ?: return false
+        if (useWebView) {
+            if (ctx == null && !isRunning()) ensureStarted(c, waitMs = 8_000L)
+            return true
+        }
         val bin = File(c.applicationInfo.nativeLibraryDir, "libaistudio2api.so")
         if (!bin.exists()) return false
         if (ctx == null && !isRunning()) ensureStarted(c, waitMs = 8_000L)
@@ -63,6 +78,8 @@ object AisEngine {
     fun startIfNeeded(ctx: Context): Boolean {
         val app = ctx.applicationContext
         appContext = app
+        // WebView 版只是一个本地端口，WebView 按需创建，开销很小：总是启动
+        if (useWebView) { start(app); return true }
         if (!shouldAutoStart(app)) {
             Log.i(TAG, "没有 AIS 账号且未在设置中开启，AIS 子进程不启动")
             return false
@@ -101,6 +118,7 @@ object AisEngine {
     }
 
     fun isRunning(): Boolean {
+        if (useWebView) return webView()?.isServing == true
         val p = process ?: return false
         return try {
             p.exitValue()
@@ -114,6 +132,11 @@ object AisEngine {
     fun start(ctx: Context) {
         val app = ctx.applicationContext
         appContext = app
+        if (useWebView) {
+            stopped = false
+            webView(app)?.start()
+            return
+        }
         if (!isAvailable(app)) {
             Log.w(TAG, "libaistudio2api.so 不存在，AIS 引擎不可用")
             return
@@ -160,6 +183,7 @@ object AisEngine {
     @Synchronized
     fun stop() {
         stopped = true
+        if (useWebView) { webView()?.stop(); return }
         supervisorThread?.interrupt()
         supervisorThread = null
         try {
@@ -288,6 +312,7 @@ object AisEngine {
     }
 
     fun getLogs(): List<String> {
+        if (useWebView) return webView()?.getLogs() ?: emptyList()
         synchronized(logLock) {
             return logBuffer.toList()
         }

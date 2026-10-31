@@ -1,0 +1,67 @@
+name: AIS WebView 模拟器实测
+
+# 只在 proto/webview-ais 分支 push 和手动触发时运行。
+# GitHub 机房 IP 可能被 Google 风控：每次运行每个接口最多请求 1 次，同一时间只跑一个。
+on:
+  push:
+    branches: ['proto/webview-ais']
+  workflow_dispatch:
+
+concurrency:
+  group: ais-emulator
+  cancel-in-progress: false
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      # debug 包用 debug 签名，不需要 keystore；WebView 版没有 .so，同一个 APK 可以装在 x86_64 模拟器上
+      - name: 构建 debug APK（WebView 版 AIS）
+        working-directory: app
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug -PaisBackend=webview --no-daemon --console=plain
+          ls -l app/build/outputs/apk/debug/
+
+      - name: 启用 KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: 模拟器测试
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          AIS_TEST_COOKIE: ${{ secrets.AIS_TEST_COOKIE }}
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          ram-size: 4096M
+          disk-size: 4096M
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash .github/scripts/ais-emulator-test.sh
+
+      - name: 上传结果（已过滤敏感信息）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ais-emulator-logs
+          path: |
+            emu-out/result.txt
+            emu-out/logcat-filtered.txt
+            emu-out/ais-logs.txt
+            emu-out/webview.json
+          if-no-files-found: ignore

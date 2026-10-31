@@ -1,0 +1,14 @@
+{
+  "cookies": [
+    {"name": "SID", "value": "sid-value", "domain": ".google.com", "path": "/", "expires": 4102444800, "httpOnly": false, "secure": false, "sameSite": "Lax"},
+    {"name": "__Secure-1PSID", "value": "psid-value", "domain": ".google.com", "path": "/", "expires": 4102444800, "httpOnly": true, "secure": true, "sameSite": "None"},
+    {"name": "SAPISID", "value": "sapisid-value", "domain": ".google.com", "path": "/", "expires": 4102444800, "httpOnly": false, "secure": true, "sameSite": "Lax"},
+    {"name": "__Secure-1PAPISID", "value": "p1-value", "domain": ".google.com", "path": "/", "expires": 4102444800, "httpOnly": false, "secure": true, "sameSite": "Lax"},
+    {"name": "__Secure-3PAPISID", "value": "p3-value", "domain": ".google.com", "path": "/", "expires": 4102444800, "httpOnly": false, "secure": true, "sameSite": "None"},
+    {"name": "AISTUDIO_HOST", "value": "host-only", "domain": "aistudio.google.com", "path": "/", "expires": -1, "httpOnly": false, "secure": true, "sameSite": "Lax"},
+    {"name": "TRACK", "value": "x", "domain": ".example.com", "path": "/", "expires": -1, "httpOnly": false, "secure": false, "sameSite": "Lax"}
+  ],
+  "origins": [
+    {"origin": "https://aistudio.google.com", "localStorage": [{"name": "v1", "value": "x"}]}
+  ]
+}

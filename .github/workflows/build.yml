@@ -2,7 +2,7 @@ name: Build wag2api
 
 on:
   push:
-    branches: [main, 'refactor/**']
+    branches: [main, 'refactor/**', 'proto/**']
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -45,6 +45,11 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:compileReleaseKotlin --no-daemon --console=plain
 
+      # WebView 版 AIS 的 JVM 单测（storage-state 解析、请求体构造、流式响应解析）
+      - name: AIS 协议单测
+        working-directory: app
+        run: ./gradlew :app:testReleaseUnitTest --no-daemon --console=plain
+
   # ─────────────────────────────────────────────
   # 2. APK：v2 只出一个 wag2api.apk（没有 Node，AG 引擎是 Kotlin）
   # ─────────────────────────────────────────────
@@ -53,9 +58,13 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/refactor/'))
+      (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/refactor/') || startsWith(github.ref, 'refs/heads/proto/')))
     runs-on: ubuntu-latest
     needs: engine-test
+    env:
+      # AIS 后端：webview（系统 WebView，不编译、不打包 libaistudio2api.so）或 go（Go + SpiderMonkey）。
+      # proto/webview-ais 分支默认 webview；仓库变量 AIS_BACKEND=go 可切回。
+      AIS_BACKEND: ${{ vars.AIS_BACKEND || 'webview' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -67,15 +76,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
 
       - uses: actions/setup-go@v5
+        if: env.AIS_BACKEND == 'go'
         with:
           go-version: '1.27.x'
 
-      # AIS 前端（web）构建要用 Node；APK 本身不再带 Node
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
       - name: 缓存 AIS 二进制
+        if: env.AIS_BACKEND == 'go'
         uses: actions/cache@v4
         id: ais-cache
         with:
@@ -86,7 +92,7 @@ jobs:
       # -Wl,--gc-sections 让链接器丢掉 SpiderMonkey 静态库里没被引用的函数段。
       # 不再构建 AIS 前端（web/），wag2api 有自己的控制台。
       - name: 编译 AIS 引擎
-        if: steps.ais-cache.outputs.cache-hit != 'true'
+        if: env.AIS_BACKEND == 'go' && steps.ais-cache.outputs.cache-hit != 'true'
         run: |
           set -e
           git clone https://github.com/Mag1cFall/AIStudio2API.git /tmp/ais
@@ -206,7 +212,7 @@ jobs:
             echo "::error::未找到解密的密钥库，无法保证固定签名"
             exit 1
           fi
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew assembleRelease -PaisBackend="$AIS_BACKEND" --no-daemon --stacktrace
 
       # 签名硬校验：证书指纹必须与仓库变量一致，否则失败
       - name: 校验签名
@@ -233,8 +239,12 @@ jobs:
           set -e
           APK=$(ls app/app/build/outputs/apk/release/*.apk | head -1)
           echo "apk: $APK"
-          if ! unzip -l "$APK" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
-            echo "::error::APK 缺少 libaistudio2api.so"; exit 1
+          if [ "$AIS_BACKEND" = "go" ]; then
+            if ! unzip -l "$APK" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
+              echo "::error::APK 缺少 libaistudio2api.so"; exit 1
+            fi
+          elif unzip -l "$APK" | grep -q 'libaistudio2api.so'; then
+            echo "::error::WebView 版 APK 不应包含 libaistudio2api.so"; exit 1
           fi
           if unzip -l "$APK" | grep -q 'libnode.so'; then
             echo "::error::v2 APK 不应包含 libnode.so"; exit 1
@@ -244,7 +254,7 @@ jobs:
           fi
           SIZE=$(stat -c %s "$APK")
           echo "APK 体积: $((SIZE / 1024)) KB"
-          echo "### APK 体积：$((SIZE / 1024)) KB（目标 ≤ 10240 KB）" >> "$GITHUB_STEP_SUMMARY"
+          echo "### APK 体积：$((SIZE / 1024)) KB（AIS 后端：$AIS_BACKEND，目标 ≤ 10240 KB）" >> "$GITHUB_STEP_SUMMARY"
           unzip -lv "$APK" | sort -k1 -n -r | head -15 >> "$GITHUB_STEP_SUMMARY" || true
           if [ "$SIZE" -gt 10485760 ]; then
             echo "::warning::APK 超过 10MB 目标（$((SIZE / 1024)) KB）"
