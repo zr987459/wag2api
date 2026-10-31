@@ -212,6 +212,7 @@ class AisWebWorker(
             headers = captureOnce(deadline, useJsHook = true)
             log("[$accountId] XHR 钩子拿到请求头名：${names(headers.keys)}")
         }
+        try { evalSync(JS_DISMISS, 5_000) } catch (_: IOException) {}
         val hasService = evalSync(JS_HAS_SERVICE, 5_000) == true
         if (!hasService) throw IOException("官网 WAA service 未暴露（snapshot key=$key）")
 
@@ -311,7 +312,7 @@ class AisWebWorker(
                 if (!r.method.equals("POST", true)) return null
                 val url = r.url?.toString() ?: return null
                 if (seenPosts.size < 30) seenPosts.add((r.url?.host ?: "") + (r.url?.path ?: ""))
-                if (!url.contains("/MakerSuiteService/GenerateContent")) return null
+                if (!url.contains("MakerSuiteService/GenerateContent")) return null
                 val h = LinkedHashMap<String, String>()
                 for ((k, v) in r.requestHeaders ?: emptyMap()) h[k.lowercase()] = v
                 log("[$accountId] shouldInterceptRequest 命中 GenerateContent，URL 参数名：${try { r.url.queryParameterNames } catch (t: Throwable) { "?" }}")
@@ -606,7 +607,9 @@ class AisWebWorker(
 
         const val JS_EMAIL = "(function(){var n=document.querySelectorAll('[aria-label]');for(var i=0;i<n.length;i++){var m=(n[i].getAttribute('aria-label')||'').match(/[\\w.+-]+@[\\w-]+\\.[\\w.-]+/);if(m)return m[0];}return null;})()"
 
-        const val JS_DISMISS = "(function(){var s=['ms-g1-welcome-dialog button[aria-label=\"Close dialog\"]','button[aria-label=\"Close guided tour\"]','#glue-cookie-notification-bar-1 .glue-cookie-notification-bar__reject','mat-dialog-container button[aria-label=\"Close\"]'];var c=0;for(var i=0;i<s.length;i++){var b=document.querySelector(s[i]);if(b&&!b.disabled){try{b.click();c++;}catch(e){}}}return c;})()"
+        const val JS_DISMISS = "(function(){var s=['ms-g1-welcome-dialog button[aria-label=\"Close dialog\"]','button[aria-label=\"Close guided tour\"]','#glue-cookie-notification-bar-1 .glue-cookie-notification-bar__reject','mat-dialog-container button[aria-label=\"Close\"]'];var c=0;for(var i=0;i<s.length;i++){var b=document.querySelector(s[i]);if(b&&!b.disabled){try{b.click();c++;}catch(e){}}}" +
+            "var ds=document.querySelectorAll('mat-dialog-container,[role=dialog]');for(var j=0;j<ds.length;j++){var bs=ds[j].querySelectorAll('button');for(var k=0;k<bs.length;k++){var t=(bs[k].innerText||'').trim();" +
+            "if(/temporary chat|^cancel$|^close$|^no thanks$|^got it$|^dismiss$/i.test(t)){try{bs[k].click();c++;}catch(e){}break;}}}return c;})()"
 
         /** 找到 default_MakerSuite 里调用 .snapshot({ 的函数，替换成：第一次被调用时记下 service 参数并恢复原函数 */
         const val JS_HOOK = "(function(){var S=Symbol.for('wg.page');if(window[S])return window[S].key;var ms=window.default_MakerSuite;if(!ms)return null;" +
@@ -657,8 +660,8 @@ class AisWebWorker(
             "Object.defineProperty(window,Symbol.for('wg.hook'),{value:o,configurable:true});var B=window['__B__'];" +
             "X.open=function(m,u){this.__u=String(u);this.__h=[];return o.open.apply(this,arguments);};" +
             "X.setRequestHeader=function(n,v){if(this.__h)this.__h.push([n,v]);return o.set.apply(this,arguments);};" +
-            "X.send=function(b){if(this.__u&&this.__u.indexOf('/MakerSuiteService/GenerateContent')>=0){B.postMessage(JSON.stringify({t:'cap',h:this.__h,q:(this.__u.split('?')[1]||'').split('&').map(function(p){return p.split('=')[0];})}));var s=this;setTimeout(function(){try{s.abort()}catch(e){}},0);return;}return o.send.apply(this,arguments);};" +
-            "window.fetch=function(i,init){var u=typeof i==='string'?i:(i&&i.url)||'';if(u.indexOf('/MakerSuiteService/GenerateContent')>=0){var hs=[],h=(init&&init.headers)||(i&&i.headers);" +
+            "X.send=function(b){if(this.__u&&this.__u.indexOf('MakerSuiteService/GenerateContent')>=0){B.postMessage(JSON.stringify({t:'cap',h:this.__h,q:(this.__u.split('?')[1]||'').split('&').map(function(p){return p.split('=')[0];})}));var s=this;setTimeout(function(){try{s.abort()}catch(e){}},0);return;}return o.send.apply(this,arguments);};" +
+            "window.fetch=function(i,init){var u=typeof i==='string'?i:(i&&i.url)||'';if(u.indexOf('MakerSuiteService/GenerateContent')>=0){var hs=[],h=(init&&init.headers)||(i&&i.headers);" +
             "if(h){if(typeof h.forEach==='function')h.forEach(function(v,k){hs.push([k,v]);});else if(Array.isArray(h))hs=h.slice();else for(var k in h)hs.push([k,h[k]]);}" +
             "B.postMessage(JSON.stringify({t:'cap',h:hs}));return Promise.reject(new DOMException('aborted','AbortError'));}return o.fetch.apply(this,arguments);};return true;})()"
 
