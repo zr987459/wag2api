@@ -1,5 +1,6 @@
 package com.wag2api.ag
 
+import com.wag2api.ag.UpstreamPolicy.Cooldowns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody

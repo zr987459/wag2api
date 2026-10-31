@@ -509,6 +509,27 @@ class LocalGatewayServer(
                 }
             }
 
+            // AIS 引擎开关（设置页）：开启立即启动；关闭时若没有 AIS 账号则停掉子进程
+            path == "/panel/api/ais/enabled" || path == "/m/api/ais/enabled" -> {
+                if (method == "POST") {
+                    val on = try { JSONObject(body).optBoolean("enabled", true) } catch (e: Exception) { true }
+                    Thread { try { AisEngine.setEnabled(context, on) } catch (ignored: Exception) {} }.start()
+                    sendJsonResponse(output, 200, JSONObject().apply {
+                        put("ok", true)
+                        put("enabled", on)
+                        put("running", AisEngine.isRunning())
+                    }.toString())
+                } else {
+                    sendJsonResponse(output, 200, JSONObject().apply {
+                        put("ok", true)
+                        put("enabled", AisEngine.isEnabledInSettings(context))
+                        put("has_accounts", AisEngine.hasAccounts(context))
+                        put("running", AisEngine.isRunning())
+                        put("available", AisEngine.isAvailable(context))
+                    }.toString())
+                }
+            }
+
             // 模型清单兼容
             path == "/panel/api/models/wb" || path == "/panel/api/models/ais" ||
             path == "/m/api/models/wb" || path == "/m/api/models/ais" -> {
