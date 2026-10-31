@@ -11,5 +11,7 @@ ac_add_options --disable-debug-symbols
 ac_add_options --disable-tests
 ac_add_options --disable-js-shell
 ac_add_options --disable-shared-js
+# Firefox 翻译功能专用的非标准 wasm intgemm 扩展（zig 的 -target 下 i8mm 编不过），网页里的标准 WebAssembly 不受影响
+ac_add_options --disable-wasm-moz-intgemm
 mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-sm
 export RUSTC_OPT_LEVEL=s
