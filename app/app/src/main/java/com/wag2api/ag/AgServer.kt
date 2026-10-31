@@ -101,14 +101,15 @@ object AgServer {
         val p = ThreadPoolExecutor(2, 64, 60, TimeUnit.SECONDS, SynchronousQueue()) { r ->
             Thread(r, "ag-http-" + counter.incrementAndGet()).apply { isDaemon = true }
         }
-        p.rejectedExecutionHandler = ThreadPoolExecutor.CallerRunsPolicy()
+        // [P3] 线程池满时直接回 503 并关连接；CallerRunsPolicy 会让 accept 线程去跑一个可能长达几分钟的流式请求，期间整个端口不再接新连接
+        p.rejectedExecutionHandler = java.util.concurrent.RejectedExecutionHandler { r, _ -> (r as? ServeTask)?.reject() }
         pool = p
 
         Thread({
             while (!ss.isClosed) {
                 val s = try { ss.accept() } catch (e: IOException) { if (ss.isClosed) break else continue }
                 try {
-                    p.execute { serve(s) }
+                    p.execute(ServeTask(s))
                 } catch (e: Throwable) {
                     try { s.close() } catch (_: Exception) {}
                 }
@@ -182,6 +183,7 @@ object AgServer {
                     val line = readLine(input) ?: break
                     val size = line.substringBefore(';').trim().toIntOrNull(16) ?: break
                     if (size == 0) { while (true) { val t = readLine(input) ?: break; if (t.isEmpty()) break }; break }
+                    if (size < 0 || out.size().toLong() + size > MAX_BODY_BYTES) throw IOException("request body too large")
                     val buf = ByteArray(size)
                     readFully(input, buf)
                     out.write(buf)
@@ -190,7 +192,7 @@ object AgServer {
                 return out.toByteArray()
             }
             if (contentLength <= 0) return ByteArray(0)
-            if (contentLength > 256L * 1024 * 1024) throw IOException("request body too large")
+            if (contentLength > MAX_BODY_BYTES) throw IOException("request body too large")
             val buf = ByteArray(contentLength.toInt())
             readFully(input, buf)
             return buf
@@ -293,6 +295,39 @@ object AgServer {
             get() = closed || socket.isClosed || socket.isOutputShutdown
     }
 
+    /** 线程池任务：被拒绝时回 503 */
+    private class ServeTask(val sock: Socket) : Runnable {
+        override fun run() = serve(sock)
+        fun reject() {
+            try {
+                sock.soTimeout = 2000
+                val body = "{\"error\":\"engine busy\"}".toByteArray(Charsets.UTF_8)
+                val out = sock.getOutputStream()
+                out.write(("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: ${body.size}\r\nRetry-After: 2\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
+                out.write(body)
+                out.flush()
+            } catch (_: Throwable) {
+            } finally {
+                try { sock.close() } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    /** [P3] 请求体上限（手机内存有限；与前门 LocalGatewayServer 一致） */
+    const val MAX_BODY_BYTES: Long = 64L * 1024 * 1024
+
+    /**
+     * [P3] 前门鉴权：管理密钥开启时，AIS 路由与 /ais-local/export 也要校验（以前只有 AG 引擎内校验，AIS 路径可绕过）。
+     * 引擎未启动时直接读 filesDir/ag/keys.json。未设置密钥时恒为 true。
+     */
+    @JvmStatic
+    fun frontDoorAllows(ctx: Context, headers: Map<String, String>, target: String): Boolean {
+        val access = core?.access ?: try {
+            AccessControl(File(File(ctx.applicationContext.filesDir, "ag"), "keys.json").path)
+        } catch (_: Throwable) { return true }
+        return access.isAdmin(headers, target)
+    }
+
     private fun readLine(input: InputStream, max: Int = 64 * 1024): String? {
         val buf = ByteArrayOutputStream(128)
         while (true) {
@@ -343,7 +378,7 @@ object AgServer {
                 try {
                     handle(req, res)
                 } catch (t: Throwable) {
-                    Log.e(TAG, "[Request Error] ${req.method} ${req.target}", t)
+                    Log.e(TAG, Redact.redact("[Request Error] ${req.method} ${Redact.pathOnly(req.target)}: ${t}"))
                     if (!res.headersSent) res.sendJson(500, JSONObject().put("error", t.message ?: t.toString()))
                 }
                 try { out.flush() } catch (_: IOException) {}
@@ -805,7 +840,7 @@ object AgServer {
             return
         }
 
-        Log.w(TAG, "[404] $method ${req.target}")
+        Log.w(TAG, "[404] $method ${Redact.pathOnly(req.target)}")
         sendJson(res, 404, JSONObject().put("error", "Endpoint not found").put("method", method).put("path", path))
     }
 
@@ -1050,11 +1085,16 @@ object AgServer {
                             .put("t_first_text", usage.opt("t_first_text") ?: JSONObject.NULL)))))
                 }
                 statsRecorded = true
-                if (isOaiChat) {
-                    val includeUsage = rawParsed.optJSONObject("stream_options")?.opt("include_usage") == true
-                    OpenaiAgConverter.handleOpenAIStreamConversion(response, res, modelUsed, onFinish, startTime, notice, includeUsage)
-                } else {
-                    SseStreamer.handleStreamConversion(response, res, modelUsed, onFinish, startTime, notice)
+                try {
+                    if (isOaiChat) {
+                        val includeUsage = rawParsed.optJSONObject("stream_options")?.opt("include_usage") == true
+                        OpenaiAgConverter.handleOpenAIStreamConversion(response, res, modelUsed, onFinish, startTime, notice, includeUsage)
+                    } else {
+                        SseStreamer.handleStreamConversion(response, res, modelUsed, onFinish, startTime, notice)
+                    }
+                } finally {
+                    // [P3] 转换器在拿到 lines 之前抛错时也要释放上游连接（close 幂等）
+                    try { response.close() } catch (_: Throwable) {}
                 }
             } else {
                 val text = try { response.body?.string() ?: "" } finally { response.close() }
@@ -1095,7 +1135,7 @@ object AgServer {
                 statsRecorded = true
             }
         } catch (err: Throwable) {
-            Log.e(TAG, "[Inference Handler Error]", err)
+            Log.e(TAG, Redact.redact("[Inference Handler Error] $err"))
             if (!statsRecorded && statsEmail != null) {
                 stats.recordRequest(JSONObject()
                     .put("email", statsEmail)

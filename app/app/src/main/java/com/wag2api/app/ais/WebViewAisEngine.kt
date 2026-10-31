@@ -102,7 +102,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                 port = PORT
                 val n = AtomicInteger(0)
                 val p = ThreadPoolExecutor(2, 32, 60, TimeUnit.SECONDS, SynchronousQueue()) { r -> Thread(r, "ais-wv-http-" + n.incrementAndGet()).apply { isDaemon = true } }
-                p.rejectedExecutionHandler = ThreadPoolExecutor.CallerRunsPolicy()
+                // [P3] 满载时拒绝并关连接（下面 catch 里 close），不再让 accept 线程自己去跑长请求而卡住整个端口
+                p.rejectedExecutionHandler = ThreadPoolExecutor.AbortPolicy()
                 pool = p
                 Thread({
                     while (!ss.isClosed) {
@@ -146,7 +147,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
 
     fun getLogs(): List<String> = synchronized(logBuf) { logBuf.toList() }
 
-    private fun log(line: String) {
+    private fun log(raw: String) {
+        val line = com.wag2api.ag.Redact.redact(raw)
         Log.i(TAG, line)
         val stamped = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + " " + line
         synchronized(logBuf) { if (logBuf.size >= MAX_LOG) logBuf.removeFirst(); logBuf.addLast(stamped) }

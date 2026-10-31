@@ -81,6 +81,7 @@ object EngineRouter {
         .readTimeout(0, TimeUnit.SECONDS)   // 流式不能超时
         .writeTimeout(60, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
+        .followRedirects(false) // [P3] 302（/token → /）原样回给客户端，不在前门内部跟随
         .build()
 
     /** 路由结果 */
@@ -388,27 +389,41 @@ object EngineRouter {
         else realBody.toRequestBody("application/json; charset=utf-8".toMediaType())
 
         val reqBuilder = Request.Builder().url(url).method(method, rb)
-        listOf("authorization", "x-api-key", "anthropic-version", "content-type", "accept").forEach { k ->
-            headers[k]?.let { reqBuilder.header(k, it) }
+        // [P3] 透传全部请求头（去掉逐跳头）。以前只带 5 个固定头：控制台的 x-admin-key、api-key / x-auth-token
+        // 以及 x-claude-code-session-id 等会话头全被丢掉，开了管理密钥后控制台 401，会话亲和失效（KV-Cache 命中率下降）。
+        for ((k, v) in headers) {
+            val lk = k.lowercase()
+            if (lk in HOP_BY_HOP_REQ) continue
+            try { reqBuilder.header(k, v) } catch (_: IllegalArgumentException) {}
         }
         reqBuilder.header("X-Engine-Token", token)
 
         engine.requestStart()
+        var headWritten = false
         try {
             client.newCall(reqBuilder.build()).execute().use { resp ->
                 val ct = resp.header("Content-Type") ?: "application/json; charset=utf-8"
                 val isSse = ct.contains("event-stream", ignoreCase = true)
+                // [P3] 透传引擎的响应头（Location、X-Gateway-Model-Used / Downgrade-Reason / Failure-Reason、Cache-Control 等）
+                val passHeaders = StringBuilder()
+                for (name in resp.headers.names()) {
+                    val ln = name.lowercase()
+                    if (ln in HOP_BY_HOP_RESP) continue
+                    for (v in resp.headers(name)) passHeaders.append(name).append(": ").append(v.replace("\r", " ").replace("\n", " ")).append("\r\n")
+                }
 
                 if (isSse) {
-                    val head = "HTTP/1.1 200 OK\r\n" +
+                    val head = "HTTP/1.1 ${resp.code} ${reasonOf(resp.code, resp.message)}\r\n" +
                             "Content-Type: $ct\r\n" +
+                            passHeaders +
                             "Cache-Control: no-cache, no-transform\r\n" +
                             "X-Accel-Buffering: no\r\n" +
                             "Transfer-Encoding: chunked\r\n" +
                             "Access-Control-Allow-Origin: *\r\n" +
-                            "Connection: keep-alive\r\n\r\n"
-                    out.write(head.toByteArray(Charsets.US_ASCII))
+                            "Connection: close\r\n\r\n"
+                    out.write(head.toByteArray(Charsets.UTF_8))
                     out.flush()
+                    headWritten = true
 
                     val buf = ByteArray(8192)
                     resp.body?.byteStream()?.use { input ->
@@ -426,21 +441,46 @@ object EngineRouter {
                     out.flush()
                 } else {
                     val bytes = resp.body?.bytes() ?: ByteArray(0)
-                    val head = "HTTP/1.1 ${resp.code} ${resp.message}\r\n" +
+                    val head = "HTTP/1.1 ${resp.code} ${reasonOf(resp.code, resp.message)}\r\n" +
                             "Content-Type: $ct\r\n" +
+                            passHeaders +
                             "Content-Length: ${bytes.size}\r\n" +
                             "Access-Control-Allow-Origin: *\r\n" +
                             "Connection: close\r\n\r\n"
-                    out.write(head.toByteArray(Charsets.US_ASCII))
+                    headWritten = true
+                    out.write(head.toByteArray(Charsets.UTF_8))
                     out.write(bytes)
                     out.flush()
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "转发 Node 失败", e)
-            try { writeError(out, 502, errorBody("AG 引擎转发失败: ${e.message}")) } catch (ignored: Exception) {}
+            Log.e(TAG, "转发 AG 引擎失败: ${com.wag2api.ag.Redact.redact(e.toString())}")
+            // [P3] 响应头已经发出（流式中途断开）时不能再写第二个响应，否则客户端收到半截 SSE + 一段 HTTP 报文
+            if (!headWritten) {
+                try { writeError(out, 502, errorBody("AG 引擎转发失败: ${e.message}")) } catch (ignored: Exception) {}
+            }
         } finally {
             engine.requestEnd()
+        }
+    }
+
+    /** 转发给引擎时不带的请求头（逐跳头 / 由 OkHttp 自己管理 / 内部令牌由宿主重新设置） */
+    private val HOP_BY_HOP_REQ = setOf(
+        "host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade",
+        "content-length", "accept-encoding", "expect", "x-engine-token",
+    )
+
+    /** 回给客户端时不透传的响应头（由前门自己写） */
+    private val HOP_BY_HOP_RESP = setOf(
+        "connection", "keep-alive", "transfer-encoding", "content-length", "content-type", "content-encoding",
+        "access-control-allow-origin", "cache-control", "x-accel-buffering", "date",
+    )
+
+    private fun reasonOf(code: Int, msg: String): String = msg.ifEmpty {
+        when (code) {
+            200 -> "OK"; 204 -> "No Content"; 302 -> "Found"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 403 -> "Forbidden"
+            404 -> "Not Found"; 413 -> "Payload Too Large"; 429 -> "Too Many Requests"; 500 -> "Internal Server Error"
+            502 -> "Bad Gateway"; 503 -> "Service Unavailable"; else -> "Status"
         }
     }
 

@@ -107,8 +107,54 @@ class LocalGatewayServer(
         }
     }
 
+    /** [P3] 请求体过大 */
+    private class BodyTooLarge : IOException("request body too large")
+
+    /** [P3] 支持 Transfer-Encoding: chunked（部分 SDK / curl --data-binary @- 会这样发）；总长度有上限 */
+    private fun readChunkedBody(input: InputStream): String {
+        val out = ByteArrayOutputStream()
+        fun line(): String? {
+            val b = ByteArrayOutputStream(16)
+            while (true) {
+                val c = input.read()
+                if (c < 0) return if (b.size() == 0) null else b.toString("ISO-8859-1")
+                if (c == '\n'.code) break
+                if (c != '\r'.code) b.write(c)
+                if (b.size() > 8192) throw IOException("chunk line too long")
+            }
+            return b.toString("ISO-8859-1")
+        }
+        while (true) {
+            val sizeLine = line() ?: break
+            val size = sizeLine.substringBefore(';').trim().toIntOrNull(16) ?: throw IOException("bad chunk size")
+            if (size == 0) { while (true) { val t = line() ?: break; if (t.isEmpty()) break }; break }
+            if (size < 0 || out.size().toLong() + size > com.wag2api.ag.AgServer.MAX_BODY_BYTES) throw BodyTooLarge()
+            val buf = ByteArray(size)
+            var off = 0
+            while (off < size) {
+                val n = input.read(buf, off, size - off)
+                if (n < 0) throw EOFException("client closed in chunk")
+                off += n
+            }
+            out.write(buf)
+            line()
+        }
+        return out.toString("UTF-8")
+    }
+
+    /** [P3] 管理密钥开启时校验；不通过就回 401 并返回 true */
+    private fun denyIfNotAdmin(output: OutputStream, headers: Map<String, String>, target: String, dataPlane: Boolean): Boolean {
+        if (com.wag2api.ag.AgServer.frontDoorAllows(context, headers, target)) return false
+        val body = if (dataPlane) JSONObject().put("type", "error").put("error", JSONObject()
+            .put("type", "authentication_error").put("message", "API Key 无效或缺失 (x-api-key)"))
+        else JSONObject().put("ok", false).put("need_admin", true).put("error", "需要管理密钥")
+        sendJsonResponse(output, 401, body.toString())
+        return true
+    }
+
     private fun readRequestBody(input: InputStream, contentLength: Int): String {
         if (contentLength <= 0) return ""
+        if (contentLength.toLong() > com.wag2api.ag.AgServer.MAX_BODY_BYTES) throw BodyTooLarge()
         val buf = ByteArray(contentLength)
         var off = 0
         while (off < contentLength) {
@@ -177,8 +223,16 @@ class LocalGatewayServer(
             }
 
             // 读取 Body
-            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
-            val body = readRequestBody(input, contentLength)
+            val chunked = headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true
+            val contentLength = headers["content-length"]?.trim()?.toLongOrNull()?.let { if (it > Int.MAX_VALUE) Int.MAX_VALUE else it.toInt() } ?: 0
+            val body = try {
+                if (chunked) readChunkedBody(input) else readRequestBody(input, contentLength)
+            } catch (e: BodyTooLarge) {
+                sendJsonResponse(output, 413, JSONObject().put("error", JSONObject()
+                    .put("message", "请求体超过 ${com.wag2api.ag.AgServer.MAX_BODY_BYTES / 1024 / 1024}MB 上限").put("type", "invalid_request_error")).toString())
+                client.close()
+                return
+            }
 
             // ── 数据面与控制面安全隔离 ──────────────────────
             val isControlPlane = path == "/" ||
@@ -252,6 +306,7 @@ class LocalGatewayServer(
 
             // 4. AIS 日志
             if (path == "/ais/logs") {
+                if (denyIfNotAdmin(output, headers, fullPath, dataPlane = false)) { client.close(); return }
                 val logs = AisEngine.getLogs()
                 val json = JSONObject().apply {
                     put("ok", true)
@@ -273,6 +328,8 @@ class LocalGatewayServer(
 
             // 5.5 AIS 本地账号导出（含 storage-state.json Cookie）
             if (path == "/ais-local/export") {
+                // [P3] 这里导出的是 AIS 账号 Cookie，以前不校验管理密钥，同机任何 App 都能读走
+                if (denyIfNotAdmin(output, headers, fullPath, dataPlane = false)) { client.close(); return }
                 if (method != "GET") {
                     val err = JSONObject().put(
                         "error",
@@ -298,6 +355,7 @@ class LocalGatewayServer(
 
             // 6. AIS API 透传：/ais/api/* -> AIS /api/*
             if (path.startsWith("/ais/api/") || path == "/ais/api") {
+                if (denyIfNotAdmin(output, headers, fullPath, dataPlane = false)) { client.close(); return }
                 val targetPath = path.removePrefix("/ais")
                 EngineRouter.proxyToAis(
                     method = method,
@@ -338,6 +396,8 @@ class LocalGatewayServer(
                     return
                 }
                 is EngineRouter.Route.ToAis -> {
+                    // [P3] AIS 推理与 AG 一样受管理密钥保护（AG 引擎内部会校验，AIS 以前不校验）
+                    if (denyIfNotAdmin(output, headers, fullPath, dataPlane = !decision.path.startsWith("/api/"))) { client.close(); return }
                     EngineRouter.proxyToAis(
                         method = method,
                         path = decision.path,

@@ -178,7 +178,7 @@ class TokenManager(val storagePath: String?) {
             )
             val res = M2Http.post(Constants.GOOGLE_TOKEN_ENDPOINT, body, M2Http.FORM, emptyMap())
             if (!res.ok) {
-                M2Log.e("[TokenManager] Refresh failed (${res.status}): ${res.body}")
+                M2Log.e("[TokenManager] Refresh failed (${res.status}): ${res.body.take(300)}")
                 return null
             }
             val data = res.json() as? JSONObject ?: throw IllegalStateException("bad json")
@@ -306,9 +306,10 @@ class TokenManager(val storagePath: String?) {
 internal object M2Log {
     /** 可选的额外日志出口（M6 可接到控制台日志环形缓冲） */
     @Volatile var sink: ((level: String, msg: String) -> Unit)? = null
-    fun i(m: String) { try { Log.i("AG", m) } catch (_: Throwable) {}; sink?.invoke("info", m) }
-    fun w(m: String) { try { Log.w("AG", m) } catch (_: Throwable) {}; sink?.invoke("warn", m) }
-    fun e(m: String) { try { Log.e("AG", m) } catch (_: Throwable) {}; sink?.invoke("error", m) }
+    // [P3] 统一脱敏：令牌 / 密钥 / Cookie 值不进 logcat 和控制台日志
+    fun i(m: String) { val r = Redact.redact(m); try { Log.i("AG", r) } catch (_: Throwable) {}; sink?.invoke("info", r) }
+    fun w(m: String) { val r = Redact.redact(m); try { Log.w("AG", r) } catch (_: Throwable) {}; sink?.invoke("warn", r) }
+    fun e(m: String) { val r = Redact.redact(m); try { Log.e("AG", r) } catch (_: Throwable) {}; sink?.invoke("error", r) }
 }
 
 /** 普通线程：定时任务 + 后台任务（守护线程） */

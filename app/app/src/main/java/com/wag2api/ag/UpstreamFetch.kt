@@ -84,12 +84,17 @@ object UpstreamFetch {
         }
     }
 
+    /** 上游读空闲超时（毫秒），环境变量 UPSTREAM_READ_IDLE_MS 可调，默认 10 分钟（大于非流式响应头超时 5 分钟） */
+    private val READ_IDLE_MS: Long = System.getenv("UPSTREAM_READ_IDLE_MS")?.toLongOrNull()?.takeIf { it > 0 } ?: 600_000L
+
     /** 全局唯一的 OkHttpClient（其他模块需要发请求也用它，或 client.newBuilder() 派生以共享连接池） */
     @JvmField
     val client: OkHttpClient = OkHttpClient.Builder()
         .connectionPool(ConnectionPool(4, 5, TimeUnit.MINUTES))
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // 流式响应可能长时间无数据；响应头超时由 headerTimeoutMs 控制
+        // [P3] 读空闲上限：上游半开连接（移动网络 NAT 回收后常见）不再无限期卡住请求线程。
+        // 只在“连续这么久一个字节都没收到”时触发，正常流式（含长思考）不受影响；响应头超时仍由 headerTimeoutMs 控制。
+        .readTimeout(READ_IDLE_MS, TimeUnit.MILLISECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .callTimeout(0, TimeUnit.MILLISECONDS)
         .retryOnConnectionFailure(true)
