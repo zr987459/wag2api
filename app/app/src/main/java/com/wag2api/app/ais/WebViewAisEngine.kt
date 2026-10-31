@@ -529,7 +529,9 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         val model = anthropicReq.optString("model", "").removePrefix("ais:").removePrefix("models/")
         if (model.isEmpty()) { sendError(res, isOai, 400, "缺少 model"); return }
         anthropicReq.put("model", model)
-        val stream = anthropicReq.optBoolean("stream", false)
+        // OpenAI → Anthropic 转换不一定保留 stream，以客户端原始请求为准
+        val stream = raw.optBoolean("stream", false) || anthropicReq.optBoolean("stream", false)
+        anthropicReq.put("stream", stream)
         val google = try { ContentConverter.convertAnthropicToGoogle(anthropicReq) } catch (e: Exception) {
             sendError(res, isOai, 400, "协议转换失败：${e.message}"); return
         }

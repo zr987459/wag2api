@@ -114,6 +114,13 @@ class MakerSuiteStreamTest {
     }
 
     @Test
+    fun numericThoughtFlag() {
+        val d = MakerSuiteStream()
+        val got = d.feed("[[[[[[[[null,\"**Plan**\",null,null,null,null,null,null,null,null,null,null,1]],\"model\"]]]]]]")
+        assertTrue(got[0].getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts").getJSONObject(0).getBoolean("thought"))
+    }
+
+    @Test
     fun maxTokensFinish() {
         val d = MakerSuiteStream()
         val got = d.feed("[[[[[[[[,\"cut\"]],\"model\"],2]],,[3,1,4]]]]")

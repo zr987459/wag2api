@@ -159,7 +159,9 @@ class MakerSuiteStream(
                 o.put("functionCall", fc)
             }
         }
-        if (p.opt(12) == true) o.put("thought", true)
+        // 思考标记：官网有时给 true，有时给 1
+        val th = p.opt(12)
+        if (th == true || (th is Number && th.toInt() != 0)) o.put("thought", true)
         (p.opt(14) as? String)?.takeIf { it.isNotEmpty() }?.let { o.put("thoughtSignature", it) }
         if (o.length() == 0) return null
         // 只有签名的独立 Part：给一个空文本，下游按签名处理
