@@ -12,9 +12,9 @@ permissions:
   actions: read
 
 env:
-  SOURCE_RUN_ID: '41202532100'          # build.yml @ 9615228（模拟器实测 41202532210 全部通过）
-  RELEASE_ID: '429942329'               # v2.0.0-beta.2 草稿
-  EXPECTED_SHA256: '16f126770f430538368d8a2d09c42b64a640ab118f51b3b4258ad0ae736c5714'
+  SOURCE_RUN_ID: '41205963298'          # build.yml @ 4c86bd7（模拟器实测 41205963293 全部通过）
+  RELEASE_ID: '429965647'               # v2.0.0-beta.3 草稿
+  EXPECTED_SHA256: 'e66901d868dd4e3ef13ec505e3689c5520c5acc5de8714084c286f8524dd0e5c'
 
 jobs:
   publish:
