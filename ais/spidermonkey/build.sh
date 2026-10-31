@@ -66,6 +66,8 @@ export RANLIB=llvm-ranlib
 export OBJCOPY=llvm-objcopy
 export STRIP=llvm-strip
 mk_add_options MOZ_PARALLEL_BUILD=$JOBS
+# 新版 rustc 无法把 configure 猜出的 x86_64-pc-linux-gnu 对上 Rust 目标，显式给出
+ac_add_options --host=$(uname -m)-unknown-linux-gnu
 MC
 cd "$SM_SRC"
 export MOZCONFIG=/tmp/mozconfig-sm MOZBUILD_STATE_PATH=/tmp/mozbuild MACH_NO_WRITE_TIMES=1
