@@ -26,5 +26,7 @@ class RedactTest {
         assertEquals(s, Redact.redact(s))
         assertEquals("/v1/messages", Redact.pathOnly("/v1/messages?key=abc"))
         assertEquals("", Redact.redact(null))
+        assertEquals("GenerateContent HTTP 403 code=7", Redact.redact("GenerateContent HTTP 403 code=7"))
+        assertFalse(Redact.redact("cb?code=4/0AbCdEfGhIjKlMn&scope=x").contains("0AbCdEfGhIjKlMn"))
     }
 }

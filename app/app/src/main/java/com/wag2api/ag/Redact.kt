@@ -12,7 +12,9 @@ object Redact {
         // Authorization: Bearer xxx
         Regex("(?i)(bearer\\s+)[A-Za-z0-9._~+/=\\-]+") to "$1***",
         // URL / 表单 / JSON 里的 key=、token=、secret= 等
-        Regex("(?i)\\b((?:api[_-]?key|key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|code|admin[_-]?key)=)[^&\\s\"']+") to "$1***",
+        Regex("(?i)\\b((?:api[_-]?key|key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|admin[_-]?key)=)[^&\\s\"']+") to "$1***",
+        // OAuth code= 只脱敏长值（gRPC 的 code=7 之类状态码保留，便于排障）
+        Regex("(?i)\\b(code=)[^&\\s\"']{10,}") to "$1***",
         Regex("(?i)(\"(?:api[_-]?key|access_?token|refresh_?token|id_?token|client_?secret|admin_?key|accessToken|refreshToken)\"\\s*:\\s*\")[^\"]*\"") to "$1***\"",
         // Cookie 值（Google 系 Cookie 名）
         Regex("(?i)\\b((?:__Secure-[A-Za-z0-9_\\-]+|__Host-[A-Za-z0-9_\\-]+|SAPISID|APISID|HSID|SSID|SID|SIDCC|NID|OSID)=)[^;\\s\"']+") to "$1***",
