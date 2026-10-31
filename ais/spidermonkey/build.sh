@@ -77,12 +77,19 @@ export MOZCONFIG=/tmp/mozconfig-sm MOZBUILD_STATE_PATH=/tmp/mozbuild MACH_NO_WRI
 # ---------- 4. 打包 ----------
 OBJ="$SM_SRC/obj-sm"
 JS_A="$(find "$OBJ" -name libjs_static.a -not -path '*/dist/*' | head -1)"
-RS_A="$(find "$OBJ" -name libjsrust.a -path '*aarch64-unknown-linux-musl*' | head -1)"
-[ -n "$JS_A" ] && [ -n "$RS_A" ] || { echo "找不到静态库"; find "$OBJ" -name '*.a' | head -50; exit 1; }
+RS_A="$(find "$OBJ" -name libjsrust.a -not -path '*/dist/*' | head -1)"
+echo "静态库清单:"; find "$OBJ" -name '*.a' -not -path '*/dist/*' -exec ls -l {} \;
+[ -n "$JS_A" ] || { echo "找不到 libjs_static.a"; exit 1; }
 PKG=/tmp/sm-pkg; rm -rf "$PKG"; mkdir -p "$PKG/include" "$PKG/lib"
 cp -rL "$OBJ/dist/include/." "$PKG/include/"
 cp "$JS_A" "$PKG/lib/libjs_static.a"
-cp "$RS_A" "$PKG/lib/libjsrust.a"
+if [ -n "$RS_A" ]; then
+  cp "$RS_A" "$PKG/lib/libjsrust.a"
+else
+  # 新版构建把 Rust 部分并进了 libjs_static.a；AIS 的 cgo 仍写 -ljsrust，放一个空归档保持目录结构兼容
+  echo "::notice::没有单独的 libjsrust.a（Rust 代码已在 libjs_static.a 内），生成空归档"
+  llvm-ar rc "$PKG/lib/libjsrust.a"
+fi
 llvm-strip --strip-debug "$PKG/lib/libjs_static.a" "$PKG/lib/libjsrust.a" || true
 mkdir -p "$(dirname "$OUT")"
 tar -czf "$OUT" -C "$PKG" include lib
