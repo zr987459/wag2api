@@ -1,0 +1,15 @@
+# 精简版 SpiderMonkey（linux-arm64 musl 静态库，给 Go cgo 用）
+# 与上游 Mag1cFall/firefox v152.0.4-aistudio2api.1 相同的源码与补丁、相同工具链（zig 0.16 = clang 21 + libc++ + musl），
+# 只改：-Os、不出调试信息、不编 js shell / 测试 / 动态库、Rust 用 opt-level=s、ICU 数据按 icu-languages.txt 裁剪。
+# Intl、JIT、WebAssembly、Temporal 全部保留（BotGuard 指纹会探测这些能力，AIS 的 Camoufox 语言/时区伪装也依赖 Intl）。
+ac_add_options --enable-project=js
+ac_add_options --target=aarch64-unknown-linux-musl
+ac_add_options --disable-bootstrap
+ac_add_options --enable-optimize=-Os
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --disable-tests
+ac_add_options --disable-js-shell
+ac_add_options --disable-shared-js
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-sm
+export RUSTC_OPT_LEVEL=s

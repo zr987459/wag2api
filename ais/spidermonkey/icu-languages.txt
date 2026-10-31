@@ -1,0 +1,12 @@
+# 精简版 ICU 数据保留的语言（ICU localeFilter，filterType=language：保留该语言的所有地区/文字变体）。
+# 账户指纹的 Locale（navigator.language / Intl 默认语言）不在这里时，SpiderMonkey 会回退到其他语言，
+# 指纹可能与 Firefox 不一致。需要更多语言就往这里加，然后重新跑 spidermonkey.yml（或在触发时用 icu_languages 输入覆盖）。
+# 写 all 表示不做语言裁剪（只保留 Firefox 自带的 data_filter.json 裁剪）。
+en zh ja ko
+de fr es pt it nl
+ru uk pl cs sk sl hr sr bg ro hu el
+sv da fi nb no
+lt lv et
+tr ar he fa hi id ms th vi fil ca
+# 旧语言代码别名（iw=he, in=id, tl=fil, sh=sr, mo=ro）
+iw in tl sh mo

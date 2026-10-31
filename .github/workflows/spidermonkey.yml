@@ -1,0 +1,242 @@
+name: SpiderMonkey lite
+
+# 手动触发：按上游 Mag1cFall/firefox v152.0.4-aistudio2api.1 的源码重编精简版 SpiderMonkey（linux-arm64 musl 静态库），
+# 在 arm64 机器上和原版各链接一次 AIS、比较 .so 体积并跑 JS 能力冒烟比对，通过后发布到本仓库 Release（预发布）。
+# 改了本 workflow 或 ais/spidermonkey/ 时也会自动跑一次（只验证，不发布）。
+on:
+  workflow_dispatch:
+    inputs:
+      icu_languages:
+        description: 'ICU 保留语言（空格分隔，all=不裁剪，留空=ais/spidermonkey/icu-languages.txt）'
+        required: false
+        default: ''
+      publish:
+        description: '验证通过后发布 Release'
+        type: boolean
+        default: true
+  push:
+    branches: ['refactor/**', 'm8/**']
+    paths:
+      - '.github/workflows/spidermonkey.yml'
+      - 'ais/spidermonkey/**'
+
+permissions:
+  contents: write
+
+env:
+  # 上游：Mag1cFall/firefox tag v152.0.4-aistudio2api.1（FIREFOX_152_0_4_RELEASE + AIStudio2API 补丁）
+  FIREFOX_REPO: https://github.com/Mag1cFall/firefox.git
+  FIREFOX_SHA: e297ff009d3b9afee0e223c02ae3271ef24d51b6
+  SM_UPSTREAM: v152.0.4-aistudio2api.1
+  SM_TAG: sm-v152.0.4-lite.1
+  SM_ASSET: spidermonkey-v152.0.4-lite.1-linux-arm64.tar.gz
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾出磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装工具链（clang/llvm、zig、Rust musl 目标）
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm m4 make unzip zip
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /tmp
+          echo "ZIG=/tmp/zig-x86_64-linux-$ZIG_VERSION/zig" >> "$GITHUB_ENV"
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-unknown-linux-musl
+          rustc --version; clang --version | head -1; /tmp/zig-x86_64-linux-$ZIG_VERSION/zig version
+
+      - name: 拉取上游 Firefox 源码（浅克隆指定提交）
+        run: |
+          set -e
+          git init -q /tmp/firefox
+          git -C /tmp/firefox remote add origin "$FIREFOX_REPO"
+          git -C /tmp/firefox fetch -q --depth 1 origin "$FIREFOX_SHA"
+          git -C /tmp/firefox checkout -q FETCH_HEAD
+          git -C /tmp/firefox log -1 --format='%H %s'
+          df -h /
+
+      - name: 编译精简版 SpiderMonkey
+        env:
+          SM_SRC: /tmp/firefox
+          ICU_LANGS: ${{ github.event.inputs.icu_languages }}
+          OUT: ${{ github.workspace }}/dist/${{ env.SM_ASSET }}
+        run: bash ais/spidermonkey/build.sh
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm-build-logs
+          path: |
+            /tmp/firefox/obj-sm/config.log
+            /tmp/icu-*.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sm-lite
+          path: dist/${{ env.SM_ASSET }}
+
+  verify:
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sm-lite
+          path: dist
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 准备 zig、原版与精简版静态库、AIS 源码
+        run: |
+          set -e
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /tmp
+          echo "ZIG=/tmp/zig-aarch64-linux-$ZIG_VERSION/zig" >> "$GITHUB_ENV"
+          mkdir -p /tmp/sm-orig /tmp/sm-lite
+          curl -fsSL -o /tmp/sm-orig.tar.gz "https://github.com/Mag1cFall/firefox/releases/download/$SM_UPSTREAM/spidermonkey-$SM_UPSTREAM-linux-arm64.tar.gz"
+          tar -xzf /tmp/sm-orig.tar.gz -C /tmp/sm-orig
+          tar -xzf "dist/$SM_ASSET" -C /tmp/sm-lite
+          git clone -q https://github.com/Mag1cFall/AIStudio2API.git /tmp/ais
+          git -C /tmp/ais checkout -q "$(cat ais/UPSTREAM_SHA)"
+          git -C /tmp/ais apply "$GITHUB_WORKSPACE/ais/android.patch"
+          (cd /tmp/ais/web && npm ci --silent && npm run build --silent)
+          cp ais/spidermonkey/smoke_test.go /tmp/ais/internal/waa/mozjs/zz_sm_smoke_test.go
+
+      - name: 链接 AIS（与 build.yml 相同参数）并比较体积
+        run: |
+          set -e
+          Z="$ZIG"
+          build() { # $1=静态库目录 $2=输出 $3=额外链接参数
+            (cd /tmp/ais && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+              CC="$Z cc -target aarch64-linux-musl" CXX="$Z c++ -target aarch64-linux-musl" \
+              CGO_CXXFLAGS="-I$1/include" CGO_LDFLAGS="-L$1/lib" \
+              go build -trimpath -tags netgo,osusergo -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all $3'" \
+              -o "$2" ./cmd/aistudio2api)
+          }
+          build /tmp/sm-orig /tmp/ais-orig ""
+          build /tmp/sm-lite /tmp/ais-lite ""
+          build /tmp/sm-orig /tmp/ais-orig-gc "-Wl,--gc-sections -Wl,--icf=all"
+          build /tmp/sm-lite /tmp/ais-lite-gc "-Wl,--gc-sections -Wl,--icf=all"
+          sz() { stat -c %s "$1"; }
+          mb() { awk "BEGIN{printf \"%.2f MB\", $1/1048576}"; }
+          gz() { gzip -9 -c "$1" | wc -c; }
+          {
+            echo "| 项目 | 原版 $SM_UPSTREAM | 精简版 $SM_TAG |"
+            echo "|---|---|---|"
+            echo "| tar.gz | $(mb $(sz /tmp/sm-orig.tar.gz)) | $(mb $(sz dist/$SM_ASSET)) |"
+            echo "| lib/libjs_static.a | $(mb $(sz /tmp/sm-orig/lib/libjs_static.a)) | $(mb $(sz /tmp/sm-lite/lib/libjs_static.a)) |"
+            echo "| lib/libjsrust.a | $(mb $(sz /tmp/sm-orig/lib/libjsrust.a)) | $(mb $(sz /tmp/sm-lite/lib/libjsrust.a)) |"
+            echo "| 解压后合计 | $(du -sm /tmp/sm-orig | cut -f1) MB | $(du -sm /tmp/sm-lite | cut -f1) MB |"
+            echo "| libaistudio2api.so（build.yml 现参数） | $(mb $(sz /tmp/ais-orig)) | $(mb $(sz /tmp/ais-lite)) |"
+            echo "| 同上 gzip -9（≈APK 内压缩后） | $(mb $(gz /tmp/ais-orig)) | $(mb $(gz /tmp/ais-lite)) |"
+            echo "| .so 加 -Wl,--gc-sections -Wl,--icf=all | $(mb $(sz /tmp/ais-orig-gc)) | $(mb $(sz /tmp/ais-lite-gc)) |"
+          } | tee /tmp/sizes.md
+          cat /tmp/sizes.md >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p dist && cp /tmp/sizes.md dist/sizes.md
+
+      - name: JS 能力冒烟比对（原版 vs 精简版）
+        run: |
+          set -e
+          Z="$ZIG"
+          smoke() { # $1=静态库目录 $2=输出
+            (cd /tmp/ais && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+              CC="$Z cc -target aarch64-linux-musl" CXX="$Z c++ -target aarch64-linux-musl" \
+              CGO_CXXFLAGS="-I$1/include" CGO_LDFLAGS="-L$1/lib" \
+              go test -c -trimpath -tags netgo,osusergo -ldflags="-linkmode external -extldflags '-static'" \
+              -o "/tmp/smoke-$(basename $1)" ./internal/waa/mozjs)
+            SM_SMOKE_OUT="$2" "/tmp/smoke-$(basename $1)" -test.run TestSpiderMonkeyLiteSmoke -test.v
+          }
+          smoke /tmp/sm-orig /tmp/smoke-orig.txt
+          smoke /tmp/sm-lite /tmp/smoke-lite.txt
+          cp /tmp/smoke-orig.txt /tmp/smoke-lite.txt dist/
+          {
+            echo; echo "### 冒烟比对"
+            echo '```diff'
+            diff /tmp/smoke-orig.txt /tmp/smoke-lite.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 保留语言内的结果必须与原版逐行一致；sw-KE（不在保留列表）只展示差异，supportedLocalesOf/supportedValuesOf 的差异是裁剪的预期结果
+          if diff <(grep -v '^sw-KE|' /tmp/smoke-orig.txt | grep -v '|supported=' ) \
+                  <(grep -v '^sw-KE|' /tmp/smoke-lite.txt | grep -v '|supported=' ); then
+            echo "冒烟比对通过（保留语言内与原版一致）"
+          else
+            echo "::error::精简版与原版的 JS 结果不一致"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sm-verify
+          path: dist/*.md
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sm-smoke
+          path: dist/smoke-*.txt
+          if-no-files-found: ignore
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    needs: [build, verify]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sm-lite
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: sm-verify
+          path: verify
+      - name: 发布 Release（预发布）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -e
+          cd dist && sha256sum "$SM_ASSET" > SHA256SUMS && cd ..
+          {
+            echo "精简版 SpiderMonkey 152.0.4（linux-arm64 musl 静态库），供 AIS 引擎 cgo 链接。"
+            echo
+            echo "源码：Mag1cFall/firefox $SM_UPSTREAM（$FIREFOX_SHA），工具链 zig $ZIG_VERSION（clang 21 + libc++ + musl），与上游一致；"
+            echo "改动：-Os、Rust opt-level=s、无调试信息、不编 shell/测试/动态库、ICU 数据按 ais/spidermonkey/icu-languages.txt 裁剪语言。Intl / JIT / WebAssembly / Temporal 均保留。"
+            echo "目录结构与上游 tar.gz 相同（include/ + lib/libjs_static.a + lib/libjsrust.a），可直接替换。"
+            echo
+            echo "构建：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            cat verify/sizes.md
+          } > notes.md
+          if gh release view "$SM_TAG" >/dev/null 2>&1; then
+            gh release upload "$SM_TAG" "dist/$SM_ASSET" dist/SHA256SUMS --clobber
+            gh release edit "$SM_TAG" --prerelease --notes-file notes.md
+          else
+            gh release create "$SM_TAG" "dist/$SM_ASSET" dist/SHA256SUMS --prerelease \
+              --target "$GITHUB_SHA" --title "SpiderMonkey 152.0.4 lite.1 (linux-arm64)" --notes-file notes.md
+          fi
