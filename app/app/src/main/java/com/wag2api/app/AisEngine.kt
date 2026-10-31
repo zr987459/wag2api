@@ -8,7 +8,12 @@ object AisEngine {
     private const val TAG = "AIS"
     const val baseUrl = "http://127.0.0.1:8820"
 
-    private const val MAX_LOG_LINES = 300
+    /** 只保留最近 200 行日志（环形缓冲） */
+    private const val MAX_LOG_LINES = 200
+
+    /** 用户手动开启 AIS 的设置（与 EngineRouter 同一个 SharedPreferences） */
+    private const val PREF = "wag2api_router"
+    private const val KEY_AIS_ENABLED = "ais_enabled"
     private val logBuffer = ArrayDeque<String>(MAX_LOG_LINES)
     private val logLock = Any()
 
@@ -21,10 +26,78 @@ object AisEngine {
     private var supervisorThread: Thread? = null
     private var appContext: Context? = null
 
+    /**
+     * AIS 二进制是否存在。
+     * 不带 ctx 的调用来自转发入口（EngineRouter.proxyToAis）：此时若子进程没起，按需拉起并等端口就绪，
+     * 这样“还没有 AIS 账号、子进程未启动”时，控制台添加第一个账号的请求也能打到 AIS。
+     */
     fun isAvailable(ctx: Context? = null): Boolean {
         val c = ctx ?: appContext ?: return false
         val bin = File(c.applicationInfo.nativeLibraryDir, "libaistudio2api.so")
-        return bin.exists()
+        if (!bin.exists()) return false
+        if (ctx == null && !isRunning()) ensureStarted(c, waitMs = 8_000L)
+        return true
+    }
+
+    /** 已有 AIS 账号：ais/auth 下存在带 storage-state.json 的账号目录 */
+    fun hasAccounts(ctx: Context): Boolean {
+        val authDir = File(ctx.filesDir, "ais/auth")
+        val dirs = authDir.listFiles() ?: return false
+        return dirs.any { it.isDirectory && !it.name.startsWith(".") && File(it, "storage-state.json").isFile }
+    }
+
+    fun isEnabledInSettings(ctx: Context): Boolean =
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean(KEY_AIS_ENABLED, false)
+
+    /** 设置里开关 AIS：开启立即启动；关闭时若没有账号则停掉子进程 */
+    fun setEnabled(ctx: Context, on: Boolean) {
+        val app = ctx.applicationContext
+        app.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putBoolean(KEY_AIS_ENABLED, on).apply()
+        if (on) ensureStarted(app) else if (!hasAccounts(app)) stop()
+    }
+
+    /** 开机自启条件：有 AIS 账号，或用户在设置里开启 */
+    fun shouldAutoStart(ctx: Context): Boolean = hasAccounts(ctx) || isEnabledInSettings(ctx)
+
+    /** 只在满足条件时启动（GatewayService 启动时调用） */
+    fun startIfNeeded(ctx: Context): Boolean {
+        val app = ctx.applicationContext
+        appContext = app
+        if (!shouldAutoStart(app)) {
+            Log.i(TAG, "没有 AIS 账号且未在设置中开启，AIS 子进程不启动")
+            return false
+        }
+        start(app)
+        return true
+    }
+
+    /**
+     * 按需启动并（可选）等待 127.0.0.1:8820 可连接；启动后后台同步一次模型表。
+     * @return 等待结束时 AIS 是否在运行
+     */
+    fun ensureStarted(ctx: Context, waitMs: Long = 0L): Boolean {
+        val app = ctx.applicationContext
+        if (!stopped && isRunning()) return if (waitMs > 0) waitPort(waitMs) else true
+        start(app)
+        if (stopped) return false   // 二进制不存在
+        Thread({
+            if (waitPort(30_000L)) EngineRouter.syncAisModels(app)
+        }, "Ais-ModelSync-OnDemand").apply { isDaemon = true; start() }
+        return if (waitMs > 0) waitPort(waitMs) else isRunning()
+    }
+
+    /** 等 AIS 端口可连接 */
+    fun waitPort(timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                java.net.Socket().use { it.connect(java.net.InetSocketAddress("127.0.0.1", 8820), 300) }
+                return true
+            } catch (e: Exception) {
+                try { Thread.sleep(200) } catch (ie: InterruptedException) { return false }
+            }
+        }
+        return false
     }
 
     fun isRunning(): Boolean {
@@ -46,9 +119,17 @@ object AisEngine {
             return
         }
         if (!stopped && isRunning()) return
+        val sup = supervisorThread
+        if (!stopped && sup != null && sup.isAlive) {
+            // 守护线程还在（处于重启退避中）：不再起第二个，只把它从 sleep 里叫醒立即重启
+            if (process == null) sup.interrupt()
+            return
+        }
 
         stopped = false
-        supervisorThread?.interrupt()
+        // 等子进程真正 start() 后再返回，调用方可立即用 isRunning() 判断
+        val launched = java.util.concurrent.CountDownLatch(1)
+        launchedSignal = launched
         supervisorThread = Thread({
             var delayMs = 5000L
             while (!stopped) {
@@ -70,7 +151,11 @@ object AisEngine {
             isDaemon = true
             start()
         }
+        try { launched.await(3, java.util.concurrent.TimeUnit.SECONDS) } catch (ignored: InterruptedException) {}
     }
+
+    @Volatile
+    private var launchedSignal: java.util.concurrent.CountDownLatch? = null
 
     @Synchronized
     fun stop() {
@@ -97,6 +182,9 @@ object AisEngine {
             val env = pb.environment()
             env["HOME"] = dataDir.absolutePath
             env["TMPDIR"] = ctx.cacheDir.absolutePath
+            // 省内存：Go 运行时软上限 64MiB，GC 更积极
+            env["GOMEMLIMIT"] = "64MiB"
+            env["GOGC"] = "50"
             // 静态 musl 二进制：安卓没有 /etc/resolv.conf 与 /etc/ssl，显式给出系统 DNS 与证书目录
             systemDns(ctx)?.let { env["AIS_DNS"] = it }
             env["SSL_CERT_DIR"] = listOf("/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts")
@@ -105,6 +193,7 @@ object AisEngine {
 
             val p = pb.start()
             process = p
+            launchedSignal?.countDown()
 
             val readerThread = Thread({
                 try {
@@ -124,7 +213,9 @@ object AisEngine {
             System.currentTimeMillis() - startTime > 60_000L
         } catch (e: Exception) {
             Log.e(TAG, "运行 AIS 进程出错", e)
+            appendLog("AIS 启动失败: ${e.message}")
             process = null
+            launchedSignal?.countDown()
             false
         }
     }

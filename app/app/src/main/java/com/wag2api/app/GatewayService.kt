@@ -8,12 +8,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.ConnectivityManager
-import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import androidx.core.app.NotificationCompat
 import com.wag2api.app.engine.EngineFactory
 import com.wag2api.app.engine.EngineState
 import com.wag2api.app.engine.NodeEngineApi
@@ -21,16 +18,12 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.TimeUnit
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * 网关守护服务：**唯一的**前台通知、悬浮球与 WakeLock 持有者。
  *
- * 启动顺序：先起前门（WB 毫秒级就绪），再异步 bind Node 引擎，Node 不阻塞前台服务启动。
+ * 启动顺序：先起前门（毫秒级就绪），再在后台线程启动进程内 Kotlin AG 引擎（v2 已无 Node 进程）；
+ * AIS 子进程只在有 AIS 账号或设置里开启时才启动。
  */
 class GatewayService : Service() {
 
@@ -73,7 +66,7 @@ class GatewayService : Service() {
 
         /**
          * 热切换前门端口：在后台线程里先在新端口起一个新的 LocalGatewayServer，成功后再停旧的；
-         * 新端口起不来就保留旧前门并把设置改回旧端口。只动前门，Node AG 引擎不重启。
+         * 新端口起不来就保留旧前门并把设置改回旧端口。只动前门，AG 引擎不重启。
          * 调用方应已把响应发出去（本方法会先等一小会儿让旧连接收尾）。
          */
         fun switchFrontDoorPort(ctx: Context, newPort: Int, oldPort: Int) {
@@ -157,50 +150,6 @@ class GatewayService : Service() {
     }
     private lateinit var engine: NodeEngineApi
 
-    // PR4：网络恢复 / 切换时通知 Node 预热（token + projectId + 上游 TLS 连接），省掉下一次请求的握手
-    private var netCallback: ConnectivityManager.NetworkCallback? = null
-    @Volatile private var lastPrewarmAt = 0L
-    private val prewarmClient by lazy {
-        OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).build()
-    }
-
-    private fun triggerPrewarm(reason: String) {
-        if (!::engine.isInitialized || engine.state != EngineState.READY) return
-        val now = System.currentTimeMillis()
-        if (now - lastPrewarmAt < 3_000L) return
-        lastPrewarmAt = now
-        val p = engine.port
-        if (p <= 0) return
-        Thread {
-            try {
-                Thread.sleep(1_500L)   // 等新网络的路由 / DNS 稳定
-                val req = Request.Builder()
-                    .url("http://127.0.0.1:$p/api/prewarm")
-                    .header("X-Engine-Token", EngineTokenHolder.token)
-                    .post("{\"reason\":\"$reason\"}".toRequestBody("application/json".toMediaType()))
-                    .build()
-                prewarmClient.newCall(req).execute().close()
-            } catch (ignored: Exception) {}
-        }.start()
-    }
-
-    private fun registerNetworkPrewarm() {
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) { triggerPrewarm("network") }
-        }
-        try {
-            cm.registerDefaultNetworkCallback(cb)
-            netCallback = cb
-        } catch (ignored: Exception) {}
-    }
-
-    private fun unregisterNetworkPrewarm() {
-        val cb = netCallback ?: return
-        try { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } catch (ignored: Exception) {}
-        netCallback = null
-    }
-
     /**
      * 只在「有请求在处理」时持有 WakeLock，空闲立即释放：
      * 熄屏后长思考/长输出不会被挂起，平时也不白白耗电。
@@ -238,24 +187,20 @@ class GatewayService : Service() {
         createNotificationChannel()
         startForegroundServiceNotification()   // 必须在 startForegroundService 后 5 秒内调用
 
-        // AIS 引擎启动（两个 flavor 都启动）
-        AisEngine.start(applicationContext)
+        val app = applicationContext
+        engine = EngineFactory.create(app) { EngineFactory.token(app) }
+        EngineFactory.injectToken(app)
+
+        // AIS 子进程：只有存在 AIS 账号或用户在设置里开启时才启动（否则由首次 AIS 请求按需拉起）
         Thread({
-            val deadline = System.currentTimeMillis() + 30_000
-            while (System.currentTimeMillis() < deadline && !AisEngine.isRunning()) {
-                Thread.sleep(500)
-            }
-            if (AisEngine.isRunning()) {
+            if (AisEngine.startIfNeeded(applicationContext) && AisEngine.waitPort(30_000L)) {
                 EngineRouter.syncAisModels(applicationContext)
             }
             updateNotification()
-        }, "Ais-ModelSync-Init").apply {
+        }, "Ais-Start").apply {
             isDaemon = true
             start()
         }
-
-        engine = EngineFactory.create(applicationContext)
-        EngineFactory.injectToken(applicationContext)
 
         // 前门服务启动，管理面板始终保持可用
         val listenPort = getPort(applicationContext)
@@ -263,13 +208,17 @@ class GatewayService : Service() {
         server?.start()
         isRunning = true
 
-        // Node 引擎异步启动，不阻塞前台服务
-        if (EngineFactory.SUPPORTS_NODE && isNodeEnabled()) {
-            Thread {
+        // AG 引擎（进程内）异步启动，不阻塞前台服务；首次启动可能要迁移旧 Node 数据目录
+        if (isNodeEnabled()) {
+            Thread({
                 try {
-                    wakeLock.acquire(30_000L)   // 首次 AssetCopier 复制文件较慢，短时保活
+                    wakeLock.acquire(30_000L)   // 首次迁移旧数据较慢，短时保活
                 } catch (ignored: Exception) {}
-                engine.start()
+                try {
+                    engine.start()
+                } catch (e: Throwable) {
+                    android.util.Log.e("GatewayService", "AG 引擎启动失败", e)
+                }
 
                 // 等就绪后拉模型表，落盘缓存
                 val deadline = System.currentTimeMillis() + 30_000
@@ -282,11 +231,10 @@ class GatewayService : Service() {
                     )
                 }
 
-                try { if (wakeLock.isHeld) wakeLock.release() } catch (ignored: Exception) {}
+                try { if (wakeLock.isHeld && activeRequests.get() <= 0) wakeLock.release() } catch (ignored: Exception) {}
                 updateNotification()
-            }.start()
+            }, "AgEngine-Start").start()
         }
-        registerNetworkPrewarm()
         updateNotification()
     }
 
@@ -312,7 +260,8 @@ class GatewayService : Service() {
 
     private fun aisStateLabel(): String = when {
         AisEngine.isRunning() -> "AIS ✓"
-        AisEngine.isAvailable(this) -> "AIS 启动中"
+        AisEngine.isAvailable(this) && AisEngine.shouldAutoStart(this) -> "AIS 启动中"
+        AisEngine.isAvailable(this) -> "AIS 待命"
         else -> "AIS 未安装"
     }
 
@@ -321,7 +270,7 @@ class GatewayService : Service() {
         EngineState.STARTING -> "AG 启动中"
         EngineState.FAILED -> "AG 异常"
         EngineState.DRAINING, EngineState.STOPPING -> "AG 停止中"
-        EngineState.OFF -> if (EngineFactory.SUPPORTS_NODE) "AG 已关闭" else "AG 不支持"
+        EngineState.OFF -> "AG 已关闭"
     }
 
     private fun updateNotification() {
@@ -341,14 +290,20 @@ class GatewayService : Service() {
             this, 0, launchIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // 平台 Notification.Builder，不依赖 androidx.core
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this).setPriority(Notification.PRIORITY_DEFAULT)
+        }
+        return builder
             .setContentTitle("wag2api 网关运行中")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
             .build()
     }
 
@@ -367,7 +322,6 @@ class GatewayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         AisEngine.stop()
-        unregisterNetworkPrewarm()
         try { engine.stop() } catch (ignored: Exception) {}
         server?.stop()
         isRunning = false
