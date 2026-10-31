@@ -16,4 +16,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "wag2api"
 include(":app")
-include(":engine-node")

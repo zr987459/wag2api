@@ -1,4 +1,0 @@
--keepclasseswithmembernames class * { native <methods>; }
--keepclassmembers class * { @android.webkit.JavascriptInterface <methods>; }
--keep class org.agopen.gateway.NodeService { *; }
--keepattributes JavascriptInterface

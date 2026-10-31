@@ -17,8 +17,10 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.Wag2api"
-        android:usesCleartextTraffic="true"
-        android:extractNativeLibs="true">
+        android:usesCleartextTraffic="true">
+        <!-- v2：去掉 android:extractNativeLibs，由 build.gradle.kts 的 jniLibs.useLegacyPackaging 决定。
+             AIS 二进制要 exec，安装时仍需解压到 nativeLibraryDir（见 build.gradle.kts 注释）。
+             引擎全部在主进程内（AG=Kotlin，AIS=子进程），不再有 :node 进程。 -->
 
         <activity
             android:name=".MainActivity"

@@ -2,7 +2,7 @@ name: Build wag2api
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'refactor/**']
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -43,14 +43,17 @@ jobs:
         working-directory: app
         run: |
           chmod +x gradlew
-          ./gradlew :app:compileFullReleaseKotlin --no-daemon --console=plain
+          ./gradlew :app:compileReleaseKotlin --no-daemon --console=plain
 
   # ─────────────────────────────────────────────
-  # 2. APK：full + lite 一次出两个包
+  # 2. APK：v2 只出一个 wag2api.apk（没有 Node，AG 引擎是 Kotlin）
   # ─────────────────────────────────────────────
   apk:
-    # 打 tag 或手动触发时出完整包；main 分支只做轻量编译检查
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # 打 tag、手动触发、或推 refactor/** 分支时出包；main 分支只做轻量编译检查
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/refactor/'))
     runs-on: ubuntu-latest
     needs: engine-test
     steps:
@@ -67,6 +70,7 @@ jobs:
         with:
           go-version: '1.27.x'
 
+      # AIS 前端（web）构建要用 Node；APK 本身不再带 Node
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -98,28 +102,6 @@ jobs:
             -o "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" ./cmd/aistudio2api)
           file "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" || true
 
-      # nodejs-mobile 只保留 arm64，只有 full 用得到
-      - name: 缓存 nodejs-mobile
-        uses: actions/cache@v4
-        id: nm-cache
-        with:
-          path: app/engine-node/libnode
-          key: nodejs-mobile-18.20.4-arm64-v1
-
-      - name: 下载 nodejs-mobile
-        if: steps.nm-cache.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          URL=https://github.com/nodejs-mobile/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-android.zip
-          curl -sSL -o /tmp/nm.zip "$URL"
-          mkdir -p app/engine-node/libnode
-          unzip -q /tmp/nm.zip -d app/engine-node/libnode
-          rm -rf app/engine-node/libnode/bin/armeabi-v7a \
-                 app/engine-node/libnode/bin/x86 \
-                 app/engine-node/libnode/bin/x86_64
-
-      # Node 核心由 Gradle 的 syncNodeCore（preBuild）自动同步，这里不再重复 cp
-
       # keystore：有 Secret 就用正式签名，没有就退回 debug
       - name: 解密 keystore
         env:
@@ -131,11 +113,11 @@ jobs:
           fi
           mkdir -p app/keystore
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-            -in android/keystore/release.p12.enc \
+            -in app/signing/release.p12.enc \
             -out app/keystore/release.p12 -pass env:KS_PW
           echo "密钥已解密"
 
-      - name: 构建 full + lite
+      - name: 构建 release
         working-directory: app
         env:
           KS_PW: ${{ secrets.KS_PW }}
@@ -147,25 +129,18 @@ jobs:
             echo "::error::未找到解密的密钥库，无法保证固定签名"
             exit 1
           fi
-          ./gradlew assembleFullRelease assembleLiteRelease --no-daemon --stacktrace
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       # 签名硬校验：证书指纹必须与仓库变量一致，否则失败
-      - name: 校验签名（full 与 lite 必须同签名）
+      - name: 校验签名
         run: |
           set -e
           BT=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
-          FULL=$(ls app/app/build/outputs/apk/full/release/*.apk | head -1)
-          LITE=$(ls app/app/build/outputs/apk/lite/release/*.apk | head -1)
-          SHA_FULL=$("$BT" verify --print-certs "$FULL" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
-          SHA_LITE=$("$BT" verify --print-certs "$LITE" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
-          echo "full: $SHA_FULL"
-          echo "lite: $SHA_LITE"
-          if [ "$SHA_FULL" != "$SHA_LITE" ]; then
-            echo "::error::full 与 lite 签名不一致，无法互相覆盖安装"
-            exit 1
-          fi
+          APK=$(ls app/app/build/outputs/apk/release/*.apk | head -1)
+          SHA=$("$BT" verify --print-certs "$APK" | grep -i 'SHA-256 digest' | head -1 | awk '{print $NF}')
+          echo "cert: $SHA"
           if [ -n "$EXPECTED" ]; then
-            if [ "$SHA_FULL" != "$EXPECTED" ]; then
+            if [ "$SHA" != "$EXPECTED" ]; then
               echo "::error::签名指纹与 RELEASE_CERT_SHA256 不一致，会导致无法覆盖安装"
               exit 1
             fi
@@ -176,35 +151,34 @@ jobs:
         env:
           EXPECTED: ${{ vars.RELEASE_CERT_SHA256 }}
 
-      - name: 检查产物结构
+      - name: 检查产物结构与体积
         run: |
           set -e
-          FULL=$(ls app/app/build/outputs/apk/full/release/*.apk | head -1)
-          LITE=$(ls app/app/build/outputs/apk/lite/release/*.apk | head -1)
-          echo "full: $FULL"; echo "lite: $LITE"
-          if ! unzip -l "$FULL" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
-            echo "::error::full 包缺少 libaistudio2api.so"; exit 1
+          APK=$(ls app/app/build/outputs/apk/release/*.apk | head -1)
+          echo "apk: $APK"
+          if ! unzip -l "$APK" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
+            echo "::error::APK 缺少 libaistudio2api.so"; exit 1
           fi
-          if ! unzip -l "$LITE" | grep -q 'lib/arm64-v8a/libaistudio2api.so'; then
-            echo "::error::lite 包缺少 libaistudio2api.so"; exit 1
+          if unzip -l "$APK" | grep -q 'libnode.so'; then
+            echo "::error::v2 APK 不应包含 libnode.so"; exit 1
           fi
-          if ! unzip -l "$FULL" | grep -q 'libnode.so'; then
-            echo "::error::full 包缺少 libnode.so"; exit 1
+          if unzip -l "$APK" | grep -q 'assets/gateway/'; then
+            echo "::error::v2 APK 不应包含 Node 源码 assets/gateway"; exit 1
           fi
-          if unzip -l "$LITE" | grep -q 'libnode.so'; then
-            echo "::error::lite 包不应包含 libnode.so"; exit 1
-          fi
-          if ! unzip -l "$FULL" | grep -q 'assets/gateway/src/server.mjs'; then
-            echo "::error::full 包缺少 Node 核心"; exit 1
+          SIZE=$(stat -c %s "$APK")
+          echo "APK 体积: $((SIZE / 1024)) KB"
+          echo "### APK 体积：$((SIZE / 1024)) KB（目标 ≤ 10240 KB）" >> "$GITHUB_STEP_SUMMARY"
+          unzip -lv "$APK" | sort -k1 -n -r | head -15 >> "$GITHUB_STEP_SUMMARY" || true
+          if [ "$SIZE" -gt 10485760 ]; then
+            echo "::warning::APK 超过 10MB 目标（$((SIZE / 1024)) KB）"
           fi
           echo "结构检查通过"
 
-      - name: 重命名并上传
+      - name: 重命名
         run: |
           set -e
           mkdir -p dist
-          cp $(ls app/app/build/outputs/apk/full/release/*.apk | head -1) dist/wag2api.apk
-          cp $(ls app/app/build/outputs/apk/lite/release/*.apk | head -1) dist/wag2api-lite.apk
+          cp $(ls app/app/build/outputs/apk/release/*.apk | head -1) dist/wag2api.apk
 
       - uses: actions/upload-artifact@v4
         with:
@@ -316,3 +290,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # v2.* 在测试阶段一律发预发布
+          prerelease: ${{ startsWith(github.ref_name, 'v2.') }}

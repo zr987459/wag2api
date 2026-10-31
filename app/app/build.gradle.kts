@@ -22,30 +22,15 @@ android {
         targetSdk = 34
         versionCode = appVersionCode
         versionName = appVersionName
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    }
-
-    // full / lite 两个 flavor：包名与签名一致、versionCode 一致，可互相覆盖
-    flavorDimensions += "engine"
-    productFlavors {
-        create("full") {
-            dimension = "engine"
-            // 带 Node 引擎，只有 arm64
-            ndk { abiFilters += listOf("arm64-v8a") }
-            minSdk = 26
-            versionNameSuffix = ""
-        }
-        create("lite") {
-            dimension = "engine"
-            // 不带 Node，但内置 AIS 引擎（arm64）
-            ndk { abiFilters += listOf("arm64-v8a") }
-            versionNameSuffix = "-lite"
-        }
+        // v2：一个 APK、没有 Node。只剩内置 AIS 引擎（arm64 静态二进制）
+        ndk { abiFilters += listOf("arm64-v8a") }
+        // 只保留中英文资源，去掉依赖库带来的几十种语言
+        resourceConfigurations += listOf("zh", "en")
     }
 
     signingConfigs {
         create("release") {
-            // CI 从 android/keystore/release.p12.enc 解密到此路径。
+            // CI 从 app/signing/release.p12.enc 解密到此路径。
             // 必须固定同一个密钥库，否则每次构建签名不同，手机无法覆盖安装。
             val ks = rootProject.file("keystore/release.p12")
             if (ks.exists()) {
@@ -62,7 +47,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             val hasKs = rootProject.file("keystore/release.p12").exists() &&
                     !System.getenv("KS_PW").isNullOrEmpty()
             // CI 环境打包 APK 时必须用正式签名，否则每次签名不同会导致无法覆盖安装。
@@ -94,8 +80,18 @@ android {
     }
 
     packaging {
-        resources.excludes += setOf("META-INF/*.kotlin_module")
+        resources.excludes += setOf(
+            "META-INF/*.kotlin_module",
+            "META-INF/*.version",
+            "META-INF/LICENSE*",
+            "META-INF/NOTICE*",
+            "kotlin/**",
+            "DebugProbesKt.bin"
+        )
         jniLibs {
+            // 注意：libaistudio2api.so 不是 JNI 库，而是 AisEngine 用 ProcessBuilder 直接 exec 的可执行文件。
+            // useLegacyPackaging=false 时安装器不会把 .so 解压到 nativeLibraryDir，文件不存在就无法 exec，
+            // 而 Android 10+ 又禁止从 filesDir 执行文件，所以这里必须保持 true（合同 M5 条目的例外，见 PR 说明）。
             useLegacyPackaging = true
         }
     }
@@ -110,32 +106,11 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.12.0")
+    // MainActivity 继承 AppCompatActivity、主题继承 Theme.AppCompat，暂时保留；
+    // 换成平台 Activity + android:Theme.Material 后即可删掉（会连带去掉 androidx.core 等十几个库）
     implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.11.0")
+    // M3 UpstreamFetch.client 与 EngineRouter 用；全局只建一个 OkHttpClient
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-
-    // 只有 full 带 Node 引擎
-    "fullImplementation"(project(":engine-node"))
-}
-
-// ───────────────────────────────────────────────────────────
-// full 包构建前，把仓库根目录的 Node 核心同步进 assets/gateway
-// 保证 Linux 版、Docker、Android 共用同一份 src/，不出现两套代码各改各的
-// 用 Sync 而非 Copy：删掉的源文件不会残留在目标目录
-// ───────────────────────────────────────────────────────────
-val syncNodeCore by tasks.registering(Sync::class) {
-    from(rootProject.file("../src")) { into("gateway/src") }
-    from(rootProject.file("../package.json")) { into("gateway") }
-    into(layout.buildDirectory.dir("generated/nodeAssets"))
-}
-
-// AGP 只生成按变体命名的任务（preFullDebugBuild / preFullReleaseBuild），
-// 挂到全局 preBuild 上最稳，每个变体的 pre 任务都会依赖它
-tasks.named("preBuild") { dependsOn(syncNodeCore) }
-
-android.sourceSets.getByName("full") {
-    assets.srcDir(layout.buildDirectory.dir("generated/nodeAssets"))
+    // 已删：core-ktx（无 ktx 扩展调用，通知改平台 API）、material（无引用）、
+    //       okhttp-sse（无引用）、kotlinx-coroutines（合同规定不用协程）
 }
