@@ -73,6 +73,9 @@ class AisWebWorker(
 
     private val main = Handler(Looper.getMainLooper())
     private var web: WebView? = null
+    @Volatile private var attached = false
+    /** 初始化拦截期间页面发出的 POST 路径（只记路径，用于排错） */
+    private val seenPosts = java.util.Collections.synchronizedList(ArrayList<String>())
     private val bridgeName = "_" + randomHex(5)
     private val pending = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
     private val streams = ConcurrentHashMap<String, LinkedBlockingQueue<JSONObject>>()
@@ -144,6 +147,7 @@ class AisWebWorker(
         onMain {
             try {
                 w.stopLoading()
+                WebViewHost.detach(w)
                 w.loadUrl("about:blank")
                 w.removeAllViews()
                 w.destroy()
@@ -191,6 +195,8 @@ class AisWebWorker(
         if (ready == null) throw IOException("AI Studio 输入框未就绪（$pageUrl）")
 
         email = (evalSync(JS_EMAIL, 5_000) as? String)?.takeIf { it.contains('@') }
+        val raf = try { callAsync(JS_RAF, 5_000).opt("v") } catch (e: IOException) { "超时" }
+        log("[$accountId] 页面就绪（窗口=$attached，rAF=$raf，${evalSync(JS_DIAG, 5_000)}）")
         evalSync(JS_DISMISS, 5_000)
 
         // 定位官网 snapshot 函数并挂上 service 捕获
@@ -230,6 +236,7 @@ class AisWebWorker(
 
     private fun captureOnce(deadline: Long, useJsHook: Boolean): Map<String, String> {
         val fut = CompletableFuture<Map<String, String>>()
+        seenPosts.clear()
         capture = fut
         try {
             if (useJsHook) evalSync(js(JS_XHR_HOOK), 5_000)
@@ -241,6 +248,8 @@ class AisWebWorker(
             val h = try {
                 fut.get(remaining(deadline, 60_000), TimeUnit.MILLISECONDS)
             } catch (e: Exception) {
+                val diag = try { evalSync(JS_DIAG, 5_000)?.toString() } catch (x: Exception) { null }
+                log("[$accountId] 拦截超时诊断：窗口=$attached 页面=$diag POST=${synchronized(seenPosts) { seenPosts.joinToString(",") }}")
                 throw IOException("没有等到官网 GenerateContent 请求（拦截超时）")
             }
             return h
@@ -254,7 +263,8 @@ class AisWebWorker(
 
     private fun createWebView() {
         if (multiProfile()) ProfileStore.getInstance().getOrCreateProfile(profileName)
-        val w = WebView(ctx.applicationContext)
+        val hostCtx = WebViewHost.context(ctx.applicationContext)
+        val w = WebView(hostCtx ?: ctx.applicationContext)
         if (multiProfile()) WebViewCompat.setProfile(w, profileName)
         val s = w.settings
         s.javaScriptEnabled = true
@@ -298,6 +308,7 @@ class AisWebWorker(
                 val r = request ?: return null
                 if (!r.method.equals("POST", true)) return null
                 val url = r.url?.toString() ?: return null
+                if (seenPosts.size < 30) seenPosts.add((r.url?.host ?: "") + (r.url?.path ?: ""))
                 if (!url.contains("/MakerSuiteService/GenerateContent")) return null
                 val h = LinkedHashMap<String, String>()
                 for ((k, v) in r.requestHeaders ?: emptyMap()) h[k.lowercase()] = v
@@ -334,11 +345,15 @@ class AisWebWorker(
             }, bridgeName)
         }
 
-        // 不挂到窗口上：手动给一个桌面尺寸的布局，页面的可见性判断和输入框才能正常工作
-        val wSpec = View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY)
-        val hSpec = View.MeasureSpec.makeMeasureSpec(2000, View.MeasureSpec.EXACTLY)
-        w.measure(wSpec, hSpec)
-        w.layout(0, 0, 1280, 2000)
+        // 挂到私有虚拟屏的 Presentation 上（有窗口才出帧、rAF 才跑）；失败时退回手动布局
+        attached = hostCtx != null && WebViewHost.attach(w)
+        if (!attached) {
+            log("[$accountId] 虚拟屏窗口不可用（${WebViewHost.lastError}），退回离屏布局")
+            val wSpec = View.MeasureSpec.makeMeasureSpec(WebViewHost.WIDTH, View.MeasureSpec.EXACTLY)
+            val hSpec = View.MeasureSpec.makeMeasureSpec(WebViewHost.HEIGHT, View.MeasureSpec.EXACTLY)
+            w.measure(wSpec, hSpec)
+            w.layout(0, 0, WebViewHost.WIDTH, WebViewHost.HEIGHT)
+        }
         w.onResume()
         w.resumeTimers()
         web = w
@@ -593,6 +608,14 @@ class AisWebWorker(
             "var page={key:k,service:null};(function(k,f,page){page.snapshot=function(d){return f.call(ms,page.service,d);};" +
             "ms[k]=function(){var s=arguments[0];if(s&&(typeof s==='object'||typeof s==='function')){page.service=s;ms[k]=f;}return f.apply(this,arguments);};})(k,f,page);" +
             "Object.defineProperty(window,S,{value:page,configurable:true});return k;}return null;})()"
+
+        const val JS_RAF = "function(){return new Promise(function(r){var d=false;requestAnimationFrame(function(){d=true;r(true);});setTimeout(function(){if(!d)r(false);},2000);});}"
+
+        /** 排错用的页面状态：可见性、对话框文字、Run 按钮、输入框长度（不含 Cookie 等敏感信息） */
+        const val JS_DIAG = "(function(){var d=document.querySelector('mat-dialog-container,[role=dialog],[role=alertdialog]');var b=document.querySelector('ms-run-button button');var t=$TEXTAREA;" +
+            "return JSON.stringify({vis:document.visibilityState,focus:document.hasFocus(),dialog:d?(d.innerText||'').replace(/\\s+/g,' ').slice(0,200):null," +
+            "run:b?((b.getAttribute('aria-label')||'')+'|'+(b.innerText||'').trim().slice(0,30)+'|disabled='+b.disabled):null,ta:t?t.value.length:-1,path:location.pathname," +
+            "snack:(function(){var s=document.querySelector('mat-snack-bar-container,simple-snack-bar');return s?(s.innerText||'').slice(0,160):null;})()});})()"
 
         const val JS_HAS_SERVICE = "(function(){var p=window[Symbol.for('wg.page')];return !!(p&&p.service);})()"
 
