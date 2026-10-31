@@ -101,7 +101,6 @@ object EngineRouter {
         // ── 第 1 层：路径 ──────────────────────────────
         if (p.startsWith("/ag/")) return Route.ToNode(p.removePrefix("/ag"))
         if (p == "/ag") return Route.ToNode("/")
-        if (p == "/api/pairing/accounts") return Route.ToAis(p)
         if (p.startsWith("/api/")) return Route.ToNode(p)   // Node 控制台内部用绝对路径 fetch
 
         if (p.startsWith("/ais/api/") || p == "/ais/api") return Route.ToAis(p.removePrefix("/ais"))
@@ -242,7 +241,7 @@ object EngineRouter {
         stripModelPrefix: String? = null
     ) {
         if (!AisEngine.isAvailable()) {
-            writeError(out, 503, errorBody("AIS 引擎未安装或不可用"))
+            writeError(out, 503, errorBody("AIS 已在设置中关闭"))
             return
         }
 
@@ -269,7 +268,6 @@ object EngineRouter {
         }
 
         val reqBuilder = Request.Builder().url(url).method(method, rb)
-        val keepAuth = (path == "/api/pairing/accounts")
         for ((k, v) in headers) {
             val lk = k.lowercase()
             // accept-encoding 交给 OkHttp 自己管：透传浏览器的 gzip 会让 AIS 返回压缩体，
@@ -283,7 +281,7 @@ object EngineRouter {
                 lk == "x-api-key" ||
                 lk == "x-goog-api-key" ||
                 lk == "x-admin-key" ||
-                (lk == "authorization" && !keepAuth)
+                lk == "authorization"
             ) {
                 continue
             }

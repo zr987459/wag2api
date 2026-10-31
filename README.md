@@ -14,8 +14,8 @@
                              ▼                 ▼
                     ┌────────────────┐  ┌──────────────────┐
                     │  AIS 引擎       │  │  AG 引擎          │
-                    │  Go 原生子进程  │  │  Node (:node)     │
-                    │  AIStudio2API  │  │  Antigravity      │
+                    │  系统 WebView   │  │  Kotlin（进程内） │
+                    │  AI Studio 页面 │  │  Antigravity      │
                     └────────────────┘  └──────────────────┘
 ```
 
@@ -25,7 +25,7 @@
 - 🏠 全程本地运行，账号只存在自己设备上
 - 🎯 **统一入口**：一个端口、一套密钥，同时访问两家上游
 - 🧠 **双引擎独立**：任一上游失效，另一个照常可用
-- 📦 **两个安装包**：`full`（带 AG 引擎，arm64）/ `lite`（纯 Kotlin，全机型）
+- 📦 **一个安装包**：`wag2api.apk` 约 1 MB，不含任何原生库，全机型通用
 - 👥 多账号池、自动切换、额度查询
 - 📊 精确 Token 统计与请求日志
 - 🌓 白天 / 黑夜主题自动适配
@@ -39,14 +39,13 @@
 
 | 包 | 适用 | 大小 |
 | --- | --- | --- |
-| `wag2api.apk` | 主流手机（arm64），含双引擎 | 较大（内置 Node + AIS） |
-| `wag2api-lite.apk` | 主流手机（arm64），仅 AIS 引擎 | 轻量（仅内置 AIS） |
+| `wag2api.apk` | 安卓 7.0+ 全机型，含双引擎 | 约 1 MB |
 
-两个包**包名与签名相同**，可以互相覆盖安装，数据不丢。
+AIS 引擎借用系统 WebView（建议在应用商店把 Android System WebView 更新到较新版本）。包名与签名不变，可直接覆盖旧版安装，账号保留。
 
 装好后打开 App：
 
-1. **AIS 引擎**：Google AI Studio 网页协议，账号用粘贴 Cookie 或电脑端 `aistudio2api setup --remote` 远程添加（Linux/Docker 版暂不内置 AIS）
+1. **AIS 引擎**：Google AI Studio 网页协议，账号用粘贴电脑浏览器里已登录 AI Studio 的 Cookie 添加，详见 [docs/ais-webview.md](docs/ais-webview.md)（Linux/Docker 版暂不内置 AIS）
 2. **AG 引擎**：概览页 → AG 控制台 → 添加账号 → Google 登录
 3. **接入客户端**：密钥页 → 复制接入地址 `http://127.0.0.1:8800/v1` 与密钥
 

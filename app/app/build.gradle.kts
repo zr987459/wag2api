@@ -12,8 +12,6 @@ val versionProps = Properties().apply {
 val appVersionCode = versionProps.getProperty("VERSION_CODE").trim().toInt()
 val appVersionName = versionProps.getProperty("VERSION_NAME").trim()
 
-// AIS 后端：webview（默认，系统 WebView 实现，不打包 libaistudio2api.so）或 go（-PaisBackend=go，Go + SpiderMonkey 子进程）
-val aisBackend = ((project.findProperty("aisBackend") as String?) ?: "webview").trim().lowercase()
 
 android {
     namespace = "com.wag2api.app"
@@ -26,10 +24,8 @@ android {
         versionCode = appVersionCode
         versionName = appVersionName
         // v2：一个 APK、没有 Node。只剩内置 AIS 引擎（arm64 静态二进制）
-        ndk { abiFilters += listOf("arm64-v8a") }
         // 只保留中英文资源，去掉依赖库带来的几十种语言
         resourceConfigurations += listOf("zh", "en")
-        buildConfigField("String", "AIS_BACKEND", "\"$aisBackend\"")
     }
 
     testOptions {
@@ -98,14 +94,6 @@ android {
             "kotlin/**",
             "DebugProbesKt.bin"
         )
-        jniLibs {
-            // 注意：libaistudio2api.so 不是 JNI 库，而是 AisEngine 用 ProcessBuilder 直接 exec 的可执行文件。
-            // useLegacyPackaging=false 时安装器不会把 .so 解压到 nativeLibraryDir，文件不存在就无法 exec，
-            // 而 Android 10+ 又禁止从 filesDir 执行文件，所以这里必须保持 true（合同 M5 条目的例外，见 PR 说明）。
-            useLegacyPackaging = true
-            // WebView 版 AIS 不需要 Go 二进制：即使本地 jniLibs 里有，也不打进 APK
-            if (aisBackend == "webview") excludes += setOf("**/libaistudio2api.so")
-        }
     }
 
     compileOptions {

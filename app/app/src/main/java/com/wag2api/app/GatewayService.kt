@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * 网关守护服务：**唯一的**前台通知、悬浮球与 WakeLock 持有者。
  *
  * 启动顺序：先起前门（毫秒级就绪），再在后台线程启动进程内 Kotlin AG 引擎（v2 已无 Node 进程）；
- * AIS 子进程只在有 AIS 账号或设置里开启时才启动。
+ * AIS（WebView 版，进程内）在设置里的 AIS 开关打开时启动，WebView 按需创建。
  */
 class GatewayService : Service() {
 
@@ -191,7 +191,7 @@ class GatewayService : Service() {
         engine = EngineFactory.create(app) { EngineFactory.token(app) }
         EngineFactory.injectToken(app)
 
-        // AIS 子进程：只有存在 AIS 账号或用户在设置里开启时才启动（否则由首次 AIS 请求按需拉起）
+        // AIS（WebView 版，进程内）：设置里的 AIS 开关开着就启动；WebView 按需创建
         Thread({
             if (AisEngine.startIfNeeded(applicationContext) && AisEngine.waitPort(30_000L)) {
                 EngineRouter.syncAisModels(applicationContext)
@@ -260,9 +260,8 @@ class GatewayService : Service() {
 
     private fun aisStateLabel(): String = when {
         AisEngine.isRunning() -> "AIS ✓"
-        AisEngine.isAvailable(this) && AisEngine.shouldAutoStart(this) -> "AIS 启动中"
-        AisEngine.isAvailable(this) -> "AIS 待命"
-        else -> "AIS 未安装"
+        AisEngine.isEnabledInSettings(this) -> "AIS 启动中"
+        else -> "AIS 已关闭"
     }
 
     private fun nodeStateLabel(): String = when (engine.state) {

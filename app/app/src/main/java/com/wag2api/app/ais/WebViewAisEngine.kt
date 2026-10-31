@@ -36,14 +36,14 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * WebView 版 AIS 引擎（原型）：替代 Go + SpiderMonkey 的 libaistudio2api.so。
+ * AIS 引擎：用系统 WebView 承载 aistudio.google.com 页面，代替原来的 Go + SpiderMonkey 子进程。
  *
- * 在 127.0.0.1:8820（与 Go 版同一个地址）起一个进程内 HTTP 服务，前门 EngineRouter.proxyToAis 和控制台都不用改：
+ * 在 127.0.0.1:8820 起一个进程内 HTTP 服务，前门 EngineRouter.proxyToAis 和控制台都走这里：
  *  - /v1/models、/v1/chat/completions、/v1/messages（OpenAI 先经 OpenaiAgConverter 转成 Anthropic，再经 ContentConverter 转成 Google 格式，
  *    最后由 MakerSuiteWire 组成 AI Studio 私有协议；响应经 MakerSuiteStream 还原成 Google 流，交给 SseStreamer / OpenaiAgConverter 输出）
- *  - /api/… 里控制台用到的账号管理、状态、模型等接口（与 Go 版字段兼容的最小子集）
+ *  - /api/… 里控制台用到的账号管理、状态、模型等接口（字段沿用原 AIS 接口）
  *
- * 账号数据沿用 Go 版目录：filesDir/ais/auth/<id>/storage-state.json + account.json，导出 / 备份逻辑不用改。
+ * 账号数据目录：filesDir/ais/auth/<id>/storage-state.json + account.json（与旧版相同，升级后账号保留）。
  * 每个账号一个隐藏 WebView（[AisWebWorker]），按需创建，空闲 10 分钟销毁。
  */
 class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngineApi {

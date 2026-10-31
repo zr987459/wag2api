@@ -9,7 +9,6 @@ let lastStats = { ais: null, ag: null };
 const chatState = { ais: { history: [], html: '' }, ag: { history: [], html: '' } };
 const modelCache = { ais: null, ag: null };
 const aisRefreshTimes = {};
-let currentAisPairing = null;
 let aisDiscoveredAccounts = [];
 let aisAccountsCache = [];           // 缓存 /ais/api/accounts 返回的账号数组
 const aisRefreshErrors = {};         // id -> 最近一次刷新失败原因
@@ -23,8 +22,6 @@ let aisConfigCache = null;           // 缓存 /ais/api/config
 let aisCooldownsCache = [];          // 缓存 /ais/api/cooldowns
 let aisRequestsCache = [];           // 缓存 /ais/api/requests
 let aisEditingId = '';               // 当前正在编辑的 AIS 账号 ID
-let aisPairingPollTimer = null;
-let aisPairingInitialCount = 0;
 const aisTestResults = {};           // id -> { ok, latency_ms, model, error }
 const aisTestingAccounts = new Set();// 正在测试的 AIS 账号 ID
 let aisTestingAll = false;           // 是否正在全部测试 AIS 账号
@@ -183,7 +180,6 @@ function closeModal(id) {
   $(id).classList.remove('active');
   if (id === 'authModal') {
     if (activePollTimer) { clearInterval(activePollTimer); activePollTimer = null; }
-    if (aisPairingPollTimer) { clearInterval(aisPairingPollTimer); aisPairingPollTimer = null; }
   }
 }
 
@@ -1623,10 +1619,6 @@ function renderAisSchedulerCard() {
   if (!sch) return;
 
   const cfg = aisConfigCache || {};
-  const currentStrategy = cfg.routing_strategy || 'round-robin';
-  const channels = cfg.upstream_channels || ['playground', 'build'];
-  const hasPlayground = channels.includes('playground');
-  const hasBuild = channels.includes('build');
   const cdCount = (aisCooldownsCache || []).length;
 
   let html = `
@@ -1634,7 +1626,7 @@ function renderAisSchedulerCard() {
       <div>
         <span>账号调度</span>
         <div class="muted" style="font-size: 11px; margin-top: 2px;">
-          单号并发 ${cfg.per_account_concurrency || 2} · 通道 ${channels.join(' / ')} · 冷却 ${cdCount} 条
+          WebView 引擎 · 冷却 ${cdCount} 条
         </div>
       </div>
       <div style="display: flex; gap: 6px; flex-wrap: wrap;">
@@ -1642,34 +1634,9 @@ function renderAisSchedulerCard() {
           ${aisRefreshingAll ? `<span class="spinner"></span>刷新中 (${aisRefreshDone}/${aisRefreshTotal})` : '🔄 刷新全部'}
         </button>
         ${cdCount > 0 ? `<button class="btn btn-outline btn-sm" style="color:var(--warning); border-color:rgba(245,158,11,0.4);" onclick="aisClearAllCooldowns()">清除冷却 (${cdCount})</button>` : ''}
-        <button class="btn btn-outline btn-sm" onclick="openAisConfigModal()">⚙️ 设置</button>
       </div>
     </div>
 
-    <!-- 路由策略 -->
-    <div class="sched-modes-wrap" style="margin-top:8px;">
-      <div class="sched-modes-grid cols-2">
-        <button class="sched-mode-btn ${currentStrategy === 'round-robin' ? 'active' : ''}" onclick="aisSetRoutingStrategy('round-robin')">轮询均衡</button>
-        <button class="sched-mode-btn ${currentStrategy === 'fill-first' ? 'active' : ''}" onclick="aisSetRoutingStrategy('fill-first')">填满优先</button>
-      </div>
-      <div class="sched-mode-desc muted">
-        ${currentStrategy === 'round-robin' ? '在所有就绪账号间依次轮询分配请求，负载均衡' : '优先打满单个账号的并发上限后再切下一个账号'}
-      </div>
-    </div>
-
-    <!-- 上游通道 -->
-    <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px 10px; margin-top:8px;">
-      <div class="row-between">
-        <div>
-          <div style="font-size:12px; font-weight:600;">上游通道</div>
-          <div class="muted" style="font-size:11px;">启用的 Google AI Studio 上游通道</div>
-        </div>
-        <div style="display:flex; gap:6px;">
-          <button type="button" class="btn btn-sm ${hasPlayground ? 'btn-primary' : 'btn-outline'}" style="padding:3px 8px; font-size:11.5px;" onclick="aisToggleChannel('playground')">Playground</button>
-          <button type="button" class="btn btn-sm ${hasBuild ? 'btn-primary' : 'btn-outline'}" style="padding:3px 8px; font-size:11.5px;" onclick="aisToggleChannel('build')">Build</button>
-        </div>
-      </div>
-    </div>
   `;
 
   // 冷却列表
@@ -1821,37 +1788,6 @@ function showAisAccountModels(id) {
   showText(`可用模型 (${list.length})`, `账号：${acc.label || acc.id}`, list.length ? list.join('\n') : '暂无模型数据，请点击「刷新」获取');
 }
 
-async function aisSetRoutingStrategy(strategy) {
-  try {
-    await aisSaveConfigPatch({ routing_strategy: strategy });
-    showToast(`路由策略已切换为: ${strategy === 'round-robin' ? '轮询' : '填满优先'}`, 'success');
-    loadAccounts();
-  } catch (e) {
-    showToast(`切换策略失败: ${e.message}`, 'error');
-  }
-}
-
-async function aisToggleChannel(ch) {
-  const current = aisConfigCache?.upstream_channels || ['playground', 'build'];
-  let next;
-  if (current.includes(ch)) {
-    if (current.length <= 1) {
-      showToast('至少需要保留一个上游通道', 'warn');
-      return;
-    }
-    next = current.filter(c => c !== ch);
-  } else {
-    next = [...current, ch];
-  }
-  try {
-    await aisSaveConfigPatch({ upstream_channels: next });
-    showToast(`通道已更新: ${next.join(', ')}`, 'success');
-    loadAccounts();
-  } catch (e) {
-    showToast(`修改通道失败: ${e.message}`, 'error');
-  }
-}
-
 async function aisClearCooldown(accountId, scope) {
   try {
     await deleteReq(`/ais/api/accounts/${encodeURIComponent(accountId)}/cooldowns/${encodeURIComponent(scope || '*')}`);
@@ -1886,90 +1822,6 @@ async function aisCancelRequest(id) {
     loadAccounts();
   } catch (e) {
     showToast(`取消请求失败: ${e.message}`, 'error');
-  }
-}
-
-async function aisSaveConfigPatch(patch) {
-  if (!aisConfigCache) {
-    aisConfigCache = await getJson('/ais/api/config');
-  }
-  const merged = { ...aisConfigCache, ...patch, admin_auth_enabled: false };
-  if (typeof merged.first_event_hedge === 'boolean') {
-    merged.first_event_hedge = merged.first_event_hedge ? 'auto' : 'off';
-  }
-  const res = await putJson('/ais/api/config', merged);
-  aisConfigCache = res.config || res || merged;
-  if (res.service_restart_required) {
-    showToast('配置已保存，正在重启 AIS 引擎…', 'info');
-    try {
-      await postJson('/ais/api/control/stop', {});
-      await postJson('/ais/api/control/start', {});
-    } catch (e) { /* ignore restart */ }
-  }
-  return res;
-}
-
-async function openAisConfigModal() {
-  if (!aisConfigCache) {
-    try { aisConfigCache = await getJson('/ais/api/config'); } catch (e) {
-      showToast('获取设置失败: ' + e.message, 'error');
-      return;
-    }
-  }
-  const cfg = aisConfigCache || {};
-  $('aisCfgProxy').value = cfg.proxy || '';
-  $('aisCfgConcurrency').value = cfg.per_account_concurrency || 2;
-  $('aisCfgTempChat').checked = !!cfg.temporary_chat;
-  $('aisCfgKeepalive').checked = !!cfg.nonstream_keepalive;
-  $('aisCfgFakeStream').checked = !!cfg.fake_stream;
-  $('aisCfgYoutube').checked = !!cfg.youtube_links;
-  if ($('aisCfgBuildNative')) $('aisCfgBuildNative').checked = !!cfg.build_native_nonstream;
-  if ($('aisCfgModelMapping')) $('aisCfgModelMapping').value = cfg.model_mapping || '';
-  const hedgeVal = String(cfg.first_event_hedge || 'off').trim().toLowerCase() || 'off';
-  const hedgeSel = $('aisCfgHedge');
-  if (hedgeSel) {
-    if (!Array.from(hedgeSel.options).some(o => o.value === hedgeVal)) {
-      const opt = document.createElement('option');
-      opt.value = hedgeVal;
-      opt.textContent = `${hedgeVal} 秒超时对冲`;
-      hedgeSel.appendChild(opt);
-    }
-    hedgeSel.value = hedgeVal;
-  }
-  openModal('aisConfigModal');
-}
-
-async function saveAisConfigModal() {
-  const proxy = $('aisCfgProxy').value.trim();
-  const concurrency = parseInt($('aisCfgConcurrency').value, 10) || 2;
-  const temporary_chat = $('aisCfgTempChat').checked;
-  const nonstream_keepalive = $('aisCfgKeepalive').checked;
-  const fake_stream = $('aisCfgFakeStream').checked;
-  const youtube_links = $('aisCfgYoutube').checked;
-  const build_native_nonstream = $('aisCfgBuildNative') ? $('aisCfgBuildNative').checked : false;
-  const rawMapping = $('aisCfgModelMapping') ? $('aisCfgModelMapping').value.trim() : '';
-  const model_mapping = rawMapping
-    ? rawMapping.split(/[\n,]+/).map(s => s.trim().replace(/^([^=]+)=([^=:]+)$/, '$1:$2')).filter(Boolean).join(',')
-    : '';
-  const first_event_hedge = $('aisCfgHedge').value || 'off';
-
-  try {
-    await aisSaveConfigPatch({
-      proxy,
-      per_account_concurrency: concurrency,
-      temporary_chat,
-      nonstream_keepalive,
-      fake_stream,
-      youtube_links,
-      build_native_nonstream,
-      model_mapping,
-      first_event_hedge,
-    });
-    showToast('AIS 引擎设置已保存', 'success');
-    closeModal('aisConfigModal');
-    loadAccounts();
-  } catch (e) {
-    showToast(`保存失败: ${e.message}`, 'error');
   }
 }
 
@@ -2642,7 +2494,7 @@ function openAuthModal() {
   if (engine === 'ag' && !agReady()) { showToast('请先启用 AG 引擎', 'warn'); return; }
   $('authTitle').textContent = engine === 'ais' ? '添加 Google AI Studio 账号' : '添加 Google 账号';
   $('authDesc').textContent = engine === 'ais'
-    ? '粘贴 AI Studio Cookie 或使用命令行远程添加配对。'
+    ? '粘贴电脑浏览器里已登录 AI Studio 的 Cookie（Google 不允许在 App 内登录）。'
     : '用 Google 登录授权，完成后自动加入账号池。也可以在「导入」里直接粘贴 Refresh Token。';
   if (engine === 'ais') {
     $('aisAuthArea').style.display = 'block';
@@ -2740,38 +2592,8 @@ function renderAisDiscoverList() {
 }
 
 function switchAisAuthTab(tab) {
-  const isCookie = tab === 'cookie';
-  $('tabAisCookieBtn').className = 'btn btn-sm btn-outline' + (isCookie ? ' active' : '');
-  $('tabAisPairingBtn').className = 'btn btn-sm btn-outline' + (!isCookie ? ' active' : '');
-  $('aisAuthCookiePane').style.display = isCookie ? 'block' : 'none';
-  $('aisAuthPairingPane').style.display = !isCookie ? 'block' : 'none';
-  if (!isCookie) {
-    loadAisPairingToken();
-    startAisPairingPoll();
-  } else {
-    if (aisPairingPollTimer) { clearInterval(aisPairingPollTimer); aisPairingPollTimer = null; }
-  }
-}
-
-async function handleAisDiscover() {
-  const cookies = $('aisCookieInput').value.trim();
-  if (!cookies) { showToast('请先粘贴 Cookie', 'warn'); return; }
-  showToast('正在识别账号…');
-  try {
-    const env = getAisEnvInput();
-    const res = await postJson('/ais/api/accounts/import/cookies/discover', { label: '', cookies, cdp: '', ...env });
-    aisDiscoveredAccounts = res.accounts || [];
-    aisSelectedAuthUsers.clear();
-    for (const a of aisDiscoveredAccounts) {
-      if (!a.imported && !a.signed_out) {
-        aisSelectedAuthUsers.add(String(a.auth_user));
-      }
-    }
-    renderAisDiscoverList();
-    $('aisDiscoverArea').style.display = 'block';
-  } catch (e) {
-    showToast('识别失败: ' + e.message, 'error');
-  }
+  // 只剩粘贴 Cookie 一种方式（远程配对属于已删除的 Go 版 AIS）
+  $('aisAuthCookiePane').style.display = 'block';
 }
 
 async function handleAisCookieImport() {
@@ -2800,43 +2622,8 @@ async function handleAisCookieImport() {
       }
       showToast(`已成功导入 ${count} 个账号`, 'success');
     } else {
-      let discRes = null;
-      try {
-        discRes = await postJson('/ais/api/accounts/import/cookies/discover', { label: '', cookies, cdp: '', ...env });
-      } catch (e) {
-        // discover 失败，直接回退调用 import/cookies 透传底层真实错误信息
-        await postJson('/ais/api/accounts/import/cookies', { label: '', cookies, cdp: '', ...env });
-        showToast('导入成功', 'success');
-        discRes = null;
-      }
-
-      if (discRes) {
-        const accs = discRes.accounts || [];
-        const unimported = accs.filter(a => !a.imported && !a.signed_out);
-        if (unimported.length === 1) {
-          await postJson('/ais/api/accounts/import/cookies', {
-            label: '',
-            cookies,
-            cdp: '',
-            auth_user: unimported[0].auth_user,
-            ...env,
-          });
-          showToast(`已成功导入: ${unimported[0].email || '账号'}`, 'success');
-        } else if (accs.length > 1) {
-          aisDiscoveredAccounts = accs;
-          aisSelectedAuthUsers.clear();
-          for (const a of unimported) {
-            aisSelectedAuthUsers.add(String(a.auth_user));
-          }
-          renderAisDiscoverList();
-          $('aisDiscoverArea').style.display = 'block';
-          showToast(`识别到 ${accs.length} 个账号，请确认勾选后再次点击立即导入`, 'info');
-          return;
-        } else {
-          await postJson('/ais/api/accounts/import/cookies', { label: '', cookies, cdp: '', ...env });
-          showToast('导入成功', 'success');
-        }
-      }
+      await postJson('/ais/api/accounts/import/cookies', { label: '', cookies, cdp: '', ...env });
+      showToast('导入成功', 'success');
     }
 
     try { await postJson('/ais/api/control/start', {}); } catch (e) { /* ignore */ }
@@ -2850,64 +2637,6 @@ async function handleAisCookieImport() {
   }
 }
 
-let currentPairingToken = null;
-async function loadAisPairingToken() {
-  const tokenEl = $('aisPairingTokenText');
-  const expEl = $('aisPairingExpires');
-  const cmdEl = $('aisPairingCmdText');
-  tokenEl.textContent = '获取中…';
-  expEl.textContent = '';
-  try {
-    const res = await postJson('/ais/api/pairing', {});
-    currentPairingToken = res.token || '';
-    tokenEl.textContent = currentPairingToken || '--';
-    if (res.expires_at) {
-      const d = new Date(res.expires_at);
-      expEl.textContent = '有效期至 ' + d.toLocaleTimeString('zh-CN', { hour12: false });
-    }
-    const origin = window.location.origin.startsWith('http') ? window.location.origin : 'http://127.0.0.1:8800';
-    cmdEl.textContent = `aistudio2api setup --remote ${origin}`;
-  } catch (e) {
-    tokenEl.textContent = '获取失败';
-    expEl.textContent = e.message;
-  }
-}
-
-function startAisPairingPoll() {
-  if (aisPairingPollTimer) clearInterval(aisPairingPollTimer);
-  aisPairingInitialCount = aisAccountsCache.length;
-  aisPairingPollTimer = setInterval(async () => {
-    const modal = $('authModal');
-    if (!modal || !modal.classList.contains('active')) {
-      clearInterval(aisPairingPollTimer);
-      aisPairingPollTimer = null;
-      return;
-    }
-    try {
-      const res = await getJson('/ais/api/accounts');
-      const accs = res.accounts || [];
-      if (accs.length > aisPairingInitialCount) {
-        clearInterval(aisPairingPollTimer);
-        aisPairingPollTimer = null;
-        showToast('🎉 远程账号配对成功！', 'success');
-        try { await postJson('/ais/api/control/start', {}); } catch (e) {}
-        modelCache.ais = null;
-        closeModal('authModal');
-        loadAccounts();
-      }
-    } catch (e) {}
-  }, 3000);
-}
-
-function copyAisPairingToken() {
-  if (currentPairingToken) copyText(currentPairingToken);
-  else showToast('暂无配对令牌', 'warn');
-}
-
-function copyAisPairingCmd() {
-  const cmd = $('aisPairingCmdText').textContent;
-  copyText(cmd);
-}
 
 async function requestAuthLink() {
   const btn = $('startAuthBtn');

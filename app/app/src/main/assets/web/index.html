@@ -81,7 +81,6 @@
       <div style="display:flex; gap:8px; margin-top:12px;">
         <button class="btn btn-primary btn-sm" style="flex:1;" id="aisStartStopBtn" onclick="toggleAisService()">⏹ 停止服务</button>
         <button class="btn btn-outline btn-sm" style="flex:1;" onclick="restartAisService()">🔄 重启服务</button>
-        <button class="btn btn-outline btn-sm" style="flex:1;" onclick="openAisConfigModal()">⚙️ 引擎设置</button>
       </div>
     </div>
 
@@ -202,12 +201,7 @@
       
       <!-- AIS 添加账号专属区域 -->
       <div id="aisAuthArea" style="display: none; margin-bottom: 14px;">
-        <div class="ais-auth-tabs" style="display:flex; gap:8px; margin-bottom:12px;">
-          <button type="button" class="btn btn-sm btn-outline active" id="tabAisCookieBtn" onclick="switchAisAuthTab('cookie')" style="flex:1;">粘贴 Cookie</button>
-          <button type="button" class="btn btn-sm btn-outline" id="tabAisPairingBtn" onclick="switchAisAuthTab('pairing')" style="flex:1;">远程添加</button>
-        </div>
-
-        <!-- 选项 A: 粘贴 Cookie -->
+        <!-- 粘贴 Cookie（Google 不允许在 WebView 里登录，只能导入电脑浏览器里已登录 AI Studio 的 Cookie） -->
         <div id="aisAuthCookiePane">
           <textarea id="aisCookieInput" class="input-field mono" rows="5" oninput="resetAisDiscover()" style="font-size:12px; resize:vertical; width:100%; box-sizing:border-box;" placeholder="粘贴 Cookie (支持 Cookie-Editor JSON / Cookie 请求头 / cookies.txt)"></textarea>
           <div id="aisDiscoverArea" style="display:none; margin-bottom:10px;">
@@ -218,9 +212,9 @@
             <div id="aisDiscoverList"></div>
           </div>
           <details style="margin-top:8px; border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:8px 10px; background:rgba(0,0,0,0.2);">
-            <summary class="muted" style="cursor:pointer; font-size:12px; user-select:none;">⚙️ 更多设置（可选代理 / 语言 / 时区）</summary>
+            <summary class="muted" style="cursor:pointer; font-size:12px; user-select:none;">⚙️ 更多设置（可选语言 / 时区）</summary>
             <div style="margin-top:8px;">
-              <input type="text" id="aisEnvProxy" class="input-field mono" style="font-size:12px; margin-bottom:6px;" placeholder="单账号代理，如 socks5://127.0.0.1:1080（留空走全局或直连）" />
+              <input type="hidden" id="aisEnvProxy" class="input-field mono" style="font-size:12px; margin-bottom:6px;" placeholder="单账号代理，如 socks5://127.0.0.1:1080（留空走全局或直连）" />
               <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                 <input type="text" id="aisEnvLocale" class="input-field mono" style="font-size:12px; margin-bottom:0;" placeholder="语言 (如 zh-CN)" />
                 <input type="text" id="aisEnvTimezone" class="input-field mono" style="font-size:12px; margin-bottom:0;" placeholder="时区 (如 Asia/Shanghai)" />
@@ -228,28 +222,10 @@
             </div>
           </details>
           <div style="display:flex; gap:8px; margin-top:8px;">
-            <button type="button" class="btn btn-outline btn-sm" style="flex:1;" onclick="handleAisDiscover()">🔍 识别邮箱</button>
             <button type="button" class="btn btn-primary btn-sm" style="flex:1;" onclick="handleAisCookieImport()">📥 立即导入</button>
           </div>
         </div>
 
-        <!-- 选项 B: 远程添加 -->
-        <div id="aisAuthPairingPane" style="display:none;">
-          <div class="muted" style="margin-bottom:10px; font-size:12px; line-height:1.6;" id="aisPairingHelp">
-            在能登录 Google 的电脑上运行：<br />
-            <span class="mono" style="color:var(--primary); word-break:break-all;" id="aisPairingCmdText">aistudio2api setup --remote &lt;你的地址&gt;</span><br />
-            并粘贴下方令牌。
-          </div>
-          <div style="background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:10px; margin-bottom:10px; text-align:center;">
-            <div class="mono" id="aisPairingTokenText" style="font-size:16px; font-weight:700; color:var(--accent); word-break:break-all; user-select:all;">--</div>
-            <div class="muted mono" id="aisPairingExpires" style="font-size:11px; margin-top:4px;"></div>
-          </div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button type="button" class="btn btn-outline btn-sm" style="flex:1;" onclick="copyAisPairingToken()">📋 复制令牌</button>
-            <button type="button" class="btn btn-outline btn-sm" style="flex:1;" onclick="copyAisPairingCmd()">📋 复制命令</button>
-            <button type="button" class="btn btn-outline btn-sm" onclick="loadAisPairingToken()">🔄 刷新</button>
-          </div>
-        </div>
       </div>
 
       <!-- AG 添加账号专属区域 -->
@@ -306,7 +282,7 @@
         <input type="checkbox" id="aisEditEnabled" style="width:18px; height:18px; accent-color:var(--primary);" />
         <label for="aisEditEnabled" style="font-size:14px; cursor:pointer;">启用此账号</label>
       </div>
-      <div style="margin-bottom:12px;">
+      <div style="margin-bottom:12px; display:none;">
         <label class="muted" style="font-size:12px; display:block; margin-bottom:4px;">专属出口代理 (可选)</label>
         <input type="text" id="aisEditProxy" class="input-field mono" style="font-size:12px;" placeholder="socks5://127.0.0.1:1080 (留空走全局或直连)" />
       </div>
@@ -323,64 +299,6 @@
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-primary" style="flex: 1;" onclick="saveAisAccountEdit()">保存修改</button>
         <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('aisEditModal')">取消</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- AIS 引擎高级设置 -->
-  <div class="modal-overlay" id="aisConfigModal">
-    <div class="modal-sheet">
-      <div class="sheet-handle"></div>
-      <div class="section-title">AIS 引擎设置</div>
-      <p class="muted" style="margin-bottom: 12px; font-size:12px;">修改运行时参数，部分配置变更可能需要自动重启服务。</p>
-      
-      <div style="margin-bottom:12px;">
-        <label class="muted" style="font-size:12px; display:block; margin-bottom:4px;">全局出口代理 (全局 proxy)</label>
-        <input type="text" id="aisCfgProxy" class="input-field mono" style="font-size:12px;" placeholder="如 socks5://127.0.0.1:1080 (留空直连)" />
-      </div>
-
-      <div style="margin-bottom:12px;">
-        <label class="muted" style="font-size:12px; display:block; margin-bottom:4px;">单账号并发数</label>
-        <input type="number" id="aisCfgConcurrency" class="input-field mono" style="font-size:12px;" min="1" max="10" placeholder="2" />
-      </div>
-
-      <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:14px;">
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-          <input type="checkbox" id="aisCfgTempChat" style="accent-color:var(--primary);" /> 启用临时对话 (Temporary Chat)
-        </label>
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-          <input type="checkbox" id="aisCfgKeepalive" style="accent-color:var(--primary);" /> 非流式保活 (Keepalive)
-        </label>
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-          <input type="checkbox" id="aisCfgFakeStream" style="accent-color:var(--primary);" /> 模拟流式打字机 (Fake Stream)
-        </label>
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-          <input type="checkbox" id="aisCfgYoutube" style="accent-color:var(--primary);" /> 允许 YouTube 链接转换
-        </label>
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-          <input type="checkbox" id="aisCfgBuildNative" style="accent-color:var(--primary);" /> Build 通道原生非流式 (Build Native Nonstream)
-        </label>
-      </div>
-
-      <div style="margin-bottom:14px;">
-        <label class="muted" style="font-size:12px; display:block; margin-bottom:4px;">首包超时对冲 (First Event Hedge)</label>
-        <select id="aisCfgHedge" class="input-field" style="font-size:12px; margin-bottom:0;">
-          <option value="off">关闭 (off)</option>
-          <option value="auto">自动按近期 P95 对冲 (auto)</option>
-          <option value="30">30 秒超时对冲</option>
-          <option value="60">60 秒超时对冲</option>
-          <option value="120">120 秒超时对冲</option>
-        </select>
-      </div>
-
-      <div style="margin-bottom:14px;">
-        <label class="muted" style="font-size:12px; display:block; margin-bottom:4px;">模型别名映射 (逗号或换行分隔 别名:目标模型)</label>
-        <textarea id="aisCfgModelMapping" class="input-field mono" rows="3" style="font-size:12px; margin-bottom:0; resize:vertical;" placeholder="如: gpt-4o:gemini-2.5-pro,sonnet:gemini-2.5-pro"></textarea>
-      </div>
-
-      <div style="display: flex; gap: 8px;">
-        <button class="btn btn-primary" style="flex: 1;" onclick="saveAisConfigModal()">保存设置</button>
-        <button class="btn btn-outline" style="flex: 1;" onclick="closeModal('aisConfigModal')">取消</button>
       </div>
     </div>
   </div>

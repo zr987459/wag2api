@@ -1,6 +1,6 @@
-# WebView 版 AIS（原型，分支 proto/webview-ais）
+# AIS 引擎（系统 WebView 实现）
 
-用安卓系统 WebView 代替 Go + SpiderMonkey 的 `libaistudio2api.so`（解压后约 79MB）。APK 里不再有 AIS 二进制。
+用安卓系统 WebView 承载 aistudio.google.com 页面实现 AIS。v2 起已删除原来的 Go + SpiderMonkey 子进程（`libaistudio2api.so`，解压后约 79MB），APK 不含任何原生库。
 
 ## 工作方式
 
@@ -10,7 +10,6 @@
   - 页面停在 `https://aistudio.google.com/prompts/new_chat`。初始化时在输入框填一条 `Hi` 点 Run，用 `shouldInterceptRequest` 拦下这次 GenerateContent（不真正发出），记下页面的动态请求头；同时临时替换 `default_MakerSuite` 里调用 `.snapshot({` 的函数，拿到页面自己的 WAA service。
   - 每次请求：Kotlin 组好 MakerSuite 正文（`MakerSuiteWire`）→ 页面输入框写入最后一轮文本，用 WAA service 为 binding prompt 的 SHA-256 生成 fresh proof → 在页面里用带 Cookie 的原生 XHR 发出 → 响应分块回传，`MakerSuiteStream` 还原成 Google 流，复用 App 已有的 `SseStreamer` / `OpenaiAgConverter` 输出 Anthropic / OpenAI 格式。
 - UA 去掉 `; wv` 和 `Version/4.0`；支持时把 Client Hints 里的 `Android WebView` 品牌改成 `Google Chrome`，并用 `setRequestedWithHeaderOriginAllowList(空集)` 去掉 `X-Requested-With`。不支持的 WebView 跳过，状态见 `/ais/api/webview`。
-- 切回 Go 版：`./gradlew assembleRelease -PaisBackend=go`（CI 用仓库变量 `AIS_BACKEND=go`）。
 
 ## 导入账号
 
@@ -43,9 +42,10 @@ curl http://127.0.0.1:8800/ais/api/logs              # 引擎日志（只有阶�
 
 `/ais/api/accounts/<id>/refresh` 会重建该账号的 WebView 并拉一次模型表，可当作“测试账号”。
 
-## 原型限制
+## 已知限制
 
 - 只实现了 GenerateContent 文本 / 图片输入 / 函数调用 / 思考、ListModels；没有 Build 通道、CountTokens、自动续写、Google 搜索等内置工具、图片 / 语音输出。
 - `discover`（一份 Cookie 识别多个 /u/N 账号）不支持，导入时直接用 `auth_user`。
+- 不支持单账号代理、引擎高级设置、远程配对（`aistudio2api setup --remote`），这些属于已删除的 Go 版。
 - 隐藏 WebView 不挂到窗口上（手动 layout 1280×2000），页面 `visibilityState` 为 hidden，计时器可能被节流。
 - 用量统计只在内存里保留最近 200 条。

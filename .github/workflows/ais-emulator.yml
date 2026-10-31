@@ -1,10 +1,10 @@
 name: AIS WebView 模拟器实测
 
-# 只在 proto/webview-ais 分支 push 和手动触发时运行。
+# 在 refactor/v2（以及 proto/webview-ais）分支 push 和手动触发时运行。
 # GitHub 机房 IP 可能被 Google 风控：每次运行每个接口最多请求 1 次，同一时间只跑一个。
 on:
   push:
-    branches: ['proto/webview-ais']
+    branches: ['refactor/v2', 'proto/webview-ais']
   workflow_dispatch:
 
 concurrency:
@@ -25,12 +25,12 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v3
 
-      # debug 包用 debug 签名，不需要 keystore；WebView 版没有 .so，同一个 APK 可以装在 x86_64 模拟器上
-      - name: 构建 debug APK（WebView 版 AIS）
+      # debug 包用 debug 签名，不需要 keystore；APK 没有 .so，可以直接装在 x86_64 模拟器上
+      - name: 构建 debug APK
         working-directory: app
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug -PaisBackend=webview --no-daemon --console=plain
+          ./gradlew :app:assembleDebug --no-daemon --console=plain
           ls -l app/build/outputs/apk/debug/
 
       - name: 启用 KVM

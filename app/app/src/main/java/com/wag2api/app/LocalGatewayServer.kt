@@ -509,7 +509,7 @@ class LocalGatewayServer(
                 }
             }
 
-            // AIS 引擎开关（设置页）：开启立即启动；关闭时若没有 AIS 账号则停掉子进程
+            // AIS 引擎开关（设置页）：开启立即启动，关闭立即停止并销毁 WebView（账号保留）
             path == "/panel/api/ais/enabled" || path == "/m/api/ais/enabled" -> {
                 if (method == "POST") {
                     val on = try { JSONObject(body).optBoolean("enabled", true) } catch (e: Exception) { true }
