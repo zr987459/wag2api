@@ -80,8 +80,11 @@ jobs:
         id: ais-cache
         with:
           path: app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so
-          key: ais-${{ hashFiles('ais/UPSTREAM_SHA', 'ais/android.patch') }}-sm-v2
+          key: ais-${{ hashFiles('ais/UPSTREAM_SHA', 'ais/android.patch') }}-sm-v3-slim
 
+      # M7：-tags wag2api 排除内置 Web UI、selfupdate、MCP 客户端、AAC/Opus/FLAC 编码器（见 ais/android.patch）；
+      # -Wl,--gc-sections 让链接器丢掉 SpiderMonkey 静态库里没被引用的函数段。
+      # 不再构建 AIS 前端（web/），wag2api 有自己的控制台。
       - name: 编译 AIS 引擎
         if: steps.ais-cache.outputs.cache-hit != 'true'
         run: |
@@ -89,18 +92,92 @@ jobs:
           git clone https://github.com/Mag1cFall/AIStudio2API.git /tmp/ais
           git -C /tmp/ais checkout $(cat ais/UPSTREAM_SHA)
           git -C /tmp/ais apply "$GITHUB_WORKSPACE/ais/android.patch"
-          (cd /tmp/ais/web && npm ci && npm run build)
           mkdir -p app/app/src/main/jniLibs/arm64-v8a
           # v0.2.18 起 WAA 用 SpiderMonkey（cgo），按上游 Dockerfile 用 zig 交叉编译为全静态 musl arm64，可直接在安卓上运行
           curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C /tmp && mv /tmp/zig-x86_64-linux-0.16.0 /tmp/zig
           SM=v152.0.4-aistudio2api.1
           mkdir -p /tmp/sm && curl -fsSL "https://github.com/Mag1cFall/firefox/releases/download/$SM/spidermonkey-$SM-linux-arm64.tar.gz" | tar -xz -C /tmp/sm
-          (cd /tmp/ais && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+          export CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
             CC="/tmp/zig/zig cc -target aarch64-linux-musl" CXX="/tmp/zig/zig c++ -target aarch64-linux-musl" \
-            CGO_CXXFLAGS=-I/tmp/sm/include CGO_LDFLAGS=-L/tmp/sm/lib \
-            go build -trimpath -tags netgo,osusergo -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all'" \
-            -o "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" ./cmd/aistudio2api)
-          file "$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so" || true
+            CGO_CXXFLAGS=-I/tmp/sm/include CGO_LDFLAGS=-L/tmp/sm/lib
+          TAGS=netgo,osusergo,wag2api
+          OUT="$GITHUB_WORKSPACE/app/app/src/main/jniLibs/arm64-v8a/libaistudio2api.so"
+          (cd /tmp/ais && go build -trimpath -tags $TAGS \
+            -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all -Wl,--gc-sections'" \
+            -o "$OUT" ./cmd/aistudio2api)
+          file "$OUT" || true
+          echo "### AIS .so：$(( $(stat -c %s "$OUT") / 1024 )) KB（瘦身前 v0.2.18 约 77585 KB）" >> "$GITHUB_STEP_SUMMARY"
+
+          # ── 体积构成分析（只打印到日志，不影响产物）──
+          # 同样参数但不 strip 再链接一份（编译缓存复用，只多一次链接），供 go tool nm 使用
+          (cd /tmp/ais && go build -trimpath -tags $TAGS \
+            -ldflags="-linkmode external -extldflags '-static -Wl,--gc-sections'" \
+            -o /tmp/ais-sym.so ./cmd/aistudio2api)
+          echo "::group::AIS 体积构成"
+          echo "== 产物：$(stat -c %s "$OUT") 字节；未 strip 分析副本：$(stat -c %s /tmp/ais-sym.so) 字节"
+          echo "== SpiderMonkey 静态库"; ls -l /tmp/sm/lib
+          echo "== 嵌入资源（//go:embed）"
+          (cd /tmp/ais && grep -rn --include='*.go' '^//go:embed' internal cmd | grep -v _test | while IFS= read -r line; do
+              f=${line%%:*}; d=$(dirname "$f"); for pat in ${line#*//go:embed }; do pat=${pat#all:}; for m in $d/$pat; do
+                [ -e "$m" ] && printf '%10s  %s  (%s)\n' "$(du -sb "$m" | cut -f1)" "$m" "$f"; done; done; done)
+          echo "   注：internal/webui/dist 与 internal/desktop 在 wag2api tag 下不参与编译"
+          go tool nm -size -sort size /tmp/ais-sym.so > /tmp/nm.txt
+          python3 - "$OUT" /tmp/ais-sym.so /tmp/nm.txt <<'PY'
+          import sys, struct, re, collections
+          def sections(path):
+              f = open(path, 'rb').read()
+              shoff = struct.unpack_from('<Q', f, 0x28)[0]
+              ent, num, stri = struct.unpack_from('<HHH', f, 0x3A)
+              secs = [struct.unpack_from('<IIQQQQIIQQ', f, shoff + i * ent) for i in range(num)]
+              so = secs[stri][4]
+              name = lambda o: f[so + o:f.index(b'\0', so + o)].decode()
+              return len(f), [(name(s[0]), s[5], s[1] == 8) for s in secs if s[5]]
+          total, secs = sections(sys.argv[1])
+          print("== ELF 段（产物）")
+          for n, sz, nobits in sorted(secs, key=lambda x: -x[1]):
+              print("%12d %5.1f%%  %-20s %s" % (sz, 100 * sz / total, n, "(NOBITS，不占文件)" if nobits else ""))
+          rows = []
+          for l in open(sys.argv[3]):
+              p = l.split(None, 3)
+              if len(p) == 4 and p[1].isdigit():
+                  rows.append((int(p[1]), p[0], p[2], p[3].strip()))
+          print("== go tool nm -size -sort size 前 40")
+          for sz, addr, t, n in rows[:40]:
+              print("%10d %s %s" % (sz, t, n[:150]))
+          # ICU 数据在 nm 里大小为 0，用下一个符号地址推算
+          addrs = sorted({int(a, 16) for _, a, _, _ in rows})
+          for sz, a, t, n in rows:
+              if n.startswith('icudt') and n.endswith('_dat'):
+                  ai = int(a, 16); nxt = next((x for x in addrs if x > ai), ai)
+                  print("== SpiderMonkey 内置 ICU 数据 %s ≈ %d 字节" % (n, nxt - ai))
+          def pkg(n):
+              if n.startswith(('_Z', 'js::', 'JS_', 'mz_', 'icu', 'u_', 'ucase', 'ubidi')) or 'mozilla' in n:
+                  return '[C++ SpiderMonkey/ICU/Rust]'
+              if n.startswith(('go:', 'type:')):
+                  return '[' + n.split('.')[0].split(':')[0] + ':]'
+              m = re.match(r'^((?:[\w.\-~]+/)*[\w\-~]+)\.', n)
+              if not m:
+                  return '[C 其它 (sqlite/musl/...)]'
+              return m.group(1)
+          agg = collections.Counter(); fileagg = collections.Counter()
+          for sz, a, t, n in rows:
+              k = pkg(n); agg[k] += sz
+              if t not in 'bB':
+                  fileagg[k] += sz
+          print("== 按包汇总（不含 BSS，前 50）")
+          tot = sum(fileagg.values())
+          for k, v in fileagg.most_common(50):
+              print("%10d %5.1f%%  %s" % (v, 100 * v / tot, k))
+          mod = collections.Counter()
+          for k, v in fileagg.items():
+              m = re.match(r'^(github\.com/[^/]+/[^/]+|golang\.org/x/[^/]+|gopkg\.in/[^/]+|google\.golang\.org/[^/]+)', k)
+              mod[m.group(1) if m else ('[std]' if not k.startswith('[') else k)] += v
+          print("== 按模块汇总（不含 BSS，前 30）")
+          for k, v in mod.most_common(30):
+              print("%10d %5.1f%%  %s" % (v, 100 * v / tot, k))
+          print("注：.gopclntab / .go.type / ICU 数据 等不按符号计，符号合计仅为参考")
+          PY
+          echo "::endgroup::"
 
       # keystore：有 Secret 就用正式签名，没有就退回 debug
       - name: 解密 keystore
