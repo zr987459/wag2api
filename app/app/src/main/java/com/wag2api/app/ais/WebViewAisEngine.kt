@@ -78,7 +78,9 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
     private var pool: ThreadPoolExecutor? = null
     private val reaper = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "ais-wv-reaper").apply { isDaemon = true } }
     private val workers = ConcurrentHashMap<String, AisWebWorker>()
-    private val cooldownUntil = ConcurrentHashMap<String, Long>()
+    data class CooldownEntry(val until: Long, val type: String)
+    private val cooldowns = ConcurrentHashMap<String, CooldownEntry>()
+    private val consecutive429 = ConcurrentHashMap<String, Int>()
     private val logBuf = ArrayDeque<String>()
     /** [beta] 请求账本（持久化到 filesDir/ais/usage.jsonl，重启后概览统计仍在） */
     private val ledger: AisUsageLedger by lazy { AisUsageLedger(File(ctx.filesDir, "ais/usage.jsonl")) }
@@ -198,10 +200,26 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         try { AisAccountInfo.update(File(authDir, id)) { it.put("last_error", (msg ?: "").take(300)) } } catch (_: Exception) {}
     }
 
+    private fun handle429(id: String, msg: String?): Long {
+        val count = (consecutive429[id] ?: 0) + 1
+        consecutive429[id] = count
+        val minutes = AisCooldownPolicy.cooldownMinutes(count)
+        val type = AisCooldownPolicy.cooldownType(msg)
+        val until = System.currentTimeMillis() + minutes * 60_000L
+        cooldowns[id] = CooldownEntry(until, type)
+        log("[$id] 触发 429 冷却（第 $count 次，${minutes} 分钟，类型 $type）")
+        return until
+    }
+
+    private fun handleAccountSuccess(id: String) {
+        consecutive429.remove(id)
+        cooldowns.remove(id)
+    }
+
     private fun accountState(id: String, m: JSONObject): Pair<String, String?> {
         if (!m.optBoolean("enabled", true)) return "disabled" to null
         val w = workers[id]
-        val cd = cooldownUntil[id] ?: 0L
+        val cd = cooldowns[id]?.until ?: 0L
         if (cd > System.currentTimeMillis()) return "cooldown" to "冷却至 " + SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(cd))
         return when (w?.phase) {
             AisWebWorker.Phase.AUTH_REQUIRED -> "auth_required" to w.error
@@ -262,7 +280,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         for (k in listOf("proxy", "locale", "timezone")) body.optString(k, "").takeIf { it.isNotEmpty() }?.let { m.put(k, it) }
         writeMeta(dir, m)
         workers.remove(dir.name)?.close()
-        cooldownUntil.remove(dir.name)
+        cooldowns.remove(dir.name)
+        consecutive429.remove(dir.name)
         log("导入账号 ${dir.name}（${st.cookies.size} 个 Cookie）")
         // [beta] 导入后后台初始化一次，把模型列表/权益/更新时间写回卡片（失败只记日志；随后点「刷新」会复用这次初始化）
         val id = dir.name
@@ -280,7 +299,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
      * 成功后写回模型列表、权益、更新时间。
      */
     private fun refreshAccount(id: String): Pair<AisWebWorker, AisAccountInfo.Change?> {
-        cooldownUntil.remove(id)
+        cooldowns.remove(id)
+        consecutive429.remove(id)
         var w = workers[id]
         if (w != null && w.phase == AisWebWorker.Phase.READY) {
             try {
@@ -314,6 +334,8 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         val dir = File(authDir, id)
         if (!dir.isDirectory) return false
         workers.remove(id)?.close()
+        cooldowns.remove(id)
+        consecutive429.remove(id)
         dir.deleteRecursively()
         if (AisWebWorker.multiProfile()) {
             // [beta] ProfileStore 只能在主线程调用
@@ -338,17 +360,23 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         }
     }
 
-    /** 选号：启用、不在冷却、不需重新认证；优先已就绪的 WebView，其次轮询 */
-    private fun candidates(): List<String> {
-        val now = System.currentTimeMillis()
-        val ids = accountDirs().filter { meta(it).optBoolean("enabled", true) }.map { it.name }
-            .filter { (cooldownUntil[it] ?: 0) <= now && workers[it]?.phase != AisWebWorker.Phase.AUTH_REQUIRED }
-        if (ids.isEmpty()) return ids
-        val readyFirst = ids.sortedBy { if (workers[it]?.phase == AisWebWorker.Phase.READY) 0 else 1 }
-        val start = (rr++) % readyFirst.size
-        val ready = readyFirst.filter { workers[it]?.phase == AisWebWorker.Phase.READY }
-        return if (ready.size == readyFirst.size) readyFirst.drop(start) + readyFirst.take(start) else readyFirst
+    private fun currentAccountStates(): List<AisCooldownPolicy.AccountState> = accountDirs().map { dir ->
+        val id = dir.name
+        val m = meta(dir)
+        val w = workers[id]
+        val cd = cooldowns[id]
+        AisCooldownPolicy.AccountState(
+            id = id,
+            enabled = m.optBoolean("enabled", true),
+            isAuthRequired = w?.phase == AisWebWorker.Phase.AUTH_REQUIRED,
+            isReady = w?.phase == AisWebWorker.Phase.READY,
+            cooldownUntil = cd?.until ?: 0L,
+            cooldownType = cd?.type ?: "rate_limit"
+        )
     }
+
+    /** 选号：启用、不在冷却、不需重新认证；全冷却时 plan_limit 账号兜底；优先已就绪的 WebView，其次轮询 */
+    private fun candidates(): List<String> = AisCooldownPolicy.selectCandidates(currentAccountStates(), System.currentTimeMillis(), rr++)
 
     private fun reapIdle() {
         val now = System.currentTimeMillis()
@@ -457,7 +485,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
             p == "/api/cooldowns" -> {
                 val arr = JSONArray()
                 val now = System.currentTimeMillis()
-                for ((id, until) in cooldownUntil) if (until > now) arr.put(JSONObject().put("account_id", id).put("scope", "all").put("until", iso(until)).put("remaining_ms", until - now))
+                for ((id, entry) in cooldowns) if (entry.until > now) arr.put(JSONObject().put("account_id", id).put("scope", entry.type).put("until", iso(entry.until)).put("remaining_ms", entry.until - now))
                 res.sendJson(200, JSONObject().put("cooldowns", arr))
             }
             p == "/api/requests" -> res.sendJson(200, JSONObject().put("requests", JSONArray()))
@@ -508,7 +536,7 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                     res.sendJson(502, errorObj(e.message ?: "初始化失败", "api_error").put("account", accountJson(dir)))
                 }
             }
-            segs.getOrNull(1) == "cooldowns" -> { cooldownUntil.remove(id); res.sendJson(200, JSONObject().put("ok", true)) }
+            segs.getOrNull(1) == "cooldowns" -> { cooldowns.remove(id); consecutive429.remove(id); res.sendJson(200, JSONObject().put("ok", true)) }
             else -> res.sendJson(404, errorObj("未实现", "not_found"))
         }
     }
@@ -628,112 +656,358 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         val google = try { ContentConverter.convertAnthropicToGoogle(anthropicReq) } catch (e: Exception) {
             sendError(res, isOai, 400, "协议转换失败：${e.message}"); return
         }
-        val ids = candidates()
-        if (ids.isEmpty()) { sendError(res, isOai, 503, "没有可用的 AIS 账号（请先在控制台导入 Cookie）"); return }
+        val enabledDirs = accountDirs().filter { meta(it).optBoolean("enabled", true) }
+        if (enabledDirs.isEmpty()) { sendError(res, isOai, 503, "没有可用的 AIS 账号（请先在控制台导入 Cookie）"); return }
+        val initialCandidates = candidates()
+        if (initialCandidates.isEmpty()) {
+            val now = System.currentTimeMillis()
+            val earliestUntil = AisCooldownPolicy.earliestRecoveryTime(currentAccountStates(), now)
+            if (earliestUntil != null) {
+                val retryAfterSec = Math.max(1L, (earliestUntil - now + 999) / 1000)
+                val timeStr = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(earliestUntil))
+                res.setHeader("Retry-After", retryAfterSec.toString())
+                sendError(res, isOai, 429, "全部 AIS 账号均在冷却中，最早恢复时间：$timeStr（${retryAfterSec}s）")
+            } else {
+                sendError(res, isOai, 429, "全部 AIS 账号均不可用")
+            }
+            return
+        }
 
         active.incrementAndGet()
         var lastErr: String? = null
         var lastStatus = 502
+        var accountIndex = 0
+        var prePacketRetries = 0
+        var sameAccountPreRetries = 0
         try {
-            for ((attempt, id) in ids.withIndex()) {
-                if (attempt >= 2) break // 最多换一次号
-                val w = try { workerFor(id) } catch (e: IOException) { lastErr = e.message; continue }
+            val candidateIds = initialCandidates
+            accountLoop@ while (accountIndex < candidateIds.size) {
+                val id = candidateIds[accountIndex]
+                val w = try { workerFor(id) } catch (e: IOException) {
+                    lastErr = e.message; lastStatus = 502
+                    accountIndex++
+                    sameAccountPreRetries = 0
+                    continue@accountLoop
+                }
                 w.inflight.incrementAndGet()
                 w.lastUsed = System.currentTimeMillis()
                 try {
                     try { w.ensureReady() } catch (e: IOException) {
                         lastErr = e.message; lastStatus = if (w.phase == AisWebWorker.Phase.AUTH_REQUIRED) 401 else 502
-                        continue
+                        accountIndex++
+                        sameAccountPreRetries = 0
+                        continue@accountLoop
                     }
                     persistIfChanged(id, w)
                     val info = (w.models.ifEmpty { lastModels }).firstOrNull { it.id == model }
                     val tz = meta(File(authDir, id)).optString("timezone", "").ifEmpty { TimeZone.getDefault().id }
                     val wire = MakerSuiteWire.buildGenerateContent(model, google, anthropicReq, info, tz)
                     val contents = wire.getJSONArray(1)
-                    // [P3] GenerateContent 偶发 403 code=7（PERMISSION_DENIED）：WAA proof 与页面输入框状态没对上时 Google 拒绝，
-                    // 与入口协议无关（同一次实测里 OpenAI / Anthropic 入口都出现过成功和 403）。同一账号重新生成 proof 再发一次。
-                    var sOrNull: AisWebWorker.Stream? = null
-                    var status = 0
-                    var permRetry = 0
-                    while (true) {
-                        val proof = w.proof(MakerSuiteWire.bindingPrompt(contents), MakerSuiteWire.pagePrompt(contents))
-                        val body = MakerSuiteWire.withProof(wire, proof)
-                        val sNew = w.send("GenerateContent", body)
-                        sOrNull = sNew
-                        // 等响应头
-                        val first = sNew.next(120_000) ?: run { sNew.cancel(); throw IOException("上游 120 秒无响应") }
-                        if (first.optString("t") == "err") throw IOException("页面请求失败：" + first.optString("e"))
-                        status = first.optInt("status", 0)
-                        if (status == 403 && permRetry < PERM_RETRIES) {
-                            val e403 = MakerSuiteWire.decodeError(status, drain(sNew))
-                            sNew.cancel() // 已读完，从等待表里移除
-                            if (e403.code == 7 || e403.code == 0) {
-                                permRetry++
-                                log("[$id] GenerateContent HTTP 403 code=${e403.code}，重新生成 proof 重试（$permRetry/$PERM_RETRIES）")
-                                try { Thread.sleep(PERM_RETRY_DELAY_MS * permRetry) } catch (_: InterruptedException) {}
-                                continue
+
+                    workerAttempt@ while (true) {
+                        var sOrNull: AisWebWorker.Stream? = null
+                        var status = 0
+                        var permRetry = 0
+                        var headErrReason: String? = null
+                        while (true) {
+                            val proof = w.proof(MakerSuiteWire.bindingPrompt(contents), MakerSuiteWire.pagePrompt(contents))
+                            val body = MakerSuiteWire.withProof(wire, proof)
+                            val sNew = w.send("GenerateContent", body)
+                            sOrNull = sNew
+                            val first = sNew.next(120_000)
+                            if (first == null) {
+                                sNew.cancel()
+                                headErrReason = "上游响应超时"
+                                break
                             }
-                            val cs403 = e403.clientStatus()
-                            log("[$id] GenerateContent HTTP 403 code=${e403.code}：${e403.message.take(200)}")
-                            lastErr = e403.message; lastStatus = cs403
-                            sendError(res, isOai, cs403, e403.message)
-                            record(id, model, cs403, stream, start, null, e403.message)
+                            if (first.optString("t") == "err") {
+                                sNew.cancel()
+                                headErrReason = "页面请求失败：" + first.optString("e")
+                                break
+                            }
+                            status = first.optInt("status", 0)
+                            if (status == 403 && permRetry < PERM_RETRIES) {
+                                val e403 = MakerSuiteWire.decodeError(status, drain(sNew))
+                                sNew.cancel()
+                                if (e403.code == 7 || e403.code == 0) {
+                                    permRetry++
+                                    log("[$id] GenerateContent HTTP 403 code=${e403.code}，重新生成 proof 重试（$permRetry/$PERM_RETRIES）")
+                                    try { Thread.sleep(PERM_RETRY_DELAY_MS * permRetry) } catch (_: InterruptedException) {}
+                                    continue
+                                }
+                                val cs403 = e403.clientStatus()
+                                log("[$id] GenerateContent HTTP 403 code=${e403.code}：${e403.message.take(200)}")
+                                lastErr = e403.message; lastStatus = cs403
+                                sendError(res, isOai, cs403, e403.message)
+                                record(id, model, cs403, stream, start, null, e403.message)
+                                return
+                            }
+                            break
+                        }
+
+                        if (headErrReason != null) {
+                            if (prePacketRetries < 2 && !res.headersSent) {
+                                lastErr = headErrReason; lastStatus = 502
+                                prePacketRetries++
+                                log("[$id] 首包前失败（$headErrReason），自动重新生成 $prePacketRetries/2")
+                                if (sameAccountPreRetries < 1) {
+                                    sameAccountPreRetries++
+                                    continue@workerAttempt
+                                } else if (accountIndex + 1 < candidateIds.size) {
+                                    sameAccountPreRetries = 0
+                                    accountIndex++
+                                    break@workerAttempt
+                                } else {
+                                    continue@workerAttempt
+                                }
+                            } else {
+                                lastErr = headErrReason; lastStatus = 502
+                                sendError(res, isOai, lastStatus, headErrReason)
+                                record(id, model, lastStatus, stream, start, null, headErrReason)
+                                return
+                            }
+                        }
+
+                        val s = sOrNull!!
+                        if (status in 500..599) {
+                            s.cancel()
+                            val reason = "HTTP $status"
+                            if (prePacketRetries < 2 && !res.headersSent) {
+                                lastErr = reason; lastStatus = 502
+                                prePacketRetries++
+                                log("[$id] 首包前失败（$reason），自动重新生成 $prePacketRetries/2")
+                                if (sameAccountPreRetries < 1) {
+                                    sameAccountPreRetries++
+                                    continue@workerAttempt
+                                } else if (accountIndex + 1 < candidateIds.size) {
+                                    sameAccountPreRetries = 0
+                                    accountIndex++
+                                    break@workerAttempt
+                                } else {
+                                    continue@workerAttempt
+                                }
+                            } else {
+                                lastErr = "AI Studio 返回 HTTP $status"; lastStatus = 502
+                                sendError(res, isOai, lastStatus, lastErr!!)
+                                record(id, model, lastStatus, stream, start, null, lastErr)
+                                return
+                            }
+                        }
+
+                        if (status != 200) {
+                            val errText = drain(s)
+                            val e = if (status == 0) MakerSuiteWire.RpcError(502, 0, "页面请求被浏览器拦截（status 0，可能是 CORS 或网络）")
+                                else MakerSuiteWire.decodeError(status, errText)
+                            val cs = e.clientStatus()
+                            log("[$id] GenerateContent HTTP $status code=${e.code}：${e.message.take(200)}")
+                            if (cs == 429) {
+                                handle429(id, e.message)
+                            }
+                            lastErr = e.message; lastStatus = cs
+                            if (cs == 429 || cs == 401) {
+                                sameAccountPreRetries = 0
+                                accountIndex++
+                                break@workerAttempt
+                            }
+                            sendError(res, isOai, cs, e.message)
+                            record(id, model, cs, stream, start, null, e.message)
                             return
                         }
-                        break
-                    }
-                    val s = sOrNull!!
-                    if (status != 200) {
-                        val errText = drain(s)
-                        val e = if (status == 0) MakerSuiteWire.RpcError(502, 0, "页面请求被浏览器拦截（status 0，可能是 CORS 或网络）")
-                            else MakerSuiteWire.decodeError(status, errText)
-                        val cs = e.clientStatus()
-                        log("[$id] GenerateContent HTTP $status code=${e.code}：${e.message.take(200)}")
-                        if (cs == 429) cooldownUntil[id] = System.currentTimeMillis() + 60_000
-                        lastErr = e.message; lastStatus = cs
-                        if (cs == 429 || cs == 401) continue
-                        sendError(res, isOai, cs, e.message)
-                        record(id, model, cs, stream, start, null, e.message)
-                        return
-                    }
-                    val hasSystem = (wire.opt(5) as? JSONArray) != null
-                    val decoder = MakerSuiteStream(if (hasSystem) 1 else 0)
-                    res.setHeader("X-Gateway-Engine", "ais-webview")
-                    res.setHeader("X-Gateway-Account", id)
-                    if (stream) {
-                        val feed = SseFeed(s, decoder)
-                        var usageOut: JSONObject? = null
-                        val onFinish: (JSONObject) -> Unit = { u -> usageOut = u }
-                        if (isOai) {
-                            val includeUsage = raw.optJSONObject("stream_options")?.optBoolean("include_usage", false) == true
-                            OpenaiAgConverter.handleOpenAIStreamConversion(feed, res, model, onFinish, start, null, includeUsage)
-                        } else {
-                            SseStreamer.handleStreamConversion(feed, res, model, onFinish, start, null)
-                        }
-                        val outcome = usageOut?.optString("outcome") ?: "ok"
-                        record(id, model, if (outcome == "ok") 200 else 502, true, start, usageOut, usageOut?.optString("error")?.takeIf { it.isNotEmpty() && it != "null" })
-                        log("[$id] $model 流式完成（${outcome}，${System.currentTimeMillis() - start}ms）")
-                    } else {
-                        val chunks = ArrayList<JSONObject>()
-                        while (true) {
-                            val ev = s.next(300_000) ?: throw IOException("上游响应超时")
-                            when (ev.optString("t")) {
-                                "d" -> chunks.addAll(decoder.feed(ev.optString("s")))
-                                "end" -> break
-                                "err" -> throw IOException("上游连接中断：" + ev.optString("e"))
+
+                        val hasSystem = (wire.opt(5) as? JSONArray) != null
+                        val decoder = MakerSuiteStream(if (hasSystem) 1 else 0)
+
+                        if (stream) {
+                            val prefixChunks = ArrayList<JSONObject>()
+                            var preFailureReason: String? = null
+                            var streamEnded = false
+
+                            while (true) {
+                                val ev = s.next(300_000)
+                                if (ev == null) {
+                                    preFailureReason = "上游响应超时"
+                                    break
+                                }
+                                when (ev.optString("t")) {
+                                    "d" -> {
+                                        val newChunks = try {
+                                            decoder.feed(ev.optString("s"))
+                                        } catch (e: MakerSuiteWire.RpcError) {
+                                            if (e.clientStatus() in 500..599 || e.httpStatus in 500..599) {
+                                                val errStatus = if (e.httpStatus in 500..599) e.httpStatus else e.clientStatus()
+                                                preFailureReason = "HTTP $errStatus"
+                                                break
+                                            } else throw e
+                                        }
+                                        prefixChunks.addAll(newChunks)
+                                        if (newChunks.any { MakerSuiteStream.hasActualContent(it) }) {
+                                            break
+                                        }
+                                    }
+                                    "end" -> {
+                                        streamEnded = true
+                                        val endStatus = ev.optInt("status", 200)
+                                        if (endStatus in 500..599) {
+                                            preFailureReason = "HTTP $endStatus"
+                                            break
+                                        }
+                                        try {
+                                            decoder.end(200)
+                                        } catch (e: MakerSuiteWire.RpcError) {
+                                            if (e.clientStatus() in 500..599 || e.httpStatus in 500..599) {
+                                                val errStatus = if (e.httpStatus in 500..599) e.httpStatus else e.clientStatus()
+                                                preFailureReason = "HTTP $errStatus"
+                                                break
+                                            } else throw e
+                                        }
+                                        val fin = decoder.finishReason
+                                        val hasContent = prefixChunks.any { MakerSuiteStream.hasActualContent(it) }
+                                        if (!hasContent && (fin == "MALFORMED_FUNCTION_CALL" || fin == "MALFORMED_RESPONSE")) {
+                                            preFailureReason = fin
+                                            break
+                                        }
+                                        break
+                                    }
+                                    "err" -> {
+                                        preFailureReason = "上游连接中断：" + ev.optString("e")
+                                        break
+                                    }
+                                }
                             }
+
+                            if (preFailureReason != null) {
+                                s.cancel()
+                                if (prePacketRetries < 2 && !res.headersSent) {
+                                    lastErr = preFailureReason; lastStatus = 502
+                                    prePacketRetries++
+                                    log("[$id] 首包前失败（$preFailureReason），自动重新生成 $prePacketRetries/2")
+                                    if (sameAccountPreRetries < 1) {
+                                        sameAccountPreRetries++
+                                        continue@workerAttempt
+                                    } else if (accountIndex + 1 < candidateIds.size) {
+                                        sameAccountPreRetries = 0
+                                        accountIndex++
+                                        break@workerAttempt
+                                    } else {
+                                        continue@workerAttempt
+                                    }
+                                } else {
+                                    lastErr = preFailureReason; lastStatus = 502
+                                    sendError(res, isOai, lastStatus, preFailureReason)
+                                    record(id, model, lastStatus, stream, start, null, preFailureReason)
+                                    return
+                                }
+                            }
+
+                            res.setHeader("X-Gateway-Engine", "ais-webview")
+                            res.setHeader("X-Gateway-Account", id)
+                            val feed = SseFeed(s, decoder, prefixChunks, streamEnded)
+                            var usageOut: JSONObject? = null
+                            val onFinish: (JSONObject) -> Unit = { u -> usageOut = u }
+                            if (isOai) {
+                                val includeUsage = raw.optJSONObject("stream_options")?.optBoolean("include_usage", false) == true
+                                OpenaiAgConverter.handleOpenAIStreamConversion(feed, res, model, onFinish, start, null, includeUsage)
+                            } else {
+                                SseStreamer.handleStreamConversion(feed, res, model, onFinish, start, null)
+                            }
+                            val outcome = usageOut?.optString("outcome") ?: "ok"
+                            val finalStatus = if (outcome == "ok") 200 else 502
+                            record(id, model, finalStatus, true, start, usageOut, usageOut?.optString("error")?.takeIf { it.isNotEmpty() && it != "null" })
+                            log("[$id] $model 流式完成（${outcome}，${System.currentTimeMillis() - start}ms）")
+                            if (outcome == "ok") {
+                                handleAccountSuccess(id)
+                            }
+                            return
+                        } else {
+                            val chunks = ArrayList<JSONObject>()
+                            var nonStreamPreFailure: String? = null
+                            while (true) {
+                                val ev = s.next(300_000)
+                                if (ev == null) {
+                                    nonStreamPreFailure = "上游响应超时"
+                                    break
+                                }
+                                when (ev.optString("t")) {
+                                    "d" -> {
+                                        try {
+                                            chunks.addAll(decoder.feed(ev.optString("s")))
+                                        } catch (e: MakerSuiteWire.RpcError) {
+                                            if (e.clientStatus() in 500..599 || e.httpStatus in 500..599) {
+                                                val errStatus = if (e.httpStatus in 500..599) e.httpStatus else e.clientStatus()
+                                                nonStreamPreFailure = "HTTP $errStatus"
+                                                break
+                                            } else throw e
+                                        }
+                                    }
+                                    "end" -> {
+                                        val endStatus = ev.optInt("status", 200)
+                                        if (endStatus in 500..599) {
+                                            nonStreamPreFailure = "HTTP $endStatus"
+                                            break
+                                        }
+                                        try {
+                                            decoder.end(200)
+                                        } catch (e: MakerSuiteWire.RpcError) {
+                                            if (e.clientStatus() in 500..599 || e.httpStatus in 500..599) {
+                                                val errStatus = if (e.httpStatus in 500..599) e.httpStatus else e.clientStatus()
+                                                nonStreamPreFailure = "HTTP $errStatus"
+                                                break
+                                            } else throw e
+                                        }
+                                        val fin = decoder.finishReason
+                                        val hasContent = chunks.any { MakerSuiteStream.hasActualContent(it) }
+                                        if (!hasContent && (fin == "MALFORMED_FUNCTION_CALL" || fin == "MALFORMED_RESPONSE")) {
+                                            nonStreamPreFailure = fin
+                                            break
+                                        }
+                                        break
+                                    }
+                                    "err" -> {
+                                        nonStreamPreFailure = "上游连接中断：" + ev.optString("e")
+                                        break
+                                    }
+                                }
+                            }
+
+                            if (nonStreamPreFailure != null) {
+                                s.cancel()
+                                if (prePacketRetries < 2 && !res.headersSent) {
+                                    lastErr = nonStreamPreFailure; lastStatus = 502
+                                    prePacketRetries++
+                                    log("[$id] 首包前失败（$nonStreamPreFailure），自动重新生成 $prePacketRetries/2")
+                                    if (sameAccountPreRetries < 1) {
+                                        sameAccountPreRetries++
+                                        continue@workerAttempt
+                                    } else if (accountIndex + 1 < candidateIds.size) {
+                                        sameAccountPreRetries = 0
+                                        accountIndex++
+                                        break@workerAttempt
+                                    } else {
+                                        continue@workerAttempt
+                                    }
+                                } else {
+                                    lastErr = nonStreamPreFailure; lastStatus = 502
+                                    sendError(res, isOai, lastStatus, nonStreamPreFailure)
+                                    record(id, model, lastStatus, stream, start, null, nonStreamPreFailure)
+                                    return
+                                }
+                            }
+
+                            val googleData = MakerSuiteStream.aggregate(chunks)
+                            val out = if (isOai) OpenaiAgConverter.convertGoogleToOpenAI(googleData, model) else ContentConverter.convertGoogleToAnthropic(googleData, model)
+                            res.setHeader("X-Gateway-Engine", "ais-webview")
+                            res.setHeader("X-Gateway-Account", id)
+                            res.sendJson(200, out)
+                            val u = googleData.optJSONObject("usageMetadata")
+                            record(id, model, 200, false, start, com.wag2api.ag.Usage.normalizeGeminiUsage(u), null)
+                            log("[$id] $model 非流式完成（${decoder.frames} 帧，${System.currentTimeMillis() - start}ms）")
+                            handleAccountSuccess(id)
+                            return
                         }
-                        decoder.end(200)
-                        val googleData = MakerSuiteStream.aggregate(chunks)
-                        val out = if (isOai) OpenaiAgConverter.convertGoogleToOpenAI(googleData, model) else ContentConverter.convertGoogleToAnthropic(googleData, model)
-                        res.sendJson(200, out)
-                        val u = googleData.optJSONObject("usageMetadata")
-                        record(id, model, 200, false, start, com.wag2api.ag.Usage.normalizeGeminiUsage(u), null)
-                        log("[$id] $model 非流式完成（${decoder.frames} 帧，${System.currentTimeMillis() - start}ms）")
-                    }
-                    return
+                    } // end workerAttempt
                 } catch (e: MakerSuiteWire.RpcError) {
                     lastErr = e.message; lastStatus = e.clientStatus()
+                    if (lastStatus == 429) handle429(id, e.message)
                     if (!res.headersSent) { sendError(res, isOai, lastStatus, e.message); record(id, model, lastStatus, stream, start, null, e.message) }
                     return
                 } catch (e: IOException) {
@@ -741,10 +1015,27 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
                     log("[$id] 请求失败：${e.message}")
                     if (res.headersSent) return
                     if (w.phase == AisWebWorker.Phase.FAILED) { workers.remove(id); w.close() }
-                    continue
+                    accountIndex++
+                    sameAccountPreRetries = 0
+                    continue@accountLoop
                 } finally {
                     w.inflight.decrementAndGet()
                     w.lastUsed = System.currentTimeMillis()
+                }
+            } // end accountLoop
+
+            val now = System.currentTimeMillis()
+            val states = currentAccountStates()
+            val activeEnabled = states.filter { it.enabled && !it.isAuthRequired }
+            val allInCooldown = activeEnabled.isNotEmpty() && activeEnabled.all { it.cooldownUntil > now }
+            if (lastStatus == 429 || (lastStatus != 401 && allInCooldown)) {
+                val earliestUntil = AisCooldownPolicy.earliestRecoveryTime(states, now)
+                if (earliestUntil != null) {
+                    val retryAfterSec = Math.max(1L, (earliestUntil - now + 999) / 1000)
+                    val timeStr = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(earliestUntil))
+                    res.setHeader("Retry-After", retryAfterSec.toString())
+                    lastErr = "全部 AIS 账号均在冷却中，最早恢复时间：$timeStr（${retryAfterSec}s）"
+                    lastStatus = 429
                 }
             }
             sendError(res, isOai, lastStatus, lastErr ?: "AIS 请求失败")
@@ -767,10 +1058,21 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
     }
 
     /** 页面回传的 MakerSuite 增量 → Google SSE 行，供 SseStreamer 当作上游 InputStream 读 */
-    private class SseFeed(private val s: AisWebWorker.Stream, private val dec: MakerSuiteStream) : InputStream() {
+    private class SseFeed(
+        private val s: AisWebWorker.Stream,
+        private val dec: MakerSuiteStream,
+        prefixChunks: List<JSONObject> = emptyList(),
+        private var eof: Boolean = false
+    ) : InputStream() {
         private var cur: ByteArray = ByteArray(0)
         private var off = 0
-        private var eof = false
+
+        init {
+            val sb = StringBuilder()
+            for (c in prefixChunks) sb.append(MakerSuiteStream.sseLine(c))
+            if (eof) sb.append("data: [DONE]\n\n")
+            cur = sb.toString().toByteArray(Charsets.UTF_8)
+        }
 
         private fun fill(): Boolean {
             while (off >= cur.size) {
@@ -806,5 +1108,77 @@ class WebViewAisEngine private constructor(private val ctx: Context) : NodeEngin
         }
 
         override fun close() { if (!eof) s.cancel() }
+    }
+}
+
+/**
+ * [beta] 账号冷却与调度纯逻辑：429 递增冷却、冷却类型判定、全冷却时套餐限额账号兜底。
+ * 纯 JVM 代码，可在 JUnit 单测中直接测试。
+ */
+internal object AisCooldownPolicy {
+    data class AccountState(
+        val id: String,
+        val enabled: Boolean = true,
+        val isAuthRequired: Boolean = false,
+        val isReady: Boolean = false,
+        val cooldownUntil: Long = 0L,
+        val cooldownType: String = "rate_limit"
+    )
+
+    fun cooldownMinutes(consecutive429Count: Int): Long = when {
+        consecutive429Count <= 1 -> 1L
+        consecutive429Count == 2 -> 5L
+        consecutive429Count == 3 -> 15L
+        consecutive429Count == 4 -> 30L
+        else -> 60L
+    }
+
+    fun cooldownType(msg: String?): String {
+        val m = (msg ?: "").lowercase(Locale.ROOT)
+        return if (m.contains("usage limit") || m.contains("reached your") || m.contains("quota")) {
+            "plan_limit"
+        } else {
+            "rate_limit"
+        }
+    }
+
+    fun selectCandidates(
+        accounts: List<AccountState>,
+        now: Long,
+        roundRobin: Int = 0
+    ): List<String> {
+        val enabled = accounts.filter { it.enabled }
+        if (enabled.isEmpty()) return emptyList()
+
+        // 正常可用账号：不在冷却中且不需要重新认证
+        val normal = enabled.filter { it.cooldownUntil <= now && !it.isAuthRequired }
+        if (normal.isNotEmpty()) {
+            val readyFirst = normal.sortedBy { if (it.isReady) 0 else 1 }
+            val start = ((roundRobin % readyFirst.size) + readyFirst.size) % readyFirst.size
+            val ready = readyFirst.filter { it.isReady }
+            return if (ready.size == readyFirst.size) {
+                (readyFirst.drop(start) + readyFirst.take(start)).map { it.id }
+            } else {
+                readyFirst.map { it.id }
+            }
+        }
+
+        // 如果启用的账号全部在冷却，而其中有 plan_limit 冷却的账号（且不是 AUTH_REQUIRED），仍按冷却剩余时间从短到长返回用于尝试
+        val activeEnabled = enabled.filter { !it.isAuthRequired }
+        if (activeEnabled.isNotEmpty() && activeEnabled.all { it.cooldownUntil > now }) {
+            val planLimitFallbacks = activeEnabled
+                .filter { it.cooldownType == "plan_limit" }
+                .sortedBy { it.cooldownUntil - now }
+            return planLimitFallbacks.map { it.id }
+        }
+
+        return emptyList()
+    }
+
+    fun earliestRecoveryTime(accounts: List<AccountState>, now: Long): Long? {
+        return accounts
+            .filter { it.enabled && it.cooldownUntil > now }
+            .map { it.cooldownUntil }
+            .minOrNull()
     }
 }

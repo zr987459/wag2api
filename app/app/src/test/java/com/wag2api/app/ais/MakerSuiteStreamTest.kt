@@ -128,4 +128,27 @@ class MakerSuiteStreamTest {
         assertEquals(1, got[0].getJSONObject("usageMetadata").getInt("candidatesTokenCount"))
         assertTrue(d.end())
     }
+
+    @Test
+    fun detectsActualContent() {
+        val (chunks, _) = decodeInChunks(fixture("generate-stream.txt"), 1000)
+        // chunk 0: thought 文本 -> true
+        assertTrue(MakerSuiteStream.hasActualContent(chunks[0]))
+        // chunk 1: 正文文本 -> true
+        assertTrue(MakerSuiteStream.hasActualContent(chunks[1]))
+        // chunk 2: 正文文本（带引号与括号） -> true
+        assertTrue(MakerSuiteStream.hasActualContent(chunks[2]))
+        // chunk 3: functionCall -> true
+        assertTrue(MakerSuiteStream.hasActualContent(chunks[3]))
+        // chunk 4: 只有 finishReason STOP 与 usageMetadata -> false
+        assertFalse(MakerSuiteStream.hasActualContent(chunks[4]))
+
+        // 仅有签名的空文本 Part -> false
+        val sigOnly = JSONObject("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\",\"thoughtSignature\":\"sig\"}]}}]}")
+        assertFalse(MakerSuiteStream.hasActualContent(sigOnly))
+
+        // 纯 usageMetadata 无 candidates -> false
+        val usageOnly = JSONObject("{\"usageMetadata\":{\"totalTokenCount\":10}}")
+        assertFalse(MakerSuiteStream.hasActualContent(usageOnly))
+    }
 }

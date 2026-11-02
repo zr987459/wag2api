@@ -233,5 +233,19 @@ class MakerSuiteStream(
         /** 一块 Google chunk → 一行 SSE（SseStreamer 逐行读 "data: {...}"） */
         @JvmStatic
         fun sseLine(chunk: JSONObject): String = "data: " + chunk.toString() + "\n\n"
+
+        /** 判断 Google chunk 是否包含实际内容（非空正文、思考文本或工具调用） */
+        @JvmStatic
+        fun hasActualContent(chunk: JSONObject): Boolean {
+            val cand = chunk.optJSONArray("candidates")?.optJSONObject(0) ?: return false
+            val parts = cand.optJSONObject("content")?.optJSONArray("parts") ?: return false
+            for (i in 0 until parts.length()) {
+                val p = parts.optJSONObject(i) ?: continue
+                if (p.has("functionCall")) return true
+                if (p.optString("text").isNotEmpty()) return true
+                if (p.has("inlineData")) return true
+            }
+            return false
+        }
     }
 }
